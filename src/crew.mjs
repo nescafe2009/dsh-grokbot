@@ -33,9 +33,13 @@ function normalizeBot(raw, index) {
     id,
     name: String(raw.name || id).trim() || id,
     avatar: String(raw.avatar || '🤖').trim() || '🤖',
+    title: String(raw.title || '').trim(),
     persona: String(raw.persona || '').trim(),
     workspace: String(raw.workspace || '').trim(),
     model,
+    pinned: raw.pinned === true,
+    section: String(raw.section || '').trim(),
+    hidden: raw.hidden === true,
   }
 }
 
@@ -96,5 +100,82 @@ export async function atomicWrite(path, text) {
 }
 
 export function botWorkspace(stateDir, bot) {
-  return bot.workspace || join(stateDir, 'workspaces', bot.id)
+  // Grok Bot 语义：全队共享一台电脑；bot.workspace 仅作高级覆盖
+  return bot.workspace || join(stateDir, 'workspace')
+}
+
+function slugId(name) {
+  const base = String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'bot'
+  return `${base}-${randomUUID().slice(0, 6)}`
+}
+
+export function createBot(crew, input) {
+  const draft = {
+    id: String(input?.id || '').trim() || slugId(input?.name),
+    name: String(input?.name || input?.id || '新专家').trim(),
+    avatar: String(input?.avatar || '🤖').trim() || '🤖',
+    title: String(input?.title || '').trim(),
+    persona: String(input?.persona || '').trim(),
+    workspace: String(input?.workspace || '').trim(),
+    model: input?.model && (input.model.provider || input.model.model)
+      ? { provider: String(input.model.provider || ''), model: String(input.model.model || '') }
+      : null,
+    pinned: input?.pinned === true,
+    section: String(input?.section || '').trim(),
+    hidden: input?.hidden === true,
+  }
+  if (crew.bots.some((bot) => bot.id === draft.id)) {
+    throw new Error(`bot id 已存在：${draft.id}`)
+  }
+  if (crew.bots.length >= 50) {
+    throw new Error('bots+groups 总数已达上限 50')
+  }
+  const bot = normalizeBot(draft, crew.bots.length)
+  crew.bots.push(bot)
+  return bot
+}
+
+const EDITABLE_FIELDS = ['name', 'avatar', 'title', 'persona', 'workspace', 'pinned', 'section', 'hidden', 'model']
+
+export function updateBot(crew, botId, patch) {
+  const bot = crew.bots.find((entry) => entry.id === botId)
+  if (!bot) throw new Error(`bot 不存在：${botId}`)
+  if (!patch || typeof patch !== 'object') throw new Error('patch 必须是对象')
+  for (const key of Object.keys(patch)) {
+    if (!EDITABLE_FIELDS.includes(key)) throw new Error(`不可编辑字段：${key}`)
+  }
+  Object.assign(bot, normalizeBot({ ...bot, ...patch }, 0))
+  if (crew.routing.default === botId && bot.hidden === true) {
+    // 默认收件人不允许隐藏：会吞掉无目标任务
+    bot.hidden = false
+  }
+  return bot
+}
+
+export function removeBot(crew, botId) {
+  const index = crew.bots.findIndex((entry) => entry.id === botId)
+  if (index < 0) throw new Error(`bot 不存在：${botId}`)
+  if (crew.bots.length <= 1) throw new Error('至少保留一个专家')
+  crew.bots.splice(index, 1)
+  if (crew.routing.default === botId) {
+    crew.routing.default = crew.bots[0].id
+  }
+  return crew.bots
+}
+
+export function duplicateBot(crew, botId) {
+  const source = crew.bots.find((entry) => entry.id === botId)
+  if (!source) throw new Error(`bot 不存在：${botId}`)
+  // 复制 profile/设置，不复制记忆与对话（记忆按 botId 隔离，天然不带走）
+  return createBot(crew, {
+    name: `${source.name} 副本`,
+    avatar: source.avatar,
+    title: source.title,
+    persona: source.persona,
+    workspace: source.workspace,
+    model: source.model,
+    pinned: false,
+    section: source.section,
+    hidden: false,
+  })
 }

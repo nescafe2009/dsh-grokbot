@@ -8,6 +8,10 @@ interface BotInfo {
   id: string
   name: string
   avatar: string
+  title: string
+  pinned: boolean
+  section: string
+  hidden: boolean
   status: 'idle' | 'working'
   currentJob: string | null
   lastActivity: number | null
@@ -33,6 +37,20 @@ const GROKBOT_CSS = `
 .grokbot-sidebar__title .grokbot-dot { width:6px; height:6px; border-radius:50%; background:#8a8f98; flex:none; }
 .grokbot-sidebar__title .grokbot-dot.on { background:#2ea043; box-shadow:0 0 5px #2ea04399; }
 .grokbot-sidebar__queue { margin-left:auto; font-size:10px; opacity:.6; text-transform:none; letter-spacing:0; }
+.grokbot-sidebar__new { margin-left:auto; border:none; background:none; cursor:pointer; opacity:.55; font-size:14px; padding:0 5px; border-radius:5px; line-height:1; }
+.grokbot-sidebar__new:hover { opacity:1; background:rgba(127,127,127,.15); }
+.grokbot-sidebar__section { font-size:10px; opacity:.45; margin:8px 4px 3px; letter-spacing:.04em; }
+.grokbot-botrow.pinned .grokbot-botrow__name::after { content:"📌"; font-size:9px; margin-left:4px; vertical-align:top; }
+.grokbot-form { display:flex; flex-direction:column; gap:8px; padding:10px; margin:0 4px 8px; border:1px solid var(--border,#e3e5e8); border-radius:10px; background:rgba(127,127,127,.05); }
+.grokbot-form__row { display:flex; gap:6px; }
+.grokbot-form input, .grokbot-form textarea { flex:1; min-width:0; border:1px solid var(--border,#d8dbe0); border-radius:8px; padding:6px 9px; font:inherit; font-size:12.5px; background:transparent; color:inherit; }
+.grokbot-form textarea { resize:vertical; min-height:52px; }
+.grokbot-form__actions { display:flex; gap:6px; justify-content:flex-end; }
+.grokbot-form__actions button { border:none; border-radius:8px; padding:5px 12px; font-size:12px; cursor:pointer; font-weight:600; }
+.grokbot-form__submit { background:#3b82f6; color:#fff; }
+.grokbot-form__cancel { background:rgba(127,127,127,.15); color:inherit; }
+.grokbot-chat__edit { border:none; background:none; cursor:pointer; opacity:.5; font-size:12px; padding:3px 8px; border-radius:7px; }
+.grokbot-chat__edit:hover { opacity:1; background:rgba(127,127,127,.12); }
 .grokbot-sidebar__native { margin-left:auto; border:none; background:none; cursor:pointer; opacity:.45; font-size:12px; padding:1px 5px; border-radius:5px; }
 .grokbot-sidebar__native:hover { opacity:1; background:rgba(127,127,127,.15); }
 .grokbot-sidebar__queue + .grokbot-sidebar__native { margin-left:0; }
@@ -161,6 +179,59 @@ function statusLine(bot: BotInfo): string {
   return '待命'
 }
 
+function BotForm(props: {
+  initial?: BotInfo | null
+  onCancel: () => void
+  onSaved: (bot: BotInfo) => void
+}): ReactNode {
+  const { initial } = props
+  const [avatar, setAvatar] = useState(initial?.avatar ?? '🤖')
+  const [name, setName] = useState(initial?.name ?? '')
+  const [title, setTitle] = useState(initial?.title ?? '')
+  const [persona, setPersona] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  const submit = useCallback(async (): Promise<void> => {
+    if (busy) return
+    if (!name.trim()) { setError('名称必填'); return }
+    setBusy(true)
+    setError('')
+    try {
+      const payload: Record<string, unknown> = {
+        name: name.trim(),
+        avatar: avatar.trim() || '🤖',
+        title: title.trim(),
+      }
+      if (persona.trim()) payload.persona = persona.trim()
+      const outcome = initial
+        ? await api(`/bots/${encodeURIComponent(initial.id)}`, { method: 'PATCH', body: JSON.stringify(payload) })
+        : await api('/bots', { method: 'POST', body: JSON.stringify(payload) })
+      props.onSaved(outcome?.bot as BotInfo)
+    } catch (err) {
+      setError(String((err as Error)?.message ?? err))
+    } finally {
+      setBusy(false)
+    }
+  }, [avatar, name, title, persona, busy, initial, props])
+
+  return (
+    <div className="grokbot-form">
+      <div className="grokbot-form__row">
+        <input style={{ maxWidth: 52, textAlign: 'center' }} value={avatar} onChange={(e) => setAvatar(e.target.value)} aria-label="头像" />
+        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="名称（必填）" aria-label="名称" />
+      </div>
+      <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="头衔，如：检索与情报专家" aria-label="头衔" />
+      <textarea value={persona} onChange={(e) => setPersona(e.target.value)} placeholder={initial ? '补充职责/规则（留空不改）' : '职责与持久规则：它负责什么、怎么做事、安全边界'} aria-label="职责" />
+      {error ? <span style={{ color: '#cf1322', fontSize: '11.5px' }}>{error}</span> : null}
+      <div className="grokbot-form__actions">
+        <button type="button" className="grokbot-form__cancel" onClick={props.onCancel}>取消</button>
+        <button type="button" className="grokbot-form__submit" disabled={busy} onClick={() => void submit()}>{initial ? '保存' : '创建'}</button>
+      </div>
+    </div>
+  )
+}
+
 /**
  * 侧栏 agent 团队列表：挂进 sidebar.workspaces 插槽。
  * 挂载后把同容器的原有节点（默认工作区/会话树）结构化隐藏，
@@ -170,6 +241,7 @@ export function GrokbotSidebarCrew(): ReactNode {
   const state = useGrokbotState()
   const openId = useOpenBotId()
   const nativeVisible = useNativeSidebarVisible()
+  const [creating, setCreating] = useState(false)
   const rootRef = useRef<HTMLDivElement | null>(null)
   const hiddenRef = useRef<HTMLElement[]>([])
 
@@ -202,8 +274,17 @@ export function GrokbotSidebarCrew(): ReactNode {
     }
   }, [nativeVisible])
 
-  const bots = state?.bots ?? []
+  const allBots = state?.bots ?? []
   const busy = (state?.running.length ?? 0) + (state?.queueDepth ?? 0)
+  const visible = allBots
+    .filter((bot) => !bot.hidden)
+    .sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.name.localeCompare(b.name, 'zh'))
+  const groups: { section: string; bots: typeof visible }[] = []
+  for (const bot of visible) {
+    const last = groups[groups.length - 1]
+    if (last && last.section === bot.section) last.bots.push(bot)
+    else groups.push({ section: bot.section, bots: [bot] })
+  }
 
   return (
     <div className="grokbot-sidebar" ref={rootRef}>
@@ -215,25 +296,39 @@ export function GrokbotSidebarCrew(): ReactNode {
           : null}
         <button
           type="button"
+          className="grokbot-sidebar__new"
+          title="新建专家"
+          onClick={() => setCreating(true)}
+        >＋</button>
+        <button
+          type="button"
           className="grokbot-sidebar__native"
           title={nativeVisible ? '隐藏原始列表' : '显示原始工作区/会话列表'}
           onClick={() => toggleNativeSidebar()}
         >⇅</button>
       </div>
-      {bots.map((bot) => (
-        <button
-          key={bot.id}
-          type="button"
-          className={`grokbot-botrow${openId === bot.id ? ' active' : ''}`}
-          onClick={() => openBot(bot.id)}
-        >
-          <span className="grokbot-botrow__avatar">{bot.avatar}</span>
-          <span className="grokbot-botrow__main">
-            <span className="grokbot-botrow__name">{bot.name}</span>
-            <span className="grokbot-botrow__status">{statusLine(bot)}</span>
-          </span>
-          <span className={`grokbot-botrow__badge${bot.status === 'working' ? ' working' : ''}`} />
-        </button>
+      {creating
+        ? <BotForm onCancel={() => setCreating(false)} onSaved={() => setCreating(false)} />
+        : null}
+      {groups.map((group) => (
+        <div key={group.section || '__default__'}>
+          {group.section ? <div className="grokbot-sidebar__section">{group.section}</div> : null}
+          {group.bots.map((bot) => (
+            <button
+              key={bot.id}
+              type="button"
+              className={`grokbot-botrow${openId === bot.id ? ' active' : ''}${bot.pinned ? ' pinned' : ''}`}
+              onClick={() => openBot(bot.id)}
+            >
+              <span className="grokbot-botrow__avatar">{bot.avatar}</span>
+              <span className="grokbot-botrow__main">
+                <span className="grokbot-botrow__name">{bot.name}</span>
+                <span className="grokbot-botrow__status">{bot.title || statusLine(bot)}</span>
+              </span>
+              <span className={`grokbot-botrow__badge${bot.status === 'working' ? ' working' : ''}`} />
+            </button>
+          ))}
+        </div>
       ))}
     </div>
   )
@@ -243,6 +338,7 @@ function BotChatView(props: { bot: BotInfo }): ReactNode {
   const { bot } = props
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
+  const [editing, setEditing] = useState(false)
   const logRef = useRef<HTMLDivElement | null>(null)
   const messages = useMemo(() => historyOf(bot.id), [bot.id, sending])
 
@@ -281,11 +377,15 @@ function BotChatView(props: { bot: BotInfo }): ReactNode {
         <span className="grokbot-chat__title">
           <span className="grokbot-chat__name">{bot.name}</span>
           <span className="grokbot-chat__meta">
-            {bot.status === 'working' ? '正在执行任务…' : '常驻待命 · 有自己的工作区'}
+            {bot.title || (bot.status === 'working' ? '正在执行任务…' : '常驻待命')}
           </span>
         </span>
+        <button className="grokbot-chat__edit" type="button" onClick={() => setEditing(true)}>编辑</button>
         <button className="grokbot-chat__close" type="button" onClick={closeBot} aria-label="关闭">✕</button>
       </div>
+      {editing
+        ? <BotForm initial={bot} onCancel={() => setEditing(false)} onSaved={() => setEditing(false)} />
+        : null}
       <div className="grokbot-log" ref={logRef}>
         {messages.length === 0
           ? <div className="grokbot-empty">和 {bot.name} 对话，或投递任务给它。<br />它会真实使用工具并在自己的工作区里干活。</div>

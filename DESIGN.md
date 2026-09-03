@@ -1,122 +1,94 @@
-# DESIGN — dsh-grokbot 整体逻辑
+# DESIGN v2 — dsh-grokbot 整体逻辑（复刻 Grok Bot）
 
-对标 Grok Bot 的产品逻辑（xAI 官方：常驻 agent 团队、每 bot 记住对话越用越懂你；MindStudio：幕僚长委派 + 共享记忆 + routines；Cursor 论坛：记忆绑定 bot 实例），
-在 DSH 插件体系内给出完整概念模型、数据流与实现路径。
+依据（三轮 review 后定稿）：
+- xAI 官方发布：常驻 agent 团队、记住对话、有自己的电脑、7×24
+- Cursor 官方文档《Work with Grok Bot》全文（操作语义权威来源）
+- 布局资料：消息应用式——侧栏=agent 列表，主区=选中 agent 的会话
+- 本机逆向：todi-hub 文件协议、桌面版 harness home、客户端插槽机制
 
-## 1. 概念模型
+## 0. v1→v2 关键纠正
 
-```
-Crew（团队，v1 全局一个，v2 多团队）
- ├─ 章程：TEAM.md（团队偏好/规矩，人可编辑）
- ├─ 共享记忆：memory/decisions.md（群聊与任务沉淀的决议）
- ├─ 默认模型 + 路由策略（defaultBot / 规则 / 幕僚长自主委派）
- ├─ Bot × N（专家）
- │   ├─ 档案：id/name/avatar/title/persona（= Grok Bot 的 Edit Profile）
- │   ├─ 模型绑定：{provider, model} 可空 → 团队默认 → 全局默认
- │   ├─ 电脑：workspaces/<botId>/ 专属目录（文件、工具产物）
- │   ├─ 记忆：memory/PROFILE.md（长期自我记忆，bot 自己维护）
- │   ├─ 会话：持久 sessionId，重启 resume（对话不丢）
- │   └─ 状态：idle / working(+currentJob)
- ├─ Room（群聊，v1.5）：多 bot + 人同室；@提及定向，未@时按路由
- └─ Routine（v2）：cron / webhook / 文件触发，产物统一走 inbox
-```
+| v1 设计（错） | Grok Bot 实际（对） |
+|---|---|
+| 每 bot 一台专属电脑 | **全队共享一台电脑**（文件/登录/浏览器会话共享，bot 可接力）；每 bot 一个"屏幕"= 并发工作面；隔离在用户之间 |
+| 记忆含安全边界 | **安全边界放 description**；记忆只存稳定偏好/事实/摘要，不是权威源 |
+| 群聊无@时按路由规则选人 | **正常说话让 bot 们自己决定谁应答**；@=定向交接；@everyone=群发 |
+| 模型三层是核心 | Grok Bot 用户不选模型；多层模型是我们基于 DSH 多provider 的**增强项**，降为高级设置 |
+| 会话是插件私有的 | **会话即对话本身**，transcript 里内联渲染工具活动/电脑操作/产出文件/审批请求 |
 
-一切遵循「文件即接口」：配置（crew.json）、任务（inbox/）、记忆（*.md）都是plain文件，人和 bot 都能读写。
-
-## 2. 增加专家（Bot 生命周期）
-
-- **创建**：侧栏「＋ 新建专家」→ 表单（名称/头像/职责一句话/模型/工作区）→ `POST /api/plugins/grokbot/bots`
-  - 服务端：写 crew.json + 建 `workspaces/<id>/` + 种子 `memory/PROFILE.md` + 继承团队默认模型
-  - 热加载：无需重启，crew 变更即时生效（内存 crew + 文件落盘）
-- **模板**：内置 工程师🛠️ / 调研员🔎 / 秘书📋 / 审核员🛡️ 四种 persona 模板，一键创建
-- **编辑/停用/删除**：`PATCH/DELETE /bots/:id`；删除保留 workspace 与记忆（可恢复），仅摘出团队
-
-## 3. 组建团队与群聊
-
-- **单团队（现在）**：crew.json 的 `routing.default` 决定无目标任务的收件人
-- **路由策略（渐进）**：
-  1. `toBot` 显式指定（inbox/群聊 @）
-  2. 规则表 `routing.rules: [{match, bot}]`（关键词/前缀）
-  3. 都不中 → defaultBot（幕僚长）；幕僚长可在回复中给出委派建议（v1）
-  4. 幕僚长自主委派（v2）：spawn 子任务投递到专家队列，汇总结论
-- **群聊 Room（v1.5）**：
-  - `rooms: [{id, name, memberBotIds}]`；消息记录 `rooms/<id>/transcript.jsonl`
-  - @bot 定向回复；无 @ 时按路由选一个应答（避免全员刷屏，Grok Bot 同款克制）
-  - 参考 dsh-agent-arena 的会议实现，但我们走文件协议 + 轻量轮询
-
-## 4. 模型制定
-
-三层优先级（已实现前两层）：
-```
-bot.model（专家级）→ crew.defaultModel（团队级）→ agentDefaultModel.currentSelection()（全局）
-```
-- **模型目录**：`GET /model-catalog` 从 `ctx.llm.listProviders()/listModels()` 聚合（arena 的 modelCatalog 模式）供 UI 下拉
-- **任务级模型**：例行摘要/标题生成可配 `crew.utilityModel`（便宜模型），主对话用强模型
-- 每次会话创建时锁定选择（会话中途不改模型，保持上下文一致）
-
-## 5. 记忆体系（群聊记忆 ↔ 专家记忆的关联）
-
-Grok Bot 的语义：每个 bot 有绑定自身的长期记忆；群聊是共享上下文场所；复制 bot 不共享记忆。
-
-### 目录结构
-```
-<stateDir>/
-  memory/
-    TEAM.md          # 团队章程：用户偏好、协作规矩（人可手改，bot 只读）
-    decisions.md     # 共享决议：群聊/任务沉淀（bot 追加，最新在前）
-  bots/<botId>/
-    memory/
-      PROFILE.md     # 专家长期记忆：我是谁/擅长/和用户打交道的经验（bot 自己维护）
-      episodic/YYYY-MM-DD.md   # 当日会话摘要（收尾自动生成）
-    workspace/       # 它的电脑（工具产物）
-```
-
-### 关联机制（三条链路）
-1. **注入（读）**：每次专家回合的 systemPrompt 分三段：
-   - `grokbot:team`：TEAM.md 全文 + decisions.md 最近 N 条
-   - `grokbot:identity`：persona + PROFILE.md 全文
-   - `grokbot:workspace`：工作区路径与工具说明
-   → 群聊沉淀天然进入**所有**专家的上下文；个人记忆只进**自己**的。
-2. **沉淀（写）**：回合收尾（turn/end）触发轻量摘要任务（utilityModel）：
-   - 有团队级决议 → 追加 `decisions.md`（一行式：日期/结论/来源）
-   - 有个人经验 → 追加自己的 `PROFILE.md`（"这次学到…"）
-   - 摘要失败不阻塞回复（记忆是尽力而为）
-3. **延续（存）**：每个 bot 的聊天会话用稳定 sessionId 持久化（sessionPersistence），
-   进程重启后 `ctx.agents.resume()` 恢复——对话连续是记忆的底线；episodic 摘要是跨会话压缩层。
-
-### 边界
-- 记忆文件有体积上限（PROFILE.md > 32KB 时提示 bot 自行精炼）
-- 删除 bot：记忆归档到 `archive/<botId>/`，不污染新同名 bot
-
-## 6. 任务与编排流（端到端）
+## 1. 概念模型（对齐官方语义）
 
 ```
-入口（手机/hub、webhook、cron、UI 群聊/私聊）
-   → inbox（queue.jsonl）或 chat API
-   → 路由（§3）→ bot（模型 §4，记忆注入 §5.1）
-   → agent 回合（工具在它的 workspace 里真实执行）
-   → 收尾：reply.md / 会话消息 + 记忆沉淀（§5.2）
-   → （v2）幕僚长委派：拆分任务 → 投递子任务 → 汇总
+Team（账号级，对应 Grok Bot 账户）
+ ├─ Computer（一台共享电脑 = <stateDir>/workspace/）
+ │   ├─ 项目文件夹；文件/凭证全队共享、跨任务持久
+ │   └─ Screen × N（每 bot 一个并发工作面 = 一个 agent 会话）
+ ├─ Bot（≤50，含群聊总数）
+ │   ├─ Profile：name / title / description(持久规则+安全边界) / avatar
+ │   ├│ conversation（独立持久对话；任务指令放这里，不放 description）
+ │   ├─ memory（稳定偏好/重要事实/工作摘要；复制不带记忆）
+ │   ├─ routines ≤50（定时/事件触发，归此 bot 所有）
+ │   └─ pinned / section（侧栏置顶与分组）/ hidden（隐藏不停摆）
+ ├─ Group（2-6 bot 群聊）：共享 outcome 与可见交接
+ ├─ Skill（跨 bot 复用的做法说明；/ 引用；不属任何 bot）
+ └─ Transcript 统一形态：消息 + 工具活动 + 文件卡片 + 审批 + 提问 内联混排
 ```
 
-## 7. 与现状的差距盘点（2026-09-04）
+## 2. Bot 生命周期（复刻官方流程）
 
-| 能力 | 现状 | 缺口 |
-|---|---|---|
-| 专家 CRUD | 手改 crew.json + 重启 | API/表单/热加载/模板 ❌ |
-| 团队/群聊 | 单 default 路由 | rules、Room、@提及 ❌ |
-| 模型 | 三层优先级已实现 | 目录 API、选择 UI、utilityModel ❌ |
-| 记忆 | 无；chat 会话进程内存，重启丢 | 注入/沉淀/resume 全套 ❌（最高优） |
-| 编排 | 无 | 幕僚长委派 ❌ |
-| 触发器 | 文件 watcher ✅ | cron/webhook ❌ |
-| 会话观感 | 纯文本气泡 | 工具轨迹卡片 ❌ |
+- **创建**：侧栏「＋ New」→ Create new agent → 首个真实任务即上岗（官方：发一个有明确完成线的任务）
+- **编辑**：Edit Profile 改 name/title/description/avatar；**发现持久偏好/边界/职责时更新 description**（消息只承载本次任务指令）
+- **组织**：Pin 置顶；Sidebar Sections 按项目/客户分组；Hide from sidebar（工作与 routines 不停）；Duplicate（复制 profile/settings/skills/routines/avatar，**不带**对话史/记忆/附件）
+- **删除**：删 profile+对话+routines；电脑上的文件不隔离、需单独清理；不确定就 Hide
+- **上限**：bots+groups ≤ 50
+- bot 也可以在对话中建议/创建新 bot（当某类工作值得长期 owner）——v2
 
-## 8. 实现顺序（每步独立可验收）
+## 3. 共享电脑（v2 核心变更）
 
-- **M1 记忆与会话持久化**：记忆目录 + systemPrompt 三段注入 + bot 稳定 sessionId + 重启 resume + 收尾摘要
-- **M2 专家管理**：bots CRUD API + 热加载 + 侧栏新建/编辑表单 + 模板
-- **M3 模型目录**：/model-catalog + 表单下拉 + utilityModel
-- **M4 群聊 Room**：rooms + transcript + @路由 + 群聊 UI
-- **M5 编排与触发**：幕僚长委派、cron routine、webhook
-- **M6 观感**：会话内工具轨迹卡片（读 session.events 渲染）
-- G6/G7（todi-hub 适配、GitHub 发布）并行推进
+- 全队一个 `workspace/`，默认 `workspace/<项目名>/` 组织
+- **bot 间接力**：A 存的文件 B 直接可用（同一 cwd）
+- 凭证/登录全队共享 → 我们不在插件里做 bot 间隔离（与官方一致）；敏感步骤走审批
+- 每屏一个 computer-use 任务；我们的"屏"= 独立 agent 会话（可并行）
+
+## 4. 对话与协作（复刻官方语义）
+
+- **私聊优先**：用户私聊可打断/重定向当前后台回合；"立即停止"不撤销已完成动作
+- **群聊**：正常书写让 bots 决定谁应答（实现：默认由路由 bot 判断并回应，可点名他人）；
+  `@名字` 定向交接；`@everyone` 群发；**每阶段一个 owner**；bot→bot 交接消息纯文本
+- **bot↔bot 异步交接**：A 给 B 发消息 → 唤醒 B 处理 → 可稍后回复；交接在 transcript 可见
+  （实现：A 的工具调用 `handoff(botId, text)` → 服务端向 B 的会话注入 followup）
+- **附件**：图/文/链接/PDF/表格…，须说明"这是什么、怎么用"；上限对齐官方（6/条）
+- **可审查产出**：要求源链接/截图/时间戳/动作日志/未验证清单；产物以卡片呈现（预览/保存/反馈）
+
+## 5. 记忆（收敛为官方语义）
+
+- **内容**：稳定偏好、重要事实、工作摘要（不回放全部历史）
+- **边界**：记忆≠权威源；变化的事实放源系统；安全边界放 description
+- **实现**：`bots/<id>/memory/PROFILE.md`（bot 自维护）+ episodic 摘要；
+  注入只进自己的会话；团队共享记忆降级为 `workspace/TEAM.md`（项目章程，可选）
+- **持久对话**：稳定 sessionId + 重启 resume（对话存在电脑之外——与官方一致）
+- 复制 bot 不复制记忆 ✅（天然：按 botId 隔离）
+
+## 6. Skills 与 Routines
+
+- **Skill**：跨 bot 的可复用做法（步骤/决策规则/期望输出/安全边界）；
+  `/` 菜单引用；存 `<stateDir>/skills/*.md`；v2 支持对话中"把这次的做法存成 skill"
+- **Routine**：归**单个 bot** 所有；schedule(cron) 或窄事件规则（webhook/inbox 匹配）；
+  必须 Test run + 运行历史（≤20 条）；产物回到 owning bot 的会话
+- 信任分级：准备类可自动化；发送/采购/删除/发布/生产变更必须审批
+
+## 7. 模型（DSH 增强项，非复刻必需）
+
+bot.model → team.defaultModel → agentDefaultModel.currentSelection()；
+模型目录 API 供表单下拉；utilityModel 干摘要杂活。放"高级设置"，不进主流程。
+
+## 8. 实现路线（goal 模式，每步可验收）
+
+- **M1 Bot 对象与对话底座**：bots CRUD（profile 五字段+pin/section/hidden/duplicate）+ 热加载 +
+  共享 workspace（替换 per-bot 工作区）+ 稳定 sessionId 持久对话 + 重启 resume + 侧栏 New/编辑表单
+- **M2 记忆**：PROFILE.md 注入/沉淀 + episodic 摘要（utilityModel）+ description/任务指令分离
+- **M3 群聊与交接**：group（2-6）+ 自主应答 + @handoff + bot↔bot 异步交接 + 私聊打断/Stop
+- **M4 Transcript 观感**：会话内联渲染 工具活动/文件卡片/审批卡（读 session.events）；workspace 文件浏览
+- **M5 Skills & Routines**：skills 目录 + / 菜单 + cron/事件 routine + test run + 历史
+- **M6 集成发布**：todi-hub handoffDsh、webhook 事件、GitHub 开源
+- 验收总标准：与 Grok Bot 官方工作流逐条对照可跑通（创建→派活→看活动→交接→群聊→routine→记忆延续）

@@ -2,7 +2,7 @@ import { watch } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { loadOrCreateCrew, routeJob, botWorkspace, serializeCrew, atomicWrite, parseCrew } from './crew.mjs'
+import { loadOrCreateCrew, routeJob, botWorkspace, serializeCrew, atomicWrite, parseCrew, createBot, updateBot, removeBot, duplicateBot } from './crew.mjs'
 import { ensureInbox, scanInbox, claimJob, completeJob, failJob, enqueueJob } from './inbox.mjs'
 
 const API_ROOT = '/api/plugins/grokbot'
@@ -117,14 +117,19 @@ export function apply(ctx, config = {}) {
   async function init() {
     await mkdir(stateDir, { recursive: true })
     await ensureInbox(inboxRoot)
+    // 共享电脑：全队一个 workspace（Grok Bot 语义）
+    await mkdir(join(stateDir, 'workspace'), { recursive: true })
     const loaded = await loadOrCreateCrew(stateDir)
     crewState.path = loaded.path
     crewState.crew = loaded.crew
     for (const bot of crewState.crew.bots) {
       botState(bot.id)
-      await mkdir(botWorkspace(stateDir, bot), { recursive: true })
     }
     ctx.logger?.info?.(`grokbot ready: ${crewState.crew.bots.length} bot(s), inbox=${inboxRoot}`)
+  }
+
+  async function persistCrew() {
+    await atomicWrite(crewState.path, serializeCrew(crewState.crew))
   }
 
   const hydrated = init()
@@ -330,6 +335,10 @@ export function apply(ctx, config = {}) {
       id: bot.id,
       name: bot.name,
       avatar: bot.avatar,
+      title: bot.title,
+      pinned: bot.pinned,
+      section: bot.section,
+      hidden: bot.hidden,
       status: state.status,
       currentJob: state.currentJob,
       lastActivity: state.lastActivity,
@@ -361,6 +370,57 @@ export function apply(ctx, config = {}) {
         }
         if (method === 'GET' && suffix === '/crew') {
           respond(res, 200, { crew: crewState.crew }); return
+        }
+        if (method === 'POST' && suffix === '/bots') {
+          const body = await readJsonBody(req)
+          let bot
+          try {
+            bot = createBot(crewState.crew, body)
+          } catch (error) {
+            throw new HttpError(400, safeError(error))
+          }
+          await persistCrew()
+          respond(res, 201, { bot: publicBot(bot) }); return
+        }
+        const botMatch = /^\/bots\/([^/]+)$/.exec(suffix)
+        if (botMatch) {
+          const botId = decodeURIComponent(botMatch[1])
+          if (method === 'PATCH') {
+            const body = await readJsonBody(req)
+            let bot
+            try {
+              bot = updateBot(crewState.crew, botId, body)
+            } catch (error) {
+              throw new HttpError(400, safeError(error))
+            }
+            await persistCrew()
+            respond(res, 200, { bot: publicBot(bot) }); return
+          }
+          if (method === 'DELETE') {
+            try {
+              removeBot(crewState.crew, botId)
+            } catch (error) {
+              throw new HttpError(400, safeError(error))
+            }
+            await persistCrew()
+            respond(res, 200, { ok: true, bots: crewState.crew.bots.map(publicBot) }); return
+          }
+          if (method === 'GET') {
+            const bot = crewState.crew.bots.find((entry) => entry.id === botId)
+            if (!bot) throw new HttpError(404, `bot 不存在：${botId}`)
+            respond(res, 200, { bot: publicBot(bot) }); return
+          }
+        }
+        const dupMatch = /^\/bots\/([^/]+)\/duplicate$/.exec(suffix)
+        if (method === 'POST' && dupMatch) {
+          let bot
+          try {
+            bot = duplicateBot(crewState.crew, decodeURIComponent(dupMatch[1]))
+          } catch (error) {
+            throw new HttpError(400, safeError(error))
+          }
+          await persistCrew()
+          respond(res, 201, { bot: publicBot(bot) }); return
         }
         if (method === 'PUT' && suffix === '/crew') {
           const body = await readJsonBody(req)
