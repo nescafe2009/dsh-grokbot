@@ -55,17 +55,39 @@
     "@deepseek-ai/dsh-workspace": "^0.1.0-rc.6"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/cordis": { "optional": true },
-    "@deepseek-ai/dsh-agent": { "optional": true },
-    "@deepseek-ai/dsh-agent-default-model": { "optional": true },
-    "@deepseek-ai/dsh-host-webserver": { "optional": true },
-    "@deepseek-ai/dsh-llm": { "optional": true },
-    "@deepseek-ai/dsh-session": { "optional": true },
-    "@deepseek-ai/dsh-session-persistence": { "optional": true },
-    "@deepseek-ai/dsh-subagent": { "optional": true },
-    "@deepseek-ai/dsh-system-prompt": { "optional": true },
-    "@deepseek-ai/dsh-tools": { "optional": true },
-    "@deepseek-ai/dsh-workspace": { "optional": true }
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-agent": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-agent-default-model": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-host-webserver": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-session": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-session-persistence": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-subagent": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-system-prompt": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-workspace": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "tsdown": "0.22.2"
@@ -73,5 +95,13 @@
   "engines": {
     "node": ">=22"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nescafe2009/dsh-grokbot.git"
+  },
+  "homepage": "https://github.com/nescafe2009/dsh-grokbot#readme",
+  "bugs": {
+    "url": "https://github.com/nescafe2009/dsh-grokbot/issues"
+  }
 }

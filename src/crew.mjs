@@ -43,6 +43,51 @@ function normalizeBot(raw, index) {
   }
 }
 
+function normalizeRoom(raw, index, ids) {
+  if (!raw || typeof raw !== 'object') {
+    throw new Error(`crew.rooms[${index}] 必须是对象`)
+  }
+  const id = String(raw.id || '').trim()
+  if (!SAFE_ID_RE.test(id)) {
+    throw new Error(`crew.rooms[${index}].id 非法：${id}`)
+  }
+  const members = Array.isArray(raw.memberBotIds) ? raw.memberBotIds.map(String) : []
+  if (members.length < 2 || members.length > 6) {
+    throw new Error(`群聊 ${id} 成员数须在 2-6`)
+  }
+  for (const memberId of members) {
+    if (!ids.has(memberId)) throw new Error(`群聊 ${id} 成员不存在：${memberId}`)
+  }
+  return { id, name: String(raw.name || id).trim() || id, memberBotIds: [...new Set(members)] }
+}
+
+function normalizeRoutine(raw, index, ids) {
+  if (!raw || typeof raw !== 'object') {
+    throw new Error(`crew.routines[${index}] 必须是对象`)
+  }
+  const id = String(raw.id || '').trim()
+  if (!SAFE_ID_RE.test(id)) {
+    throw new Error(`crew.routines[${index}].id 非法：${id}`)
+  }
+  const botId = String(raw.botId || '').trim()
+  if (!ids.has(botId)) throw new Error(`routine ${id} 归属 bot 不存在：${botId}`)
+  const schedule = raw.schedule && typeof raw.schedule === 'object' ? raw.schedule : {}
+  const everyMinutes = Number(schedule.everyMinutes)
+  const time = String(schedule.time || '').trim()
+  if (!(Number.isInteger(everyMinutes) && everyMinutes >= 1) && !/^\d{1,2}:\d{2}$/.test(time)) {
+    throw new Error(`routine ${id} 的 schedule 须为 everyMinutes(分钟) 或 time(HH:MM)`)
+  }
+  const prompt = String(raw.prompt || '').trim()
+  if (!prompt) throw new Error(`routine ${id} 缺少 prompt`)
+  return {
+    id,
+    botId,
+    prompt,
+    schedule: Number.isInteger(everyMinutes) && everyMinutes >= 1 ? { everyMinutes } : { time },
+    enabled: raw.enabled !== false,
+  }
+}
+
 export function parseCrew(text) {
   const raw = JSON.parse(text)
   const bots = Array.isArray(raw?.bots) && raw.bots.length > 0 ? raw.bots : DEFAULT_CREW.bots
@@ -56,13 +101,32 @@ export function parseCrew(text) {
   if (!ids.has(defaultBot)) {
     throw new Error(`routing.default 指向不存在的 bot：${defaultBot}`)
   }
-  return { routing: { default: defaultBot }, bots: normalized }
+  const normModel = (value) => value && (value.provider || value.model)
+    ? { provider: String(value.provider || ''), model: String(value.model || '') }
+    : null
+  const rooms = Array.isArray(raw?.rooms) ? raw.rooms.map((room, i) => normalizeRoom(room, i, ids)) : []
+  const routines = Array.isArray(raw?.routines) ? raw.routines.map((routine, i) => normalizeRoutine(routine, i, ids)) : []
+  if (normalized.length + rooms.length > 50) {
+    throw new Error('bots+groups 总数已达上限 50')
+  }
+  return {
+    routing: { default: defaultBot },
+    bots: normalized,
+    rooms,
+    routines,
+    defaultModel: normModel(raw?.defaultModel),
+    utilityModel: normModel(raw?.utilityModel),
+  }
 }
 
 export function serializeCrew(crew) {
   return `${JSON.stringify({
     routing: crew.routing,
+    defaultModel: crew.defaultModel || null,
+    utilityModel: crew.utilityModel || null,
     bots: crew.bots.map((bot) => ({ ...bot, model: bot.model || null })),
+    rooms: crew.rooms || [],
+    routines: (crew.routines || []).map((routine) => ({ ...routine, schedule: routine.schedule })),
   }, null, 2)}\n`
 }
 
@@ -127,7 +191,7 @@ export function createBot(crew, input) {
   if (crew.bots.some((bot) => bot.id === draft.id)) {
     throw new Error(`bot id 已存在：${draft.id}`)
   }
-  if (crew.bots.length >= 50) {
+  if (crew.bots.length + (crew.rooms?.length ?? 0) >= 50) {
     throw new Error('bots+groups 总数已达上限 50')
   }
   const bot = normalizeBot(draft, crew.bots.length)
@@ -178,4 +242,61 @@ export function duplicateBot(crew, botId) {
     section: source.section,
     hidden: false,
   })
+}
+
+export function createRoom(crew, input) {
+  if (!Array.isArray(crew.rooms)) crew.rooms = []
+  const ids = new Set(crew.bots.map((bot) => bot.id))
+  const draft = {
+    id: String(input?.id || '').trim() || slugId(String(input?.name || 'room')),
+    name: String(input?.name || '新群聊').trim(),
+    memberBotIds: Array.isArray(input?.memberBotIds) ? input.memberBotIds.map(String) : [],
+  }
+  if (crew.rooms.some((room) => room.id === draft.id)) {
+    throw new Error(`room id 已存在：${draft.id}`)
+  }
+  const room = normalizeRoom(draft, crew.rooms.length, ids)
+  crew.rooms.push(room)
+  return room
+}
+
+export function updateRoom(crew, roomId, patch) {
+  const room = crew.rooms?.find((entry) => entry.id === roomId)
+  if (!room) throw new Error(`room 不存在：${roomId}`)
+  const ids = new Set(crew.bots.map((bot) => bot.id))
+  const next = normalizeRoom({ ...room, ...(patch ?? {}) }, 0, ids)
+  Object.assign(room, next)
+  return room
+}
+
+export function removeRoom(crew, roomId) {
+  const index = crew.rooms?.findIndex((entry) => entry.id === roomId) ?? -1
+  if (index < 0) throw new Error(`room 不存在：${roomId}`)
+  crew.rooms.splice(index, 1)
+  return crew.rooms
+}
+
+export function upsertRoutine(crew, input, routineId) {
+  if (!Array.isArray(crew.routines)) crew.routines = []
+  const ids = new Set(crew.bots.map((bot) => bot.id))
+  if (routineId) {
+    const routine = crew.routines.find((entry) => entry.id === routineId)
+    if (!routine) throw new Error(`routine 不存在：${routineId}`)
+    Object.assign(routine, normalizeRoutine({ ...routine, ...(input ?? {}) }, 0, ids))
+    return routine
+  }
+  const draft = { ...input, id: String(input?.id || '').trim() || slugId('routine') }
+  if (crew.routines.some((routine) => routine.id === draft.id)) {
+    throw new Error(`routine id 已存在：${draft.id}`)
+  }
+  const routine = normalizeRoutine(draft, crew.routines.length, ids)
+  crew.routines.push(routine)
+  return routine
+}
+
+export function removeRoutine(crew, routineId) {
+  const index = crew.routines?.findIndex((entry) => entry.id === routineId) ?? -1
+  if (index < 0) throw new Error(`routine 不存在：${routineId}`)
+  crew.routines.splice(index, 1)
+  return crew.routines
 }

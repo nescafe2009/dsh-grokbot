@@ -1,8 +1,8 @@
 import { watch } from 'node:fs'
-import { mkdir } from 'node:fs/promises'
+import { mkdir, readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { loadOrCreateCrew, routeJob, botWorkspace, serializeCrew, atomicWrite, parseCrew, createBot, updateBot, removeBot, duplicateBot } from './crew.mjs'
+import { loadOrCreateCrew, routeJob, botWorkspace, serializeCrew, atomicWrite, parseCrew, createBot, updateBot, removeBot, duplicateBot, createRoom, updateRoom, removeRoom, upsertRoutine, removeRoutine } from './crew.mjs'
 import { ensureInbox, scanInbox, claimJob, completeJob, failJob, enqueueJob } from './inbox.mjs'
 
 const API_ROOT = '/api/plugins/grokbot'
@@ -11,7 +11,7 @@ const JSON_HEADERS = {
   'cache-control': 'no-store',
 }
 
-export const inject = ['agents', 'webServer', 'agentDefaultModel']
+export const inject = ['agents', 'webServer', 'agentDefaultModel', 'llm']
 
 const nowIso = () => new Date().toISOString()
 const safeError = (error) => (error instanceof Error ? error.message : String(error))
@@ -75,6 +75,18 @@ export function summarizeTurn(events, firstSeq) {
   return { text, stopReason, error, trace }
 }
 
+export function activityOf(events, firstSeq) {
+  const calls = []
+  for (const event of events) {
+    if (event.seq < firstSeq) continue
+    if (event.type === 'tool/call') {
+      const name = String(event.data?.name || 'tool')
+      if (name) calls.push(name)
+    }
+  }
+  return calls
+}
+
 export function apply(ctx, config = {}) {
   const stateDir = resolve(String(config.stateDir || join(process.cwd(), '.dsh-grokbot')))
   const inboxRoot = resolve(String(config.inboxDir || join(stateDir, 'inbox')))
@@ -85,12 +97,89 @@ export function apply(ctx, config = {}) {
   const crewState = { path: '', crew: { routing: { default: '' }, bots: [] } }
   const botStates = new Map()
   const chatHandles = new Map()
+  const chatSessionIds = new Map()
   const pendingJobs = []
   const runningJobs = new Map()
   const seenJobIds = new Set()
   const recentJobs = []
   let disposed = false
   let scanning = false
+
+  const chatSessionsPath = join(stateDir, 'chat-sessions.json')
+  const memoryDirOf = (botId) => join(stateDir, 'bots', botId, 'memory')
+  const profilePathOf = (botId) => join(memoryDirOf(botId), 'PROFILE.md')
+  const teamMemoryPath = join(stateDir, 'memory', 'TEAM.md')
+  const skillsDir = join(stateDir, 'skills')
+  const roomsDir = join(stateDir, 'rooms')
+  const routinesStatePath = join(stateDir, 'routines-state.json')
+
+  const roomTranscriptPath = (roomId) => join(roomsDir, `${roomId}.transcript.jsonl`)
+  const routineHistoryPath = (routineId) => join(roomsDir, `routine-${routineId}.history.jsonl`)
+
+  async function appendRoomMsg(roomId, entry) {
+    await mkdir(roomsDir, { recursive: true })
+    const path = roomTranscriptPath(roomId)
+    const { appendFile } = await import('node:fs/promises')
+    let text = ''
+    try {
+      text = await readFile(path, 'utf8')
+    } catch { text = '' }
+    if (!text.endsWith('\n') && text.length > 0) await appendFile(path, '\n')
+    await appendFile(path, `${JSON.stringify({ ts: Date.now(), ...entry })}\n`)
+  }
+
+  async function readRoomMsgs(roomId, limit = 200) {
+    try {
+      const lines = (await readFile(roomTranscriptPath(roomId), 'utf8')).split('\n').filter((line) => line.trim())
+      return lines.slice(-limit).map((line) => { try { return JSON.parse(line) } catch { return null } }).filter(Boolean)
+    } catch {
+      return []
+    }
+  }
+
+  async function appendRoutineHistory(routineId, line) {
+    await mkdir(roomsDir, { recursive: true })
+    const path = routineHistoryPath(routineId)
+    const { appendFile } = await import('node:fs/promises')
+    let text = ''
+    try {
+      text = await readFile(path, 'utf8')
+    } catch { text = '' }
+    let lines = text.split('\n').filter((entry) => entry.trim())
+    lines.push(JSON.stringify({ ts: Date.now(), ...line }))
+    lines = lines.slice(-20)
+    await atomicWrite(path, `${lines.join('\n')}\n`)
+  }
+
+  async function loadRoutinesState() {
+    try {
+      return JSON.parse(await readFile(routinesStatePath, 'utf8')) || {}
+    } catch {
+      return {}
+    }
+  }
+
+  async function loadChatSessions() {
+    try {
+      const map = JSON.parse(await readFile(chatSessionsPath, 'utf8'))
+      for (const [botId, sessionId] of Object.entries(map || {})) {
+        if (typeof sessionId === 'string' && sessionId) chatSessionIds.set(botId, sessionId)
+      }
+    } catch { /* 首次启动无文件 */ }
+  }
+
+  async function persistChatSessions() {
+    await atomicWrite(chatSessionsPath, `${JSON.stringify(Object.fromEntries(chatSessionIds), null, 2)}\n`)
+  }
+
+  async function seedBotMemory(bot) {
+    await mkdir(memoryDirOf(bot.id), { recursive: true })
+    try {
+      await readFile(profilePathOf(bot.id), 'utf8')
+    } catch {
+      await atomicWrite(profilePathOf(bot.id), `# ${bot.name} 的长期记忆\n\n（由 ${bot.name} 自己维护：稳定偏好、重要事实、工作摘要。一条一行：日期 + 内容。）\n`)
+    }
+  }
 
   function botState(botId) {
     let state = botStates.get(botId)
@@ -109,9 +198,63 @@ export function apply(ctx, config = {}) {
   function personaPrompt(bot) {
     return [
       bot.persona || '你是常驻桌面 agent 团队的一员，用简体中文直接处理用户投递的任务。',
-      `你的专属工作区目录：${botWorkspace(stateDir, bot)}（文件读写优先在这里进行）。`,
+      `团队共享电脑的工作目录：${botWorkspace(stateDir, bot)}（全队共享，文件读写在这里进行）。`,
       '只汇报真实完成的操作，不要把工具调用伪装成普通文本。',
     ].join('\n')
+  }
+
+  async function memorySections(bot, agentCtx) {
+    // 团队章程（可选，人写）
+    try {
+      const team = await readFile(teamMemoryPath, 'utf8')
+      if (team.trim()) {
+        agentCtx.systemPrompt.section({
+          name: 'grokbot:team',
+          order: -19,
+          text: `## 团队章程（全队共享，优先遵守）\n${team.trim()}`,
+        })
+      }
+    } catch { /* 无章程 */ }
+    // 专家长期记忆（bot 自维护）
+    const profilePath = profilePathOf(bot.id)
+    let profile = ''
+    try {
+      profile = await readFile(profilePath, 'utf8')
+    } catch { /* 未初始化 */ }
+    agentCtx.systemPrompt.section({
+      name: 'grokbot:memory',
+      order: -18,
+      text: [
+        '## 你的长期记忆',
+        `文件路径：${profilePath}（可读写）`,
+        '当前内容：',
+        profile.trim() || '（空）',
+        '',
+        '记忆维护规则：每回合结束时，若本回合产生了值得长期记住的稳定偏好或重要事实，用工具向该文件追加一行「YYYY-MM-DD 事实」。不要写入一次性任务细节；安全边界写在团队章程或你的职责里，不写记忆。',
+      ].join('\n'),
+    })
+    // 技能（跨 bot 复用，文件即技能）
+    try {
+      const { readdir: rd } = await import('node:fs/promises')
+      const files = await rd(skillsDir).catch(() => [])
+      const skills = files.filter((name) => name.endsWith('.md')).sort()
+      if (skills.length > 0) {
+        const lines = []
+        for (const name of skills) {
+          const head = (await readFile(join(skillsDir, name), 'utf8')).split('\n').find((line) => line.trim()) ?? ''
+          lines.push(`/${name.replace(/\.md$/, '')} — ${head.replace(/^#+\s*/, '').slice(0, 60)}`)
+        }
+        agentCtx.systemPrompt.section({
+          name: 'grokbot:skills',
+          order: -17,
+          text: [
+            '## 可复用技能（全队共享）',
+            `目录：${skillsDir}（消息中出现 /技能名 引用时，用读文件工具查看对应 .md 全文并按其执行）`,
+            ...lines,
+          ].join('\n'),
+        })
+      }
+    } catch { /* 无技能 */ }
   }
 
   async function init() {
@@ -119,11 +262,16 @@ export function apply(ctx, config = {}) {
     await ensureInbox(inboxRoot)
     // 共享电脑：全队一个 workspace（Grok Bot 语义）
     await mkdir(join(stateDir, 'workspace'), { recursive: true })
+    await mkdir(join(stateDir, 'memory'), { recursive: true })
+    await mkdir(skillsDir, { recursive: true })
+    await mkdir(roomsDir, { recursive: true })
     const loaded = await loadOrCreateCrew(stateDir)
     crewState.path = loaded.path
     crewState.crew = loaded.crew
+    await loadChatSessions()
     for (const bot of crewState.crew.bots) {
       botState(bot.id)
+      await seedBotMemory(bot)
     }
     ctx.logger?.info?.(`grokbot ready: ${crewState.crew.bots.length} bot(s), inbox=${inboxRoot}`)
   }
@@ -132,22 +280,44 @@ export function apply(ctx, config = {}) {
     await atomicWrite(crewState.path, serializeCrew(crewState.crew))
   }
 
+  const catalogCache = { expiresAt: 0, value: null }
+  async function modelCatalog() {
+    if (catalogCache.expiresAt > Date.now()) return catalogCache.value
+    const providers = typeof ctx.llm?.listProviders === 'function' ? await ctx.llm.listProviders() : []
+    const value = await Promise.all(providers.map(async (provider) => {
+      let models = []
+      try {
+        models = typeof ctx.llm?.listModels === 'function' ? await ctx.llm.listModels(provider.id) : []
+      } catch { models = [] }
+      return {
+        id: provider.id,
+        name: provider.name || provider.id,
+        models: (models || []).map((model) => ({ id: model.id, name: model.name || model.id })),
+      }
+    }))
+    catalogCache.value = value
+    catalogCache.expiresAt = Date.now() + 10_000
+    return value
+  }
+
   const hydrated = init()
 
   // ---------- agent 会话 ----------
 
   const activeSessions = new Set()
 
-  async function createBotAgent(bot) {
+  async function createBotAgent(bot, { sessionId, resume = false } = {}) {
     const abort = new AbortController()
     const fallback = typeof ctx.agentDefaultModel?.currentSelection === 'function'
       ? ctx.agentDefaultModel.currentSelection()
       : null
     const selection = bot.model?.provider && bot.model?.model
       ? bot.model
-      : (fallback?.provider && fallback?.model ? fallback : null)
-    const handle = await ctx.agents.create({
-      sessionId: randomUUID(),
+      : (crewState.crew.defaultModel?.provider && crewState.crew.defaultModel?.model
+          ? crewState.crew.defaultModel
+          : (fallback?.provider && fallback?.model ? fallback : null))
+    const base = {
+      sessionId: sessionId || randomUUID(),
       meta: { cwd: botWorkspace(stateDir, bot) },
       ...(selection ? { agentOptions: selection } : {}),
       signal: abort.signal,
@@ -157,8 +327,20 @@ export function apply(ctx, config = {}) {
           order: -20,
           text: personaPrompt(bot),
         })
+        await memorySections(bot, agentCtx)
       },
-    })
+    }
+    let handle
+    if (resume && sessionId) {
+      // 持久对话：重启后接续同一会话（对话存在电脑之外，与 Grok Bot 语义一致）
+      try {
+        handle = await ctx.agents.resume(base)
+      } catch {
+        handle = await ctx.agents.create({ ...base, sessionId: randomUUID() })
+      }
+    } else {
+      handle = await ctx.agents.create(base)
+    }
     abort.signal.addEventListener('abort', () => {
       try { handle.agent.cancel({ kind: 'user' }) } catch { /* already settled */ }
     }, { once: true })
@@ -175,17 +357,118 @@ export function apply(ctx, config = {}) {
     return session
   }
 
-  async function chatTurn(bot, text) {
+  async function chatTurn(bot, text, { preamble = '' } = {}) {
     let session = chatHandles.get(bot.id)
     if (!session) {
-      session = await createBotAgent(bot)
+      const known = chatSessionIds.get(bot.id)
+      if (known) {
+        session = await createBotAgent(bot, { sessionId: known, resume: true })
+      } else {
+        const sessionId = randomUUID()
+        chatSessionIds.set(bot.id, sessionId)
+        await persistChatSessions()
+        session = await createBotAgent(bot, { sessionId })
+      }
+      const actualId = session.handle.agent?.session?.id
+      if (actualId && actualId !== chatSessionIds.get(bot.id)) {
+        chatSessionIds.set(bot.id, String(actualId))
+        await persistChatSessions()
+      }
       chatHandles.set(bot.id, session)
     }
     await session.handle.agent.whenIdle()
     const firstSeq = session.handle.agent.session.seq
-    session.handle.agent.followup(userMessage(text))
+    session.handle.agent.followup(userMessage(preamble ? `${preamble}\n\n${text}` : text))
     await session.handle.agent.whenIdle()
-    return summarizeTurn(session.handle.agent.session.events, firstSeq)
+    return {
+      ...summarizeTurn(session.handle.agent.session.events, firstSeq),
+      activity: activityOf(session.handle.agent.session.events, firstSeq),
+    }
+  }
+
+  function memberBot(room, botId) {
+    return crewState.crew.bots.find((bot) => bot.id === botId && room.memberBotIds.includes(bot.id))
+  }
+
+  function pickResponder(room, text) {
+    // @提及定向（Grok Bot 语义）；未提及时由默认收件人（若在群内）应答，否则首位成员
+    const mention = /@([\w\u4e00-\u9fa5]+)/.exec(String(text || ''))
+    if (mention) {
+      const hit = room.memberBotIds
+        .map((botId) => crewState.crew.bots.find((bot) => bot.id === botId))
+        .find((bot) => bot && (bot.name.includes(mention[1]) || mention[1] === bot.id || bot.id.includes(mention[1])))
+      if (hit) return hit
+    }
+    const fallbackId = crewState.crew.routing.default
+    const inRoom = room.memberBotIds.includes(fallbackId)
+    return crewState.crew.bots.find((bot) => bot.id === (inRoom ? fallbackId : room.memberBotIds[0]))
+  }
+
+  const HANDOFF_LINE_RE = /^@([\w\u4e00-\u9fa5]+)[：:\s]+(.+)$/
+
+  async function roomTurn(room, senderText, { mentionTarget } = {}) {
+    const members = room.memberBotIds
+      .map((botId) => crewState.crew.bots.find((bot) => bot.id === botId))
+      .filter(Boolean)
+    const responder = mentionTarget ?? pickResponder(room, senderText)
+    if (!responder) throw new Error('群聊无可应答成员')
+    const preamble = [
+      `【群聊 ${room.name}】成员：${members.map((bot) => `${bot.avatar}${bot.name}`).join('、')}。`,
+      '你现在在群聊中应答用户消息。若你认为某条工作应由其他成员处理，在回复的最后一行单独写「@成员名 交代内容」，系统会异步转交；不要除此行外提交接。',
+    ].join('\n')
+    const outcome = await chatTurn(responder, senderText, { preamble })
+    const reply = outcome.text?.trim() || `[${responder.name} 未能给出文本回复：${outcome.error || outcome.stopReason}]`
+    // 解析末尾交接行 → bot↔bot 异步交接
+    const lines = reply.split('\n')
+    const lastLine = lines[lines.length - 1]?.trim() ?? ''
+    const handoff = HANDOFF_LINE_RE.exec(lastLine)
+    if (handoff) {
+      const target = members.find((bot) => bot.name.includes(handoff[1]) || bot.id.includes(handoff[1]))
+      if (target && target.id !== responder.id) {
+        lines.pop()
+        const cleanReply = lines.join('\n').trim() || '（已转交）'
+        await appendRoomMsg(room.id, { role: 'bot', botId: responder.id, text: cleanReply })
+        await appendRoomMsg(room.id, { role: 'handoff', fromBotId: responder.id, toBotId: target.id, text: handoff[2] })
+        void (async () => {
+          try {
+            const relay = await chatTurn(target, `【群聊转交，来自 ${responder.name}】${handoff[2]}`, { preamble: `【群聊 ${room.name}】你收到队友 ${responder.name} 的转交任务。` })
+            await appendRoomMsg(room.id, { role: 'bot', botId: target.id, text: relay.text?.trim() || '[转交处理失败]' })
+          } catch (error) {
+            await appendRoomMsg(room.id, { role: 'system', text: `转交失败：${safeError(error)}` })
+          }
+        })()
+        return { responder, reply: cleanReply, handoffTo: target.id }
+      }
+    }
+    await appendRoomMsg(room.id, { role: 'bot', botId: responder.id, text: reply })
+    return { responder, reply, handoffTo: null }
+  }
+
+  // 陈旧任务清扫：claimed 超过 2×jobTimeout 仍未出结果的，判失败释放队列
+  async function sweepStale() {
+    try {
+      const queueText = await readFile(join(inboxRoot, 'queue.jsonl'), 'utf8').catch(() => '')
+      for (const line of queueText.split('\n')) {
+        const trimmed = line.trim()
+        if (!trimmed) continue
+        let entry
+        try { entry = JSON.parse(trimmed) } catch { continue }
+        const jobId = String(entry.jobId || entry.id || '').trim()
+        const dir = String(entry.dir || join(inboxRoot, jobId))
+        let status = null
+        try { status = JSON.parse(await readFile(join(dir, 'status.json'), 'utf8')) } catch { continue }
+        if (status?.status !== 'claimed') continue
+        const age = Date.now() - (Number(status.startedAt) || 0)
+        if (age < jobTimeoutMs * 2) continue
+        const botId = String(status.botId || routeJob(crewState.crew, entry).id)
+        const job = { jobId, dir, toBot: botId, text: String(entry.text || ''), images: [] }
+        await failJob(job, botId, `任务超时未完成（claimed ${Math.round(age / 1000)}s），已由清扫器释放`)
+        recordRecent({ jobId, botId, status: 'failed', error: 'stale-claimed swept', endedAt: Date.now() })
+        ctx.logger?.warn?.(`grokbot swept stale job ${jobId}`)
+      }
+    } catch (error) {
+      ctx.logger?.warn?.(`grokbot sweep error: ${safeError(error)}`)
+    }
   }
 
   async function runInboxJob(job) {
@@ -266,6 +549,7 @@ export function apply(ctx, config = {}) {
     scanning = true
     try {
       await hydrated
+      await sweepStale()
       const jobs = await scanInbox(inboxRoot)
       for (const job of jobs) {
         if (seenJobIds.has(job.jobId)) continue
@@ -282,6 +566,35 @@ export function apply(ctx, config = {}) {
   }
 
   const rescanTimer = setInterval(() => void scan(), rescanIntervalMs)
+  // routines 调度器：到期触发 → 投递 inbox（试运行/历史同源）
+  const routineTimer = setInterval(() => void (async () => {
+    try {
+      const routines = crewState.crew.routines ?? []
+      if (routines.length === 0) return
+      const state = await loadRoutinesState()
+      const now = new Date()
+      for (const routine of routines) {
+        if (routine.enabled === false) continue
+        const last = Number(state[routine.id]) || 0
+        let due = false
+        if (routine.schedule.everyMinutes) {
+          due = Date.now() - last >= routine.schedule.everyMinutes * 60_000
+        } else if (routine.schedule.time) {
+          const [hh, mm] = routine.schedule.time.split(':').map(Number)
+          due = now.getHours() === hh && now.getMinutes() >= mm
+            && new Date(last).toDateString() !== now.toDateString()
+        }
+        if (!due) continue
+        state[routine.id] = Date.now()
+        await atomicWrite(routinesStatePath, `${JSON.stringify(state, null, 2)}\n`)
+        const job = await enqueueJob(inboxRoot, { toBot: routine.botId, text: `[routine ${routine.id}] ${routine.prompt}` })
+        await appendRoutineHistory(routine.id, { kind: 'scheduled', jobId: job.jobId })
+        ctx.logger?.info?.(`grokbot routine ${routine.id} fired job=${job.jobId}`)
+      }
+    } catch (error) {
+      ctx.logger?.warn?.(`grokbot routine scheduler error: ${safeError(error)}`)
+    }
+  })(), 30_000)
   let watcher = null
   try {
     watcher = watch(inboxRoot, { recursive: true }, () => {
@@ -362,6 +675,8 @@ export function apply(ctx, config = {}) {
         if (method === 'GET' && suffix === '/state') {
           respond(res, 200, {
             bots: crewState.crew.bots.map(publicBot),
+            rooms: crewState.crew.rooms ?? [],
+            routines: crewState.crew.routines ?? [],
             running: [...runningJobs.entries()].map(([jobId, entry]) => ({ jobId, ...entry })),
             queueDepth: pendingJobs.length,
             recentJobs,
@@ -369,6 +684,26 @@ export function apply(ctx, config = {}) {
           }); return
         }
         if (method === 'GET' && suffix === '/crew') {
+          respond(res, 200, { crew: crewState.crew }); return
+        }
+        if (method === 'GET' && suffix === '/model-catalog') {
+          respond(res, 200, { catalog: await modelCatalog(), current: ctx.agentDefaultModel?.currentSelection?.() ?? null }); return
+        }
+        if (method === 'PATCH' && suffix === '/crew') {
+          const body = await readJsonBody(req)
+          const normModel = (value) => value && (value.provider || value.model)
+            ? { provider: String(value.provider || ''), model: String(value.model || '') }
+            : null
+          if (body?.defaultModel !== undefined) crewState.crew.defaultModel = normModel(body.defaultModel)
+          if (body?.utilityModel !== undefined) crewState.crew.utilityModel = normModel(body.utilityModel)
+          if (body?.routing?.default !== undefined) {
+            const target = String(body.routing.default)
+            if (!crewState.crew.bots.some((entry) => entry.id === target)) {
+              throw new HttpError(400, `routing.default 指向不存在的 bot：${target}`)
+            }
+            crewState.crew.routing.default = target
+          }
+          await persistCrew()
           respond(res, 200, { crew: crewState.crew }); return
         }
         if (method === 'POST' && suffix === '/bots') {
@@ -380,6 +715,7 @@ export function apply(ctx, config = {}) {
             throw new HttpError(400, safeError(error))
           }
           await persistCrew()
+          await seedBotMemory(bot).catch(() => undefined)
           respond(res, 201, { bot: publicBot(bot) }); return
         }
         const botMatch = /^\/bots\/([^/]+)$/.exec(suffix)
@@ -420,7 +756,140 @@ export function apply(ctx, config = {}) {
             throw new HttpError(400, safeError(error))
           }
           await persistCrew()
+          await seedBotMemory(bot).catch(() => undefined)
           respond(res, 201, { bot: publicBot(bot) }); return
+        }
+        if (method === 'GET' && suffix === '/rooms') {
+          respond(res, 200, { rooms: crewState.crew.rooms ?? [] }); return
+        }
+        if (method === 'POST' && suffix === '/rooms') {
+          const body = await readJsonBody(req)
+          let room
+          try {
+            room = createRoom(crewState.crew, body)
+          } catch (error) {
+            throw new HttpError(400, safeError(error))
+          }
+          await persistCrew()
+          await appendRoomMsg(room.id, { role: 'system', text: `群聊「${room.name}」创建` })
+          respond(res, 201, { room }); return
+        }
+        const roomMatch = /^\/rooms\/([^/]+)(?:\/(chat|messages))?$/.exec(suffix)
+        if (roomMatch) {
+          const roomId = decodeURIComponent(roomMatch[1])
+          const room = crewState.crew.rooms?.find((entry) => entry.id === roomId)
+          if (!room) throw new HttpError(404, `room 不存在：${roomId}`)
+          if (method === 'GET' && !roomMatch[2]) {
+            respond(res, 200, { room, messages: await readRoomMsgs(roomId) }); return
+          }
+          if (method === 'PATCH' && !roomMatch[2]) {
+            const body = await readJsonBody(req)
+            try {
+              updateRoom(crewState.crew, roomId, body)
+            } catch (error) {
+              throw new HttpError(400, safeError(error))
+            }
+            await persistCrew()
+            respond(res, 200, { room }); return
+          }
+          if (method === 'DELETE' && !roomMatch[2]) {
+            try {
+              removeRoom(crewState.crew, roomId)
+            } catch (error) {
+              throw new HttpError(400, safeError(error))
+            }
+            await persistCrew()
+            respond(res, 200, { ok: true }); return
+          }
+          if (method === 'POST' && roomMatch[2] === 'chat') {
+            const body = await readJsonBody(req)
+            const text = String(body?.text || '').trim()
+            if (!text) throw new HttpError(400, 'text 不能为空')
+            await appendRoomMsg(roomId, { role: 'user', text })
+            const result = await roomTurn(room, text)
+            respond(res, 200, {
+              responder: publicBot(result.responder),
+              reply: result.reply,
+              handoffTo: result.handoffTo,
+              messages: await readRoomMsgs(roomId),
+            }); return
+          }
+        }
+        if (method === 'GET' && suffix === '/skills') {
+          const { readdir: rd } = await import('node:fs/promises')
+          const files = (await rd(skillsDir).catch(() => [])).filter((name) => name.endsWith('.md')).sort()
+          const skills = []
+          for (const name of files) {
+            const content = await readFile(join(skillsDir, name), 'utf8')
+            skills.push({ name: name.replace(/\.md$/, ''), summary: (content.split('\n').find((line) => line.trim()) ?? '').replace(/^#+\s*/, '').slice(0, 80) })
+          }
+          respond(res, 200, { skills }); return
+        }
+        if (method === 'POST' && suffix === '/skills') {
+          const body = await readJsonBody(req)
+          const name = String(body?.name || '').trim().replace(/\.md$/, '')
+          const content = String(body?.content || '').trim()
+          if (!/^[A-Za-z0-9._-]+$/.test(name) || !content) throw new HttpError(400, 'name/content 非法')
+          await atomicWrite(join(skillsDir, `${name}.md`), `${content}\n`)
+          respond(res, 201, { skill: { name } }); return
+        }
+        const skillMatch = /^\/skills\/([^/]+)$/.exec(suffix)
+        if (method === 'DELETE' && skillMatch) {
+          const { rm } = await import('node:fs/promises')
+          const name = decodeURIComponent(skillMatch[1]).replace(/\.md$/, '')
+          if (!/^[A-Za-z0-9._-]+$/.test(name)) throw new HttpError(400, 'name 非法')
+          await rm(join(skillsDir, `${name}.md`), { force: true })
+          respond(res, 200, { ok: true }); return
+        }
+        if (method === 'GET' && suffix === '/routines') {
+          const state = await loadRoutinesState()
+          respond(res, 200, {
+            routines: crewState.crew.routines ?? [],
+            lastRun: state,
+          }); return
+        }
+        if (method === 'POST' && suffix === '/routines') {
+          const body = await readJsonBody(req)
+          let routine
+          try {
+            routine = upsertRoutine(crewState.crew, body)
+          } catch (error) {
+            throw new HttpError(400, safeError(error))
+          }
+          await persistCrew()
+          respond(res, 201, { routine }); return
+        }
+        const routineMatch = /^\/routines\/([^/]+)(?:\/(test))?$/.exec(suffix)
+        if (routineMatch) {
+          const routineId = decodeURIComponent(routineMatch[1])
+          if (method === 'PATCH' && !routineMatch[2]) {
+            const body = await readJsonBody(req)
+            let routine
+            try {
+              routine = upsertRoutine(crewState.crew, body, routineId)
+            } catch (error) {
+              throw new HttpError(400, safeError(error))
+            }
+            await persistCrew()
+            respond(res, 200, { routine }); return
+          }
+          if (method === 'DELETE' && !routineMatch[2]) {
+            try {
+              removeRoutine(crewState.crew, routineId)
+            } catch (error) {
+              throw new HttpError(400, safeError(error))
+            }
+            await persistCrew()
+            respond(res, 200, { ok: true }); return
+          }
+          if (method === 'POST' && routineMatch[2] === 'test') {
+            const routine = crewState.crew.routines?.find((entry) => entry.id === routineId)
+            if (!routine) throw new HttpError(404, `routine 不存在：${routineId}`)
+            const job = await enqueueJob(inboxRoot, { toBot: routine.botId, text: `[routine ${routine.id} 试运行] ${routine.prompt}` })
+            await appendRoutineHistory(routine.id, { kind: 'test', jobId: job.jobId })
+            void scan()
+            respond(res, 202, { job }); return
+          }
         }
         if (method === 'PUT' && suffix === '/crew') {
           const body = await readJsonBody(req)
@@ -464,7 +933,7 @@ export function apply(ctx, config = {}) {
             if (outcome.error) {
               ctx.logger?.warn?.(`grokbot chat ${bot.id} 回复已产出但回合报错：${outcome.error}`)
             }
-            respond(res, 200, { bot: publicBot(bot), reply }); return
+            respond(res, 200, { bot: publicBot(bot), reply, activity: outcome.activity }); return
           } finally {
             state.status = 'idle'
             state.lastActivity = Date.now()
@@ -480,6 +949,7 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => () => {
     disposed = true
     clearInterval(rescanTimer)
+    clearInterval(routineTimer)
     clearTimeout(debounceTimer)
     watcher?.close()
     chatHandles.clear()

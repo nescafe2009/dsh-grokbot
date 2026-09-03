@@ -17,8 +17,25 @@ interface BotInfo {
   lastActivity: number | null
 }
 
+interface RoomInfo {
+  id: string
+  name: string
+  memberBotIds: string[]
+}
+
+interface RoomMessage {
+  ts: number
+  role: string
+  botId?: string
+  fromBotId?: string
+  toBotId?: string
+  text: string
+}
+
 interface GrokbotState {
   bots: BotInfo[]
+  rooms: RoomInfo[]
+  routines: { id: string; botId: string; prompt: string; schedule: { everyMinutes?: number; time?: string }; enabled: boolean }[]
   running: { jobId: string; botId: string; startedAt: number }[]
   queueDepth: number
   recentJobs: { jobId: string; botId: string; status: string; endedAt: number | null }[]
@@ -26,7 +43,7 @@ interface GrokbotState {
 
 interface ChatMessage {
   id: string
-  role: 'user' | 'bot' | 'error'
+  role: 'user' | 'bot' | 'error' | 'activity'
   text: string
   at: number
 }
@@ -43,7 +60,7 @@ const GROKBOT_CSS = `
 .grokbot-botrow.pinned .grokbot-botrow__name::after { content:"📌"; font-size:9px; margin-left:4px; vertical-align:top; }
 .grokbot-form { display:flex; flex-direction:column; gap:8px; padding:10px; margin:0 4px 8px; border:1px solid var(--border,#e3e5e8); border-radius:10px; background:rgba(127,127,127,.05); }
 .grokbot-form__row { display:flex; gap:6px; }
-.grokbot-form input, .grokbot-form textarea { flex:1; min-width:0; border:1px solid var(--border,#d8dbe0); border-radius:8px; padding:6px 9px; font:inherit; font-size:12.5px; background:transparent; color:inherit; }
+.grokbot-form input, .grokbot-form textarea, .grokbot-form select { flex:1; min-width:0; border:1px solid var(--border,#d8dbe0); border-radius:8px; padding:6px 9px; font:inherit; font-size:12.5px; background:transparent; color:inherit; }
 .grokbot-form textarea { resize:vertical; min-height:52px; }
 .grokbot-form__actions { display:flex; gap:6px; justify-content:flex-end; }
 .grokbot-form__actions button { border:none; border-radius:8px; padding:5px 12px; font-size:12px; cursor:pointer; font-weight:600; }
@@ -81,6 +98,7 @@ const GROKBOT_CSS = `
 .grokbot-msg.user { align-self:flex-end; background:#3b82f6; color:#fff; border-bottom-right-radius:5px; }
 .grokbot-msg.bot { align-self:flex-start; background:var(--background-muted, #f2f3f5); border-bottom-left-radius:5px; }
 .grokbot-msg.error { align-self:center; background:#fff1f0; color:#cf1322; font-size:12px; }
+.grokbot-msg.activity { align-self:center; background:rgba(127,127,127,.1); font-size:11.5px; opacity:.75; padding:4px 12px; }
 .grokbot-msg .grokbot-msg__time { display:block; font-size:10px; opacity:.5; margin-top:5px; }
 .grokbot-empty { margin:auto; text-align:center; opacity:.5; font-size:13px; }
 .grokbot-inputbar { display:flex; gap:10px; padding:16px 22px 20px; border-top:1px solid var(--border, #e3e5e8); }
@@ -90,22 +108,42 @@ const GROKBOT_CSS = `
 .grokbot-inputbar button:disabled { opacity:.45; cursor:default; }
 `
 
-let openBotId: string | null = null
+let openTarget: { kind: 'bot' | 'room'; id: string } | null = null
 let nativeSidebarVisible = false
 const listeners = new Set<() => void>()
+
+function openBot(botId: string): void {
+  openTarget = { kind: 'bot', id: botId }
+  for (const listener of listeners) listener()
+}
+
+function openRoom(roomId: string): void {
+  openTarget = { kind: 'room', id: roomId }
+  for (const listener of listeners) listener()
+}
+
+function closeTarget(): void {
+  openTarget = null
+  for (const listener of listeners) listener()
+}
 
 function toggleNativeSidebar(): void {
   nativeSidebarVisible = !nativeSidebarVisible
   for (const listener of listeners) listener()
 }
 
-function openBot(botId: string): void {
-  openBotId = botId
-  for (const listener of listeners) listener()
+function useOpenTarget(): { kind: 'bot' | 'room'; id: string } | null {
+  const [, force] = useState(0)
+  useEffect(() => {
+    const listener = (): void => force((n) => n + 1)
+    listeners.add(listener)
+    return () => { listeners.delete(listener) }
+  }, [])
+  return openTarget
 }
 
-function closeBot(): void {
-  openBotId = null
+function openBot(botId: string): void {
+  openBotId = botId
   for (const listener of listeners) listener()
 }
 
@@ -151,16 +189,6 @@ function useGrokbotState(): GrokbotState | null {
   return state
 }
 
-function useOpenBotId(): string | null {
-  const [, force] = useState(0)
-  useEffect(() => {
-    const listener = (): void => force((n) => n + 1)
-    listeners.add(listener)
-    return () => { listeners.delete(listener) }
-  }, [])
-  return openBotId
-}
-
 function useNativeSidebarVisible(): boolean {
   const [visible, setVisible] = useState(nativeSidebarVisible)
   useEffect(() => {
@@ -179,6 +207,71 @@ function statusLine(bot: BotInfo): string {
   return '待命'
 }
 
+interface CatalogProvider {
+  id: string
+  name: string
+  models: { id: string; name: string }[]
+}
+
+let catalogCache: { at: number; providers: CatalogProvider[] } | null = null
+async function fetchCatalog(): Promise<CatalogProvider[]> {
+  if (catalogCache && Date.now() - catalogCache.at < 60_000) return catalogCache.providers
+  const outcome = await api('/model-catalog').catch(() => null)
+  const providers = (outcome?.catalog ?? []) as CatalogProvider[]
+  catalogCache = { at: Date.now(), providers }
+  return providers
+}
+
+function RoomForm(props: {
+  bots: BotInfo[]
+  onCancel: () => void
+  onSaved: (roomId: string) => void
+}): ReactNode {
+  const [name, setName] = useState('')
+  const [selected, setSelected] = useState<string[]>([])
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  const toggle = (botId: string): void => {
+    setSelected((prev) => prev.includes(botId) ? prev.filter((entry) => entry !== botId) : [...prev, botId])
+  }
+
+  const submit = useCallback(async (): Promise<void> => {
+    if (busy) return
+    if (selected.length < 2) { setError('群聊需要选择 2-6 位成员'); return }
+    setBusy(true)
+    setError('')
+    try {
+      const outcome = await api('/rooms', {
+        method: 'POST',
+        body: JSON.stringify({ name: name.trim() || '新群聊', memberBotIds: selected }),
+      })
+      props.onSaved(String(outcome?.room?.id ?? ''))
+    } catch (err) {
+      setError(String((err as Error)?.message ?? err))
+    } finally {
+      setBusy(false)
+    }
+  }, [name, selected, busy, props])
+
+  return (
+    <div className="grokbot-form">
+      <input value={name} onChange={(e) => setName(e.target.value)} placeholder="群聊名称（可空）" aria-label="群聊名称" />
+      {props.bots.map((bot) => (
+        <label key={bot.id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5, cursor: 'pointer' }}>
+          <input type="checkbox" style={{ width: 'auto', flex: 'none' }} checked={selected.includes(bot.id)} onChange={() => toggle(bot.id)} />
+          <span>{bot.avatar} {bot.name}</span>
+        </label>
+      ))}
+      {error ? <span style={{ color: '#cf1322', fontSize: 11.5 }}>{error}</span> : null}
+      <div className="grokbot-form__actions">
+        <button type="button" className="grokbot-form__cancel" onClick={props.onCancel}>取消</button>
+        <button type="button" className="grokbot-form__submit" disabled={busy} onClick={() => void submit()}>创建群聊</button>
+      </div>
+    </div>
+  )
+}
+
 function BotForm(props: {
   initial?: BotInfo | null
   onCancel: () => void
@@ -189,8 +282,17 @@ function BotForm(props: {
   const [name, setName] = useState(initial?.name ?? '')
   const [title, setTitle] = useState(initial?.title ?? '')
   const [persona, setPersona] = useState('')
+  const [advanced, setAdvanced] = useState(false)
+  const [providers, setProviders] = useState<CatalogProvider[]>([])
+  const [providerId, setProviderId] = useState('')
+  const [modelId, setModelId] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+
+  useEffect(() => {
+    if (!advanced || providers.length > 0) return
+    void fetchCatalog().then(setProviders).catch(() => undefined)
+  }, [advanced, providers.length])
 
   const submit = useCallback(async (): Promise<void> => {
     if (busy) return
@@ -204,6 +306,8 @@ function BotForm(props: {
         title: title.trim(),
       }
       if (persona.trim()) payload.persona = persona.trim()
+      if (providerId && modelId) payload.model = { provider: providerId, model: modelId }
+      else if (initial && !providerId) payload.model = null
       const outcome = initial
         ? await api(`/bots/${encodeURIComponent(initial.id)}`, { method: 'PATCH', body: JSON.stringify(payload) })
         : await api('/bots', { method: 'POST', body: JSON.stringify(payload) })
@@ -213,7 +317,7 @@ function BotForm(props: {
     } finally {
       setBusy(false)
     }
-  }, [avatar, name, title, persona, busy, initial, props])
+  }, [avatar, name, title, persona, providerId, modelId, busy, initial, props])
 
   return (
     <div className="grokbot-form">
@@ -223,6 +327,23 @@ function BotForm(props: {
       </div>
       <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="头衔，如：检索与情报专家" aria-label="头衔" />
       <textarea value={persona} onChange={(e) => setPersona(e.target.value)} placeholder={initial ? '补充职责/规则（留空不改）' : '职责与持久规则：它负责什么、怎么做事、安全边界'} aria-label="职责" />
+      <button type="button" className="grokbot-form__cancel" style={{ alignSelf: 'flex-start' }} onClick={() => setAdvanced((v) => !v)}>{advanced ? '收起高级设置' : '高级设置（模型）'}</button>
+      {advanced
+        ? (
+          <div className="grokbot-form__row">
+            <select value={providerId} onChange={(e) => { setProviderId(e.target.value); setModelId('') }} aria-label="provider">
+              <option value="">模型：跟随团队默认</option>
+              {providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}
+            </select>
+            <select value={modelId} onChange={(e) => setModelId(e.target.value)} aria-label="model" disabled={!providerId}>
+              <option value="">选择模型</option>
+              {(providers.find((provider) => provider.id === providerId)?.models ?? []).map((model) => (
+                <option key={model.id} value={model.id}>{model.name}</option>
+              ))}
+            </select>
+          </div>
+        )
+        : null}
       {error ? <span style={{ color: '#cf1322', fontSize: '11.5px' }}>{error}</span> : null}
       <div className="grokbot-form__actions">
         <button type="button" className="grokbot-form__cancel" onClick={props.onCancel}>取消</button>
@@ -239,9 +360,10 @@ function BotForm(props: {
  */
 export function GrokbotSidebarCrew(): ReactNode {
   const state = useGrokbotState()
-  const openId = useOpenBotId()
+  const target = useOpenTarget()
   const nativeVisible = useNativeSidebarVisible()
   const [creating, setCreating] = useState(false)
+  const [grouping, setGrouping] = useState(false)
   const rootRef = useRef<HTMLDivElement | null>(null)
   const hiddenRef = useRef<HTMLElement[]>([])
 
@@ -297,6 +419,12 @@ export function GrokbotSidebarCrew(): ReactNode {
         <button
           type="button"
           className="grokbot-sidebar__new"
+          title="新建群聊"
+          onClick={() => setGrouping(true)}
+        >👥</button>
+        <button
+          type="button"
+          className="grokbot-sidebar__new"
           title="新建专家"
           onClick={() => setCreating(true)}
         >＋</button>
@@ -310,6 +438,26 @@ export function GrokbotSidebarCrew(): ReactNode {
       {creating
         ? <BotForm onCancel={() => setCreating(false)} onSaved={() => setCreating(false)} />
         : null}
+      {grouping
+        ? <RoomForm bots={allBots.filter((bot) => !bot.hidden)} onCancel={() => setGrouping(false)} onSaved={(roomId) => { setGrouping(false); openRoom(roomId) }} />
+        : null}
+      {(state?.rooms ?? []).length > 0 || grouping
+        ? <div className="grokbot-sidebar__section">群聊</div>
+        : null}
+      {(state?.rooms ?? []).map((room) => (
+        <button
+          key={room.id}
+          type="button"
+          className={`grokbot-botrow${target?.kind === 'room' && target.id === room.id ? ' active' : ''}`}
+          onClick={() => openRoom(room.id)}
+        >
+          <span className="grokbot-botrow__avatar">👥</span>
+          <span className="grokbot-botrow__main">
+            <span className="grokbot-botrow__name">{room.name}</span>
+            <span className="grokbot-botrow__status">{room.memberBotIds.map((botId) => allBots.find((bot) => bot.id === botId)?.name ?? botId).join('、')}</span>
+          </span>
+        </button>
+      ))}
       {groups.map((group) => (
         <div key={group.section || '__default__'}>
           {group.section ? <div className="grokbot-sidebar__section">{group.section}</div> : null}
@@ -317,7 +465,7 @@ export function GrokbotSidebarCrew(): ReactNode {
             <button
               key={bot.id}
               type="button"
-              className={`grokbot-botrow${openId === bot.id ? ' active' : ''}${bot.pinned ? ' pinned' : ''}`}
+              className={`grokbot-botrow${target?.kind === 'bot' && target.id === bot.id ? ' active' : ''}${bot.pinned ? ' pinned' : ''}`}
               onClick={() => openBot(bot.id)}
             >
               <span className="grokbot-botrow__avatar">{bot.avatar}</span>
@@ -357,6 +505,19 @@ function BotChatView(props: { bot: BotInfo }): ReactNode {
         method: 'POST',
         body: JSON.stringify({ text }),
       })
+      const activity = (outcome?.activity ?? []) as string[]
+      if (activity.length > 0) {
+        const counted = activity.reduce<Record<string, number>>((acc, name) => {
+          acc[name] = (acc[name] ?? 0) + 1
+          return acc
+        }, {})
+        appendHistory(bot.id, {
+          id: `${Date.now()}-a`,
+          role: 'activity' as never,
+          text: Object.entries(counted).map(([name, count]) => `🔧 ${name}${count > 1 ? ` ×${count}` : ''}`).join('　'),
+          at: Date.now(),
+        })
+      }
       appendHistory(bot.id, { id: `${Date.now()}-b`, role: 'bot', text: String(outcome?.reply ?? ''), at: Date.now() })
     } catch (error) {
       appendHistory(bot.id, {
@@ -371,7 +532,7 @@ function BotChatView(props: { bot: BotInfo }): ReactNode {
   }, [bot.id, draft, sending])
 
   return (
-    <div className="grokbot-chat" onKeyDown={(event) => { if (event.key === 'Escape') closeBot() }}>
+    <div className="grokbot-chat" onKeyDown={(event) => { if (event.key === 'Escape') closeTarget() }}>
       <div className="grokbot-chat__head">
         <span className="grokbot-chat__avatar">{bot.avatar}</span>
         <span className="grokbot-chat__title">
@@ -381,7 +542,7 @@ function BotChatView(props: { bot: BotInfo }): ReactNode {
           </span>
         </span>
         <button className="grokbot-chat__edit" type="button" onClick={() => setEditing(true)}>编辑</button>
-        <button className="grokbot-chat__close" type="button" onClick={closeBot} aria-label="关闭">✕</button>
+        <button className="grokbot-chat__close" type="button" onClick={closeTarget} aria-label="关闭">✕</button>
       </div>
       {editing
         ? <BotForm initial={bot} onCancel={() => setEditing(false)} onSaved={() => setEditing(false)} />
@@ -416,20 +577,129 @@ function BotChatView(props: { bot: BotInfo }): ReactNode {
   )
 }
 
+function GroupChatView(props: { room: RoomInfo; bots: BotInfo[] }): ReactNode {
+  const { room, bots } = props
+  const [messages, setMessages] = useState<RoomMessage[]>([])
+  const [draft, setDraft] = useState('')
+  const [sending, setSending] = useState(false)
+  const logRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    let alive = true
+    const tick = (): void => {
+      api(`/rooms/${encodeURIComponent(room.id)}`).then((outcome) => {
+        if (alive) setMessages((outcome?.messages ?? []) as RoomMessage[])
+      }).catch(() => undefined)
+    }
+    tick()
+    const timer = setInterval(tick, 3000)
+    return () => { alive = false; clearInterval(timer) }
+  }, [room.id])
+
+  useEffect(() => {
+    logRef.current?.scrollTo({ top: logRef.current.scrollHeight })
+  }, [messages.length, sending])
+
+  const botOf = (botId?: string): BotInfo | undefined => bots.find((bot) => bot.id === botId)
+
+  const send = useCallback(async (): Promise<void> => {
+    const text = draft.trim()
+    if (!text || sending) return
+    setDraft('')
+    setSending(true)
+    try {
+      const outcome = await api(`/rooms/${encodeURIComponent(room.id)}/chat`, {
+        method: 'POST',
+        body: JSON.stringify({ text }),
+      })
+      setMessages(((outcome?.messages ?? []) as RoomMessage[]).slice())
+    } catch (error) {
+      setMessages((prev) => [...prev, { ts: Date.now(), role: 'system', text: `发送失败：${String((error as Error)?.message ?? error)}` }])
+    } finally {
+      setSending(false)
+    }
+  }, [draft, sending, room.id])
+
+  return (
+    <div className="grokbot-chat" style={{ width: '100%', height: '100%' }} onKeyDown={(event) => { if (event.key === 'Escape') closeTarget() }}>
+      <div className="grokbot-chat__head">
+        <span className="grokbot-chat__avatar">👥</span>
+        <span className="grokbot-chat__title">
+          <span className="grokbot-chat__name">{room.name}</span>
+          <span className="grokbot-chat__meta">
+            {room.memberBotIds.map((botId) => `${botOf(botId)?.avatar ?? '\u{1F916}'}${botOf(botId)?.name ?? botId}`).join('\u3000')}
+          </span>
+        </span>
+        <button className="grokbot-chat__close" type="button" onClick={closeTarget} aria-label="关闭">✕</button>
+      </div>
+      <div className="grokbot-log" ref={logRef}>
+        {messages.length === 0
+          ? <div className="grokbot-empty">群聊成员会自主决定谁应答；@成员名 可定向，bot 之间也会互相转交。</div>
+          : messages.map((message, index) => {
+              if (message.role === 'user') {
+                return (
+                  <div key={index} className="grokbot-msg user">
+                    {message.text}
+                    <span className="grokbot-msg__time">{new Date(message.ts).toLocaleTimeString()}</span>
+                  </div>
+                )
+              }
+              if (message.role === 'handoff') {
+                return (
+                  <div key={index} className="grokbot-msg activity">
+                    ↪ {botOf(message.fromBotId)?.name ?? message.fromBotId} → {botOf(message.toBotId)?.name ?? message.toBotId}：{message.text}
+                  </div>
+                )
+              }
+              if (message.role === 'system') {
+                return <div key={index} className="grokbot-msg activity">{message.text}</div>
+              }
+              const bot = botOf(message.botId)
+              return (
+                <div key={index} className="grokbot-msg bot">
+                  <strong>{bot?.avatar ?? ''}{bot?.name ?? message.botId}</strong>
+                  <div>{message.text}</div>
+                  <span className="grokbot-msg__time">{new Date(message.ts).toLocaleTimeString()}</span>
+                </div>
+              )
+            })}
+        {sending ? <div className="grokbot-empty">成员思考中…</div> : null}
+      </div>
+      <div className="grokbot-inputbar">
+        <textarea
+          value={draft}
+          placeholder={`发到 ${room.name}…（@成员名 定向）`}
+          rows={2}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && !event.shiftKey) {
+              event.preventDefault()
+              void send()
+            }
+          }}
+        />
+        <button type="button" disabled={sending || draft.trim().length === 0} onClick={() => void send()}>发送</button>
+      </div>
+    </div>
+  )
+}
+
 /**
  * 主区视图：选中 bot 后就地接管 centerCol——隐藏默认内容与 detailsCol，
  * 会话视图对位 centerCol 矩形（ResizeObserver 跟随），关闭即还原。
  */
 export function GrokbotMainView(): ReactNode {
-  const openId = useOpenBotId()
+  const target = useOpenTarget()
   const state = useGrokbotState()
-  const bot = openId ? (state?.bots.find((entry) => entry.id === openId) ?? null) : null
+  const bot = target?.kind === 'bot' ? (state?.bots.find((entry) => entry.id === target.id) ?? null) : null
+  const room = target?.kind === 'room' ? (state?.rooms.find((entry) => entry.id === target.id) ?? null) : null
+  const activeKey = bot ? `bot:${bot.id}` : room ? `room:${room.id}` : null
   const [box, setBox] = useState<{ left: number; top: number; width: number; height: number } | null>(null)
   const hiddenRef = useRef<HTMLElement[]>([])
 
   useEffect(() => {
     hiddenRef.current = []
-    if (!bot) return
+    if (!activeKey) return
     const center = (document.querySelector('[class*="centerCol"]') as HTMLElement) ?? null
     const details = (document.querySelector('[class*="detailsCol"]') as HTMLElement) ?? null
     if (!center) return
@@ -459,15 +729,15 @@ export function GrokbotMainView(): ReactNode {
       hiddenRef.current = []
       setBox(null)
     }
-  }, [bot?.id])
+  }, [activeKey])
 
-  if (!bot || !box) return null
+  if (!box || !activeKey) return null
   return (
     <div
       className="grokbot-chat grokbot-chat--main"
       style={{ position: 'fixed', left: box.left, top: box.top, width: box.width, height: box.height, zIndex: 900 }}
     >
-      <BotChatView bot={bot} />
+      {bot ? <BotChatView bot={bot} /> : room ? <GroupChatView room={room} bots={state?.bots ?? []} /> : null}
     </div>
   )
 }
