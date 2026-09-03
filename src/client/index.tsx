@@ -49,8 +49,8 @@ const GROKBOT_CSS = `
 .grokbot-botrow__badge { width:8px; height:8px; border-radius:50%; background:#2ea043; flex:none; }
 .grokbot-botrow__badge.working { background:#f0883e; animation: grokbot-pulse 1.2s infinite; }
 @keyframes grokbot-pulse { 0%,100% { opacity:1 } 50% { opacity:.35 } }
-.grokbot-stage { position:fixed; inset:0; z-index:1200; display:flex; align-items:stretch; justify-content:center; background:rgba(15,17,21,.46); backdrop-filter: blur(2px); }
-.grokbot-chat { width:min(880px, 96vw); height:100%; display:flex; flex-direction:column; background:var(--background, #fff); box-shadow:0 0 48px rgba(0,0,0,.25); }
+.grokbot-chat { width:min(880px, 96vw); height:100%; display:flex; flex-direction:column; background:var(--background, #fff); }
+.grokbot-chat--main { box-shadow:none; }
 .grokbot-chat__head { display:flex; align-items:center; gap:12px; padding:16px 22px; border-bottom:1px solid var(--border, #e3e5e8); }
 .grokbot-chat__avatar { font-size:26px; }
 .grokbot-chat__title { flex:1; display:flex; flex-direction:column; }
@@ -316,13 +316,57 @@ function BotChatView(props: { bot: BotInfo }): ReactNode {
   )
 }
 
-export function GrokbotStage(): ReactNode {
+/**
+ * 主区视图：选中 bot 后就地接管 centerCol——隐藏默认内容与 detailsCol，
+ * 会话视图对位 centerCol 矩形（ResizeObserver 跟随），关闭即还原。
+ */
+export function GrokbotMainView(): ReactNode {
   const openId = useOpenBotId()
   const state = useGrokbotState()
-  const bot = state?.bots.find((entry) => entry.id === openId) ?? null
-  if (!bot) return null
+  const bot = openId ? (state?.bots.find((entry) => entry.id === openId) ?? null) : null
+  const [box, setBox] = useState<{ left: number; top: number; width: number; height: number } | null>(null)
+  const hiddenRef = useRef<HTMLElement[]>([])
+
+  useEffect(() => {
+    hiddenRef.current = []
+    if (!bot) return
+    const center = (document.querySelector('[class*="centerCol"]') as HTMLElement) ?? null
+    const details = (document.querySelector('[class*="detailsCol"]') as HTMLElement) ?? null
+    if (!center) return
+    const takeover = (): void => {
+      const rect = center.getBoundingClientRect()
+      setBox({ left: rect.left, top: rect.top, width: rect.width, height: rect.height })
+    }
+    const hide = (el: HTMLElement | null): void => {
+      if (!el || el.dataset.grokbotPrevDisplay !== undefined) return
+      el.dataset.grokbotPrevDisplay = el.style.display
+      el.style.display = 'none'
+      hiddenRef.current.push(el)
+    }
+    for (const child of [...center.children]) hide(child as HTMLElement)
+    hide(details)
+    takeover()
+    const observer = new ResizeObserver(takeover)
+    observer.observe(center)
+    window.addEventListener('resize', takeover)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', takeover)
+      for (const el of hiddenRef.current) {
+        el.style.display = el.dataset.grokbotPrevDisplay || ''
+        delete el.dataset.grokbotPrevDisplay
+      }
+      hiddenRef.current = []
+      setBox(null)
+    }
+  }, [bot?.id])
+
+  if (!bot || !box) return null
   return (
-    <div className="grokbot-stage" onClick={(event) => { if (event.target === event.currentTarget) closeBot() }}>
+    <div
+      className="grokbot-chat grokbot-chat--main"
+      style={{ position: 'fixed', left: box.left, top: box.top, width: box.width, height: box.height, zIndex: 900 }}
+    >
       <BotChatView bot={bot} />
     </div>
   )
@@ -347,7 +391,7 @@ export function apply(ctx: any): void {
 
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay',
-    id: 'grokbot-stage',
+    id: 'grokbot-main',
     order: 51,
-  }, GrokbotStage))
+  }, GrokbotMainView))
 }
