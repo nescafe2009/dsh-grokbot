@@ -84,7 +84,11 @@ DSH_HOME=/tmp/dsh-smoke dsh --profile web --dump-config   # 树中应出现 grok
 
 ## 路线图
 
-见 [GOALS.md](./GOALS.md)：常驻团队（已实现）→ 首页 UI（已实现）→ 触发器（cron/webhook/watcher）→ 幕僚长路由编排。
+见 [GOALS.md](./GOALS.md)：常驻团队 ✅ → 首页 UI ✅ → inbox 协议 ✅ → 触发器（cron/webhook，规划中）→ 幕僚长路由编排（规划中）。
+
+### 已知问题
+
+- 多轮工具调用后，部分 OpenAI 兼容端点（如自建 vLLM 网关）会因请求携带空 `tools` 数组返回 400，导致带工具任务最后一轮失败；无工具任务不受影响。需在模型服务端修复（省略空 `tools` 字段）
 
 ## License
 

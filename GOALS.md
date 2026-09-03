@@ -50,6 +50,20 @@
 
 G1 → G3（协议先于 UI，可被 todi-hub 立即验证）→ G4 → G2 → G6 → G5 → G7
 
+## 验证记录（2026-09-03，隔离 DSH_HOME=/tmp/dsh-smoke + NAS qwen 真模型）
+
+- **G1 ✅**：`dsh plugin --profile web add <dir>` 自动入 bundles；`--dump-config` 组合树含 grokbot 节点；boot 无 error
+- **G2 ✅（核心）**：crew 自动生成（幕僚长）；真模型 chat 回复 9.9s，人设正确；inbox 任务热路径 6s
+- **G3 ✅**：HTTP 投递（POST /inbox）与纯文件投递（手写 prompt.md + queue.jsonl，todi-hub 同构）均 6s 出 reply.md；status 状态机正确
+- **G4 ✅**：首页出现「Agent 团队 · 常驻接活」卡片（渲染于 conversation.input.dock 插槽）；点击在窗口内浮层对话（shell.overlay），全程不新开窗口；发送→真模型回复 UI 内呈现
+- **G5 ✅（watcher）**：文件 watcher + 5s 轮询双保险，投递后秒级被发现
+
+## 已知问题与约束
+
+- **上游模型端**：NAS qwen 端点在多轮工具调用后发送 `tools: []` 会返回 400（`tools must not be an empty array`）。影响：带工具的多步任务最后一轮失败，插件按"已产出文本则回复 + 日志告警，无文本则任务失败"处理。无工具任务完全正常。修法在服务端（vLLM/网关侧省略空 tools 字段），不在本插件
+- 思考型模型（qwen3.8）的工具前导思考文本可能成为回复内容（取最后一个有文本的 step）；已按 turn/end 错误原因区分并告警
+- 首页 dock 插槽在未选择 workspace 时不渲染（DSH 前端行为，与 arena 一致）；Electron 桌面版有原生 picker 不受影响
+
 ## 已知约束与依赖
 
 - 本机 `dsh` CLI 通过 app 内包运行（系统 node 22）；插件构建产物提交进仓库，安装端无需 TS 工具链

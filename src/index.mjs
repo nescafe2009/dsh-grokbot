@@ -34,21 +34,43 @@ function contentText(content) {
   return parts.join('\n').trim()
 }
 
+function chunkText(chunk) {
+  if (!chunk || typeof chunk !== 'object') return ''
+  const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined
+  const delta = choice?.delta ?? chunk.delta
+  if (typeof delta?.content === 'string') return delta.content
+  if (typeof delta?.text === 'string') return delta.text
+  if (typeof chunk.text === 'string') return chunk.text
+  if (typeof chunk.content === 'string') return chunk.content
+  return ''
+}
+
 export function summarizeTurn(events, firstSeq) {
-  let text = ''
   let stopReason = 'completed'
   let error = ''
+  const stepText = new Map()
   const trace = []
   for (const event of events) {
     if (event.seq < firstSeq) continue
     trace.push(event.type)
-    if (event.type === 'assistant/message') {
+    const step = String(event.data?.step ?? '')
+    if (event.type === 'assistant/chunk') {
+      stepText.set(step, (stepText.get(step) || '') + chunkText(event.data?.chunk))
+    } else if (event.type === 'assistant/message') {
       const joined = contentText(event.data?.message?.content)
-      if (joined) text = joined
+      if (joined) stepText.set(step, joined)
     } else if (event.type === 'turn/end') {
-      stopReason = String(event.data?.stopReason || stopReason)
-      if (event.data?.error) error = safeError(event.data.error)
+      const reason = event.data?.reason && typeof event.data.reason === 'object' ? event.data.reason : {}
+      stopReason = String(reason.kind || event.data?.stopReason || stopReason)
+      const errText = reason.error?.message || reason.failure?.message
+        || (event.data?.error ? safeError(event.data.error) : '')
+      if (errText) error = String(errText).slice(0, 500)
     }
+  }
+  let text = ''
+  for (const [, value] of [...stepText.entries()].sort((a, b) => String(a[0]).localeCompare(String(b[0]), undefined, { numeric: true }))) {
+    const joined = value.trim()
+    if (joined) text = joined
   }
   return { text, stopReason, error, trace }
 }
@@ -189,11 +211,16 @@ export function apply(ctx, config = {}) {
       }
       const reply = outcome.text?.trim()
       if (!reply) {
-        const reason = outcome.error || `stopReason=${outcome.stopReason}，无文本输出`
+        const reason = outcome.error
+          ? `${outcome.error}（stopReason=${outcome.stopReason}）`
+          : `stopReason=${outcome.stopReason}，无文本输出`
         await failJob(job, bot.id, reason)
         recordRecent({ jobId: job.jobId, botId: bot.id, status: 'failed', error: reason, endedAt: Date.now() })
         ctx.logger?.warn?.(`grokbot job ${job.jobId} failed: ${reason}`)
       } else {
+        if (outcome.error) {
+          ctx.logger?.warn?.(`grokbot job ${job.jobId} 回复已产出但回合报错：${outcome.error}`)
+        }
         await completeJob(job, bot.id, reply)
         recordRecent({ jobId: job.jobId, botId: bot.id, status: 'replied', bytes: reply.length, endedAt: Date.now() })
         ctx.logger?.info?.(`grokbot job ${job.jobId} replied by ${bot.id} (${reply.length} bytes)`)
@@ -370,7 +397,12 @@ export function apply(ctx, config = {}) {
             const outcome = await chatTurn(bot, text)
             const reply = outcome.text?.trim()
             if (!reply) {
-              throw new HttpError(502, outcome.error || `stopReason=${outcome.stopReason}，无文本输出；events=[${outcome.trace.join(',')}]`)
+              const types = [...new Set(outcome.trace)].join(',')
+              const reason = outcome.error ? `；${outcome.error}` : ''
+              throw new HttpError(502, `stopReason=${outcome.stopReason}${reason}；events=[${types}]`)
+            }
+            if (outcome.error) {
+              ctx.logger?.warn?.(`grokbot chat ${bot.id} 回复已产出但回合报错：${outcome.error}`)
             }
             respond(res, 200, { bot: publicBot(bot), reply }); return
           } finally {
