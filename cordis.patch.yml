@@ -1,0 +1,8 @@
+- insert:
+    - id: grokbot
+      name: dsh-grokbot
+      config:
+        stateDir: !!js dshHomePath('grokbot')
+        maxConcurrentJobs: 2
+        jobTimeoutMs: 600000
+        rescanIntervalMs: 5000
