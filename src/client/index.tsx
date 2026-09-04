@@ -178,6 +178,17 @@ const GROKBOT_CSS = `
 .grokbot-msg .grokbot-msg__time { display:block; font-size:10px; color:var(--gk-text-3); margin-top:5px; text-align:inherit; font-variant-numeric:tabular-nums; }
 .grokbot-empty { margin:auto; text-align:center; color:var(--gk-text-3); font-size:13px; line-height:1.7; }
 .grokbot-details { width:272px; flex:none; border-left:1px solid var(--gk-line); overflow-y:auto; padding:16px 16px 24px; display:flex; flex-direction:column; gap:18px; background:#fafafc; }
+.grokbot-rating { border:1px solid var(--gk-line); border-radius:12px; padding:11px 13px; background:#fff; }
+.grokbot-rating__head { display:flex; align-items:center; gap:8px; }
+.grokbot-rating__level { background:linear-gradient(135deg,var(--gk-accent-2),var(--gk-accent)); color:#fff; font-size:11px; font-weight:700; border-radius:7px; padding:2px 8px; }
+.grokbot-rating__title { font-size:13px; font-weight:650; }
+.grokbot-rating__stars { margin-left:auto; color:#f5a623; font-size:12px; letter-spacing:1px; }
+.grokbot-rating__bar { height:6px; border-radius:3px; background:var(--gk-bg-soft); margin:9px 0 6px; overflow:hidden; }
+.grokbot-rating__fill { height:100%; border-radius:3px; background:linear-gradient(90deg,var(--gk-accent-2),var(--gk-accent)); transition:width .3s; }
+.grokbot-rating__nums { font-size:11px; color:var(--gk-text-3); font-variant-numeric:tabular-nums; }
+.grokbot-fb { margin-left:8px; white-space:nowrap; }
+.grokbot-fb button { border:none; background:none; cursor:pointer; font-size:11px; opacity:.4; padding:0 2px; transition:opacity .12s, transform .12s; }
+.grokbot-fb button:hover { opacity:1; transform:scale(1.2); }
 .grokbot-details__title { font-size:11px; font-weight:700; color:var(--gk-text-3); letter-spacing:.07em; text-transform:uppercase; }
 .grokbot-member { display:flex; align-items:center; gap:10px; padding:7px 6px; font-size:13px; font-weight:500; border-radius:9px; }
 .grokbot-member:hover { background:rgba(29,29,31,.04); }
@@ -233,7 +244,8 @@ const GROKBOT_CSS = `
 .grokbot-role { width:152px; display:flex; flex-direction:column; align-items:center; gap:7px; padding:20px 10px 15px; border:1px solid var(--gk-line); border-radius:16px; background:#fff; cursor:pointer; font:inherit; color:inherit; transition:all .18s cubic-bezier(.4,0,.2,1); box-shadow:var(--gk-shadow-sm); }
 .grokbot-role:hover { border-color:var(--gk-accent-2); transform:translateY(-3px); box-shadow:0 10px 28px rgba(37,99,235,.16); }
 .grokbot-role:disabled { opacity:.5; cursor:default; transform:none; }
-.grokbot-role__avatar { width:46px; height:46px; border-radius:14px; display:flex; align-items:center; justify-content:center; font-size:24px; box-shadow:var(--gk-shadow-sm); }
+.grokbot-role__avatar { width:48px; height:48px; border-radius:16px; display:flex; align-items:center; justify-content:center; box-shadow:var(--gk-shadow-sm); }
+.grokbot-role__avatar svg { width:58%; height:58%; }
 .grokbot-role__name { font-size:14.5px; font-weight:700; letter-spacing:-.01em; }
 .grokbot-role__desc { font-size:11.5px; color:var(--gk-text-3); }
 .grokbot-wizard__names { display:flex; gap:9px; flex-wrap:wrap; justify-content:center; }
@@ -254,6 +266,95 @@ function hueOf(key: string): number {
 function botGradient(id: string): string {
   const hue = hueOf(id)
   return `linear-gradient(135deg, hsl(${hue},72%,64%), hsl(${(hue + 30) % 360},76%,50%))`
+}
+
+const GLYPHS: Record<string, ReactNode> = {
+  group: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 6.5a2.5 2.5 0 0 1 2.5-2.5h7A2.5 2.5 0 0 1 16 6.5v3a2.5 2.5 0 0 1-2.5 2.5H10l-3.2 2.6v-2.6H6.5A2.5 2.5 0 0 1 4 9.5z" />
+      <path d="M16.5 9h1A2.5 2.5 0 0 1 20 11.5v3a2.5 2.5 0 0 1-2.5 2.5H17v2.6L13.8 17H12" />
+    </svg>
+  ),
+  coder: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M8.5 7.5 4 12l4.5 4.5M15.5 7.5 20 12l-4.5 4.5M13.5 5l-3 14" />
+    </svg>
+  ),
+  researcher: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="10.5" cy="10.5" r="6" /><path d="m15 15 5 5M8 10.5h5M10.5 8v5" />
+    </svg>
+  ),
+  writer: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 19.5 6 14 16.5 3.5a1.8 1.8 0 0 1 2.6 0l1.4 1.4a1.8 1.8 0 0 1 0 2.6L10 18z" /><path d="m14.5 5.5 4 4" />
+    </svg>
+  ),
+  analyst: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4.5 19.5h15M7 16.5v-4M12 16.5V7.5M17 16.5v-6" />
+    </svg>
+  ),
+  pm: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="4" y="4.5" width="5" height="9" rx="1.4" /><rect x="11.5" y="4.5" width="5" height="13" rx="1.4" /><path d="M4.5 19.5h13" />
+    </svg>
+  ),
+  ops: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="4" y="4.5" width="16" height="6" rx="1.6" /><rect x="4" y="13.5" width="16" height="6" rx="1.6" /><path d="M8 7.5h.01M8 16.5h.01" />
+    </svg>
+  ),
+  translator: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="8" /><path d="M4 12h16M12 4c-4.5 4.5-4.5 11.5 0 16M12 4c4.5 4.5 4.5 11.5 0 16" />
+    </svg>
+  ),
+  secretary: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="4.5" y="4" width="15" height="16" rx="2" /><path d="m8.5 10 1.6 1.6L13 8.7M8.5 15.5h7" />
+    </svg>
+  ),
+  reviewer: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 3.5 19 6v6c0 4.4-3 7.4-7 8.5-4-1.1-7-4.1-7-8.5V6z" /><path d="m9 12 2.2 2.2L15.5 10" />
+    </svg>
+  ),
+  chief: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="9" r="5" /><path d="m12 6.6.9 1.9 2 .3-1.4 1.4.3 2-1.8-1-1.8 1 .3-2L9.1 8.8l2-.3z" /><path d="M8.5 13.5 7 20.5l5-2.5 5 2.5-1.5-7" />
+    </svg>
+  ),
+  plus: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 5v14M5 12h14" />
+    </svg>
+  ),
+}
+
+function AvatarGlyph(props: { glyph: string; size?: number }): ReactNode {
+  const node = GLYPHS[props.glyph]
+  if (!node) return null
+  return <span style={{ width: props.size ?? '60%', height: props.size ?? '60%', display: 'inline-flex' }}>{node}</span>
+}
+
+/** Grok 风头像：专家=名字首字白字；群/角色=单线条矢量图标；底=专属渐变 */
+function AvatarView(props: { seed: string; name?: string; glyph?: string; size: number; fontSize?: number }): ReactNode {
+  const background = props.glyph === 'group' ? 'linear-gradient(135deg,#64748b,#475569)' : botGradient(props.seed)
+  return (
+    <span
+      style={{
+        width: props.size, height: props.size, borderRadius: '50%', background,
+        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+        color: '#fff', fontWeight: 600, fontSize: props.fontSize ?? Math.round(props.size * 0.42),
+        letterSpacing: 0, userSelect: 'none',
+        boxShadow: 'inset 0 -1px 2px rgba(0,0,0,.12), 0 1px 3px rgba(29,29,31,.06)',
+        boxSizing: 'border-box',
+      }}
+    >
+      {props.glyph ? <AvatarGlyph glyph={props.glyph} /> : (props.name || '?').slice(0, 1)}
+    </span>
+  )
 }
 
 let openTarget: { kind: 'conversation'; id: string } | null = null
@@ -343,6 +444,16 @@ function appendLocal(botId: string, message: ChatMessage): void {
 }
 
 let refreshState: (() => void) | null = null
+const feedbacked = new Set<string>()
+
+async function sendFeedback(botId: string, messageId: string, good: boolean): Promise<void> {
+  if (feedbacked.has(messageId)) return
+  feedbacked.add(messageId)
+  try {
+    await api(`/bots/${encodeURIComponent(botId)}/feedback`, { method: 'POST', body: JSON.stringify(good ? { good: true } : { bad: true }) })
+    refreshState?.()
+  } catch { feedbacked.delete(messageId) }
+}
 
 async function api(path: string, init?: RequestInit): Promise<any> {
   const res = await fetch(`${API_ROOT}${path}`, {
@@ -707,7 +818,7 @@ export function GrokbotSidebarCrew(): ReactNode {
           return (
             <button key={conversation.id} type="button" className={`grokbot-chatrow${target?.id === conversation.id ? ' active' : ''}`} onClick={() => openConversation(conversation.id)}>
               <span className="grokbot-avatar">
-                <span className="grokbot-avatar__circle" style={{ background: isGroup ? 'linear-gradient(135deg,#64748b,#475569)' : botGradient(conversation.id) }}>{isGroup ? '👥' : (bot?.avatar ?? '🤖')}</span>
+                <AvatarView seed={isGroup ? conversation.id : (bot?.id ?? conversation.id)} name={bot?.name} glyph={isGroup ? 'group' : undefined} size={36} fontSize={15} />
                 {!isGroup ? <span className={`grokbot-avatar__dot${working ? ' working' : ''}`} /> : null}
               </span>
               <span className="grokbot-chatrow__main">
@@ -894,7 +1005,7 @@ function SetupWizard(props: { bot: BotInfo; onAdvance: () => void }): ReactNode 
               {templates.length === 0 ? <div className="grokbot-wizard__hint">加载角色…</div> : null}
               {templates.map((template) => (
                 <button key={template.id} type="button" className="grokbot-role" disabled={busy} onClick={() => void send(template.title.split(' · ')[0])}>
-                  <span className="grokbot-role__avatar" style={{ background: botGradient(template.id) }}>{template.avatar}</span>
+                  <span className="grokbot-role__avatar" style={{ background: botGradient(template.id), color: '#fff' }}><AvatarGlyph glyph={template.id} size="52%" /></span>
                   <span className="grokbot-role__name">{template.title.split(' · ')[0]}</span>
                   <span className="grokbot-role__desc">{template.title.split(' · ')[1] || ''}</span>
                 </button>
@@ -971,7 +1082,7 @@ function MembersPanel(props: { conversation: { id: string; name: string; memberB
       {members.map((member) => (
         <div key={member.id} className="grokbot-member" style={{ justifyContent: 'space-between' }}>
           <span style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <span className="mavatar" style={{ background: botGradient(member.id) }}>{member.avatar}</span>{member.name}
+            <span className="mavatar" style={{ display:'inline-flex' }}><AvatarView seed={member.id} name={member.name} size={30} fontSize={13} /></span>{member.name}
           </span>
           {members.length > 1 ? (
             <button type="button" className="grokbot-iconbtn" title="移出会话" disabled={busy} onClick={() => void mutate(member.id, true)}>✕</button>
@@ -1095,7 +1206,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
   return (
     <div className="grokbot-chat" onKeyDown={(event) => { if (event.key === 'Escape' && !detailsOpen && !editing) closeTarget() }}>
       <div className="grokbot-chat__head">
-        <span className="grokbot-chat__avatar" style={{ background: botGradient(bot.id) }}>{bot.avatar}</span>
+        <AvatarView seed={bot.id} name={bot.name} size={38} fontSize={16} />
         <span className="grokbot-chat__title" onClick={() => setDetailsOpen((v) => !v)}>
           <span className="grokbot-chat__name">{bot.name}</span>
           <span className="grokbot-chat__meta">
@@ -1123,6 +1234,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
             ? <div className="grokbot-empty">和 {bot.name} 对话，或投递任务给它。<br />它会真实使用工具、在团队共享电脑里干活。</div>
             : null}
           {messages.map((message) => {
+            const botIdForFb = bot.id
             if (message.role === 'bot') {
               const { body, chips } = splitChips(message.text)
               return (
@@ -1138,7 +1250,13 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
                       </div>
                     )
                     : null}
-                  <span className="grokbot-msg__time">{new Date(message.at).toLocaleTimeString()}</span>
+                  <span className="grokbot-msg__time">
+                    {new Date(message.at).toLocaleTimeString()}
+                    <span className="grokbot-fb">
+                      <button type="button" title="干得好 +5" onClick={() => void sendFeedback(botIdForFb, message.id, true)}>👍</button>
+                      <button type="button" title="不满意 -3" onClick={() => void sendFeedback(botIdForFb, message.id, false)}>👎</button>
+                    </span>
+                  </span>
                 </div>
               )
             }
@@ -1250,7 +1368,7 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
   return (
     <div className="grokbot-chat" onKeyDown={(event) => { if (event.key === 'Escape' && !detailsOpen) closeTarget() }}>
       <div className="grokbot-chat__head">
-        <span className="grokbot-chat__avatar" style={{ background: 'linear-gradient(135deg,#64748b,#475569)' }}>👥</span>
+        <AvatarView seed={room.id} glyph="group" size={38} />
         <span className="grokbot-chat__title" onClick={() => setDetailsOpen((v) => !v)}>
           <span className="grokbot-chat__name">{room.name}</span>
           <span className="grokbot-chat__meta">
