@@ -1475,7 +1475,7 @@ export function GrokbotMainView(): ReactNode {
         delete el.dataset.grokbotPrevDisplay
       }
       hiddenRef.current = []
-      setBox(null)
+      // 不置空 box：避免 activeKey 切换时覆盖层闪卸露出 DSH 默认页
     }
   }, [activeKey])
 
