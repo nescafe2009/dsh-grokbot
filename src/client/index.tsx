@@ -164,6 +164,9 @@ const GROKBOT_CSS = `
 .grokbot-chips__item:hover { background:rgba(59,130,246,.18); }
 .grokbot-chips__item:disabled { opacity:.45; cursor:default; }
 .grokbot-msg .grokbot-msg__time { display:block; font-size:10px; opacity:.45; margin-top:4px; text-align:inherit; }
+.grokbot-creating { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; font-size:13.5px; opacity:.75; }
+.grokbot-creating__spinner { width:26px; height:26px; border-radius:50%; border:3px solid rgba(59,130,246,.25); border-top-color:#3b82f6; animation:grokbot-spin .8s linear infinite; }
+@keyframes grokbot-spin { to { transform:rotate(360deg) } }
 .grokbot-empty { margin:auto; text-align:center; opacity:.5; font-size:13px; }
 .grokbot-details { width:264px; flex:none; border-left:1px solid var(--border,#eceef1); overflow-y:auto; padding:14px 14px 20px; display:flex; flex-direction:column; gap:14px; }
 .grokbot-details__title { font-size:12px; font-weight:700; opacity:.55; letter-spacing:.04em; }
@@ -184,11 +187,17 @@ const GROKBOT_CSS = `
 `
 
 let openTarget: { kind: 'bot' | 'room'; id: string } | null = null
+let creatingUi = false
 let nativeSidebarVisible = false
 const listeners = new Set<() => void>()
 
 function notify(): void {
   for (const listener of listeners) listener()
+}
+
+function setCreatingUi(value: boolean): void {
+  creatingUi = value
+  notify()
 }
 
 function persistLastTarget(target: { kind: 'bot' | 'room'; id: string }): void {
@@ -495,8 +504,9 @@ export function GrokbotSidebarCrew(): ReactNode {
     if (creatingBot) return
     setMenuOpen(false)
     setMenuView('main')
-    // 立即收起当前会话：避免创建期间闪现旧对话界面
-    closeTarget()
+    // 进入"召唤中"过渡视图：保持主区接管，既不闪旧会话也不露 DSH 默认页
+    openTarget = null
+    setCreatingUi(true)
     setCreatingBot(true)
     void api('/bots', { method: 'POST', body: JSON.stringify(templateId ? { templateId } : {}) })
       .then((outcome) => {
@@ -504,7 +514,10 @@ export function GrokbotSidebarCrew(): ReactNode {
         if (id) openBot(id)
       })
       .catch(() => undefined)
-      .finally(() => setCreatingBot(false))
+      .finally(() => {
+        setCreatingBot(false)
+        setCreatingUi(false)
+      })
   }, [creatingBot])
   useEffect(() => {
     if (nativeVisible) return
@@ -1089,7 +1102,14 @@ function GroupChatView(props: { room: RoomInfo; bots: BotInfo[] }): ReactNode {
 export function GrokbotMainView(): ReactNode {
   const target = useOpenTarget()
   const state = useGrokbotState()
+  const [, forceCreating] = useState(0)
   const restoredRef = useRef(false)
+
+  useEffect(() => {
+    const listener = (): void => forceCreating((n) => n + 1)
+    listeners.add(listener)
+    return () => { listeners.delete(listener) }
+  }, [])
 
   // 启动恢复上次会话（Grok Bot 语义）：lastTarget 存于服务端，校验存在性
   useEffect(() => {
@@ -1106,7 +1126,7 @@ export function GrokbotMainView(): ReactNode {
   }, [state])
   const bot = target?.kind === 'bot' ? (state?.bots.find((entry) => entry.id === target.id) ?? null) : null
   const room = target?.kind === 'room' ? (state?.rooms.find((entry) => entry.id === target.id) ?? null) : null
-  const activeKey = bot ? `bot:${bot.id}` : room ? `room:${room.id}` : null
+  const activeKey = bot ? `bot:${bot.id}` : room ? `room:${room.id}` : (creatingUi ? 'creating' : null)
   const [box, setBox] = useState<{ left: number; top: number; width: number; height: number } | null>(null)
   const hiddenRef = useRef<HTMLElement[]>([])
 
@@ -1150,7 +1170,16 @@ export function GrokbotMainView(): ReactNode {
       className="grokbot-chat grokbot-chat--main"
       style={{ position: 'fixed', left: box.left, top: box.top, width: box.width, height: box.height, zIndex: 900 }}
     >
-      {bot ? <BotChatView bot={bot} state={state} /> : room ? <GroupChatView room={room} bots={state?.bots ?? []} /> : null}
+      {bot
+        ? <BotChatView bot={bot} state={state} />
+        : room
+          ? <GroupChatView room={room} bots={state?.bots ?? []} />
+          : (
+            <div className="grokbot-creating">
+              <div className="grokbot-creating__spinner" />
+              <div>正在召唤专家…</div>
+            </div>
+          )}
     </div>
   )
 }
