@@ -1,6 +1,6 @@
 {
   "name": "dsh-grokbot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Always-on named agent crew for DeepSeek Harness — replicate the Grok Bot mode as a pure out-of-tree plugin",
   "keywords": [
     "deepseek",
@@ -22,7 +22,8 @@
     "cordis.patch.yml",
     "README.md",
     "GOALS.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsdown --config ./tsdown.config.ts",
