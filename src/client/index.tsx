@@ -141,6 +141,28 @@ const GROKBOT_CSS = `
 .grokbot-approval__actions button { border:none; border-radius:8px; padding:5px 16px; font-size:12.5px; font-weight:600; cursor:pointer; }
 .grokbot-approval__ok { background:#2ea043; color:#fff; }
 .grokbot-approval__no { background:rgba(127,127,127,.15); color:inherit; }
+.grokbot-md__p { white-space:pre-wrap; }
+.grokbot-md__h1, .grokbot-md__h2, .grokbot-md__h3, .grokbot-md__h4 { font-weight:700; margin:6px 0 2px; }
+.grokbot-md__h1 { font-size:16px; } .grokbot-md__h2 { font-size:15px; } .grokbot-md__h3 { font-size:14px; } .grokbot-md__h4 { font-size:13px; }
+.grokbot-md__ul { margin:2px 0; padding-left:18px; }
+.grokbot-md__quote { border-left:3px solid rgba(127,127,127,.3); margin:4px 0; padding:2px 10px; opacity:.85; }
+.grokbot-md__hr { border:none; border-top:1px solid rgba(127,127,127,.25); margin:8px 0; }
+.grokbot-md__spacer { height:6px; }
+.grokbot-md__icode { background:rgba(127,127,127,.15); border-radius:5px; padding:1px 5px; font-size:12.5px; font-family:ui-monospace,Menlo,monospace; }
+.grokbot-md__link { color:#3b82f6; text-decoration:none; }
+.grokbot-md__link:hover { text-decoration:underline; }
+.grokbot-code { align-self:stretch; max-width:100%; border:1px solid var(--border,#e3e5e8); border-radius:10px; overflow:hidden; margin:4px 0; background:rgba(127,127,127,.05); }
+.grokbot-code__bar { display:flex; align-items:center; justify-content:space-between; padding:4px 10px; border-bottom:1px solid var(--border,#eceef1); font-size:11px; }
+.grokbot-code__lang { opacity:.55; text-transform:uppercase; letter-spacing:.05em; font-family:ui-monospace,Menlo,monospace; }
+.grokbot-code__actions { display:flex; gap:8px; }
+.grokbot-code__actions button { border:none; background:none; cursor:pointer; font-size:11px; color:#3b82f6; padding:2px 4px; }
+.grokbot-code__pre { margin:0; padding:10px 12px; overflow-x:auto; font-family:ui-monospace,Menlo,monospace; font-size:12.5px; line-height:1.5; white-space:pre; }
+.grokbot-code__pre.collapsed { display:none; }
+.grokbot-code__peek { border:none; background:none; cursor:pointer; text-align:left; padding:8px 12px; font-family:ui-monospace,Menlo,monospace; font-size:12px; opacity:.6; width:100%; }
+.grokbot-chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+.grokbot-chips__item { border:1px solid rgba(59,130,246,.5); background:rgba(59,130,246,.08); color:#3b82f6; border-radius:14px; padding:4px 14px; font-size:12.5px; cursor:pointer; font-weight:600; }
+.grokbot-chips__item:hover { background:rgba(59,130,246,.18); }
+.grokbot-chips__item:disabled { opacity:.45; cursor:default; }
 .grokbot-msg .grokbot-msg__time { display:block; font-size:10px; opacity:.45; margin-top:4px; text-align:inherit; }
 .grokbot-empty { margin:auto; text-align:center; opacity:.5; font-size:13px; }
 .grokbot-details { width:264px; flex:none; border-left:1px solid var(--border,#eceef1); overflow-y:auto; padding:14px 14px 20px; display:flex; flex-direction:column; gap:14px; }
@@ -597,6 +619,125 @@ export function GrokbotSidebarCrew(): ReactNode {
 
 /* ---------------- 私聊视图 ---------------- */
 
+
+/* ---------------- 消息内可视化组件 ---------------- */
+
+let mdKeySeed = 0
+function renderInline(text: string): ReactNode[] {
+  const parts: ReactNode[] = []
+  const re = /(\*\*[^*]+\*\*|`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\)|https?:\/\/[^\s)]+)/g
+  let last = 0
+  let match: RegExpExecArray | null
+  while ((match = re.exec(text))) {
+    if (match.index > last) parts.push(text.slice(last, match.index))
+    const token = match[0]
+    const key = `i${mdKeySeed++}`
+    if (token.startsWith('**')) {
+      parts.push(<strong key={key}>{token.slice(2, -2)}</strong>)
+    } else if (token.startsWith('`')) {
+      parts.push(<code key={key} className="grokbot-md__icode">{token.slice(1, -1)}</code>)
+    } else if (token.startsWith('[')) {
+      const link = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/.exec(token)
+      if (link) parts.push(<a key={key} href={link[2]} target="_blank" rel="noreferrer" className="grokbot-md__link">{link[1]}</a>)
+      else parts.push(token)
+    } else {
+      parts.push(<a key={key} href={token} target="_blank" rel="noreferrer" className="grokbot-md__link">{token.length > 48 ? `${token.slice(0, 45)}…` : token}</a>)
+    }
+    last = match.index + token.length
+  }
+  if (last < text.length) parts.push(text.slice(last))
+  return parts
+}
+
+function MarkdownText(props: { text: string }): ReactNode {
+  const lines = props.text.split('\n')
+  const out: ReactNode[] = []
+  let list: string[] = []
+  const flushList = (): void => {
+    if (list.length === 0) return
+    out.push(<ul key={`l${mdKeySeed++}`} className="grokbot-md__ul">{list.map((item, i) => <li key={i}>{renderInline(item)}</li>)}</ul>)
+    list = []
+  }
+  for (const raw of lines) {
+    const line = raw.trimEnd()
+    const heading = /^(#{1,4})\s+(.*)$/.exec(line)
+    const bullet = /^[-*•]\s+(.*)$/.exec(line)
+    const ordered = /^(\d+)[.、)]\s+(.*)$/.exec(line)
+    const quote = /^>\s?(.*)$/.exec(line)
+    if (bullet) { list.push(bullet[1]); continue }
+    if (ordered) { list.push(`${ordered[1]}. ${ordered[2]}`); continue }
+    flushList()
+    if (!line.trim()) { out.push(<div key={`s${mdKeySeed++}`} className="grokbot-md__spacer" />); continue }
+    if (heading) {
+      const level = heading[1].length
+      out.push(<div key={`h${mdKeySeed++}`} className={`grokbot-md__h${level}`}>{renderInline(heading[2])}</div>)
+    } else if (quote) {
+      out.push(<blockquote key={`q${mdKeySeed++}`} className="grokbot-md__quote">{renderInline(quote[1])}</blockquote>)
+    } else if (/^---+$/.test(line.trim())) {
+      out.push(<hr key={`r${mdKeySeed++}`} className="grokbot-md__hr" />)
+    } else {
+      out.push(<div key={`p${mdKeySeed++}`} className="grokbot-md__p">{renderInline(line)}</div>)
+    }
+  }
+  flushList()
+  return <>{out}</>
+}
+
+function CodeBlock(props: { code: string; lang: string }): ReactNode {
+  const lines = props.code.replace(/\n$/, '').split('\n')
+  const long = lines.length > 14
+  const [collapsed, setCollapsed] = useState(long)
+  const [copied, setCopied] = useState(false)
+  const copy = useCallback(async (): Promise<void> => {
+    try {
+      await navigator.clipboard.writeText(props.code)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch { /* 无剪贴板权限 */ }
+  }, [props.code])
+  return (
+    <div className="grokbot-code">
+      <div className="grokbot-code__bar">
+        <span className="grokbot-code__lang">{props.lang || 'text'}</span>
+        <div className="grokbot-code__actions">
+          {long
+            ? <button type="button" onClick={() => setCollapsed((v) => !v)}>{collapsed ? `展开 ${lines.length} 行` : '折叠'}</button>
+            : null}
+          <button type="button" onClick={() => void copy()}>{copied ? '已复制 ✓' : '复制'}</button>
+        </div>
+      </div>
+      <pre className={`grokbot-code__pre${collapsed ? ' collapsed' : ''}`}>{collapsed ? '' : props.code.replace(/\n$/, '')}</pre>
+      {collapsed ? <button type="button" className="grokbot-code__peek" onClick={() => setCollapsed(false)}>{props.code.split('\n').slice(0, 3).join('\n').slice(0, 120)}…</button> : null}
+    </div>
+  )
+}
+
+function MarkdownView(props: { text: string }): ReactNode {
+  const segments = props.text.split(/```/)
+  return (
+    <>
+      {segments.map((segment, index) => {
+        if (index % 2 === 1) {
+          const body = segment.replace(/^\n/, '')
+          const lang = /^[a-zA-Z0-9_+-]*\n/.exec(body)?.[0]?.trim() || ''
+          const code = lang ? body.slice(lang.length) : body
+          return <CodeBlock key={`c${index}`} code={code} lang={lang} />
+        }
+        return <MarkdownText key={`t${index}`} text={segment} />
+      })}
+    </>
+  )
+}
+
+function splitChips(text: string): { body: string; chips: string[] } {
+  const match = /\n?\[\[([^\]\n]+)\]\]\s*$/.exec(text)
+  if (!match) return { body: text, chips: [] }
+  return {
+    body: text.slice(0, match.index),
+    chips: match[1].split('|').map((entry) => entry.trim()).filter(Boolean).slice(0, 6),
+  }
+}
+
 function ApprovalCard(props: { approval: ApprovalInfo }): ReactNode {
   const [busy, setBusy] = useState(false)
   const decide = useCallback(async (outcome: 'allowed-once' | 'rejected') => {
@@ -653,8 +794,8 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
     await api(`/bots/${encodeURIComponent(bot.id)}/stop`, { method: 'POST' }).catch(() => undefined)
   }, [bot.id])
 
-  const send = useCallback(async (): Promise<void> => {
-    const text = draft.trim()
+  const send = useCallback(async (overrideText?: string): Promise<void> => {
+    const text = (overrideText ?? draft).trim()
     if (!text || sending) return
     setDraft('')
     appendLocal(bot.id, { id: `${Date.now()}-u`, role: 'user', text, at: Date.now() })
@@ -714,15 +855,33 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
           {messages.length === 0 && pending.length === 0
             ? <div className="grokbot-empty">和 {bot.name} 对话，或投递任务给它。<br />它会真实使用工具、在团队共享电脑里干活。</div>
             : null}
-          {messages.map((message) => (
-            <div key={message.id} className={`grokbot-msg ${message.role}`}>
-              {message.role === 'bot'
-                ? <strong style={{ display: 'block', fontSize: 11.5, opacity: .55, marginBottom: 2 }}>{bot.avatar} {bot.name}</strong>
-                : null}
-              {message.text}
-              <span className="grokbot-msg__time">{new Date(message.at).toLocaleTimeString()}</span>
-            </div>
-          ))}
+          {messages.map((message) => {
+            if (message.role === 'bot') {
+              const { body, chips } = splitChips(message.text)
+              return (
+                <div key={message.id} className="grokbot-msg bot">
+                  <strong style={{ display: 'block', fontSize: 11.5, opacity: .55, marginBottom: 2 }}>{bot.avatar} {bot.name}</strong>
+                  <MarkdownView text={body} />
+                  {chips.length > 0
+                    ? (
+                      <div className="grokbot-chips">
+                        {chips.map((chip) => (
+                          <button key={chip} type="button" className="grokbot-chips__item" disabled={sending} onClick={() => void send(chip)}>{chip}</button>
+                        ))}
+                      </div>
+                    )
+                    : null}
+                  <span className="grokbot-msg__time">{new Date(message.at).toLocaleTimeString()}</span>
+                </div>
+              )
+            }
+            return (
+              <div key={message.id} className={`grokbot-msg ${message.role}`}>
+                {message.text}
+                <span className="grokbot-msg__time">{new Date(message.at).toLocaleTimeString()}</span>
+              </div>
+            )
+          })}
           {pending.map((approval) => (
             <ApprovalCard key={approval.id} approval={approval} />
           ))}
@@ -859,7 +1018,7 @@ function GroupChatView(props: { room: RoomInfo; bots: BotInfo[] }): ReactNode {
               return (
                 <div key={index} className="grokbot-msg bot">
                   <strong style={{ display: 'block', fontSize: 11.5, opacity: .55, marginBottom: 2 }}>{bot?.avatar ?? ''}{bot?.name ?? message.botId}</strong>
-                  <div>{message.text}</div>
+                  <MarkdownView text={splitChips(message.text).body} />
                   <span className="grokbot-msg__time">{new Date(message.ts).toLocaleTimeString()}</span>
                 </div>
               )
