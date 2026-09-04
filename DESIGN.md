@@ -92,3 +92,46 @@ bot.model → team.defaultModel → agentDefaultModel.currentSelection()；
 - **M5 Skills & Routines**：skills 目录 + / 菜单 + cron/事件 routine + test run + 历史
 - **M6 集成发布**：todi-hub handoffDsh、webhook 事件、GitHub 开源
 - 验收总标准：与 Grok Bot 官方工作流逐条对照可跑通（创建→派活→看活动→交接→群聊→routine→记忆延续）
+
+---
+
+# 附录 A：三方组织架构实证研究（2026-09-04，磁盘级解剖）
+
+## 1. Grok 本体的组织架构（~/Library/Application Support/Grok Bot 解剖实证）
+
+**核心发现：一切皆 agent 会话（统一实体模型）**
+
+- `sand-client-persistence/*.blob`（JSON，base32 风格键名编码）中的 roster 表（schemaVersion 4）：
+  `rows: [{id(UUID), name, description, title, avatarShape/avatarColor/avatarVersion, createdAt/updatedAt, path, lastEntry, lastMessageId, newestEntryId, hasUnread}]`
+- **私聊 bot 与群聊 channel 完全同构**——用户的"幕僚长助手"(私聊)与"鸿蒙投递"(群)在同一表里，
+  `path` 全部形如 **`/home/box/sand-data/agents/<agentUUID>`**
+  → **channel 不是独立容器，就是成员更多的 agent 会话**；"会话加成员即成群"是统一实体模型的自然结果
+- **共享电脑上按 agent 分目录**：`sand-data/agents/<id>/` 每 agent 一个数据目录（电脑共享、数据按 agent 组织）
+  → "SandMachine"共享电脑 + forever-box 浏览器持久分区（Partitions/sand-forever-box 实证）
+- **消息层是本地优先同步协议**：outbox entries `[{kind:'send-message', id, message:{type,content}, timestampMs, requestId}]`
+  + `epochHint` + `acceptedSequenceHint`（服务端确认序号）——客户端离线可写、服务端收敛
+- 对话存储在电脑之外（官方文档），重置电脑不丢对话
+
+## 2. DSH 原生体系（harness home 实证）
+
+- 组织单位 = **Workspace**：`storages/workspace.json` 注册表（UUID/path/title/**sessionIds[]**）
+- 会话 = `sessions/<sanitized-cwd 桶>/<sessionUUID>/session.jsonl.zstd`——**事件流全量持久化**（zstd 压缩 JSONL），
+  resume 的物理基础；按工作目录分桶
+- **bot 不是 DSH 原生概念**：我们的 bot = 插件配置实体 + 一个持久 DSH 会话（事件流）的映射
+
+## 3. 我们（dsh-grokbot）的当前实现与对照
+
+| 维度 | Grok | DSH 原生 | 我们现状 | 结论 |
+|---|---|---|---|---|
+| 私聊实体 | agent 会话（roster row） | DSH session | crew.json 条目 + bots/<id>/ + DSH session 映射 | ✓ 同构（配置+会话分离合理） |
+| 群聊实体 | **同一实体，多成员** | 无群概念 | **rooms[] 独立二等实体** | ✗ 应统一为 members 模型 |
+| 电脑侧组织 | 共享电脑 + agents/<id>/ 子目录 | workspace=cwd | 共享 workspace，无 per-agent 子目录 | △ 建议 workspace/agents/<botId>/ |
+| 消息持久 | outbox+epoch/sequence 同步 | session.jsonl.zstd 事件流 | dm-transcript.jsonl + DSH 事件流 | ✓ 文件协议符合我们的本地定位 |
+| 会话恢复 | 服务端会话 | resume(sessionId) | chat-sessions.json→resume | ✓ 已对齐 |
+
+## 4. 设计结论（对齐 Grok 的统一实体模型）
+
+1. **M-next 最高优先：rooms 并入统一会话实体**——每会话 `conversations: [{id, members: [botId...], profile...}]`，
+   私聊=members 长度 1，群=2-6；transcript/会话/成员面板共用一套机制；"加成员即成群"水到渠成
+2. workspace 内建 `agents/<botId>/` 个人子目录（电脑共享、数据按 agent 组织，对齐 sand-data/agents）
+3. roster 行级字段补齐：hasUnread（未读红点）、lastMessageId/newestEntryId（增量同步）、avatar 结构化（shape/color/version）
