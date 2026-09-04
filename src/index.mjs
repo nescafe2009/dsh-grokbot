@@ -970,6 +970,20 @@ export function apply(ctx, config = {}) {
             const base = publicBot(bot)
             const setup = await loadSetup(bot.id)
             if (setup && setup.stage && setup.stage !== 'done') base.setupStage = setup.stage
+            // roleTemplate：setup.json 优先，title 关键词匹配兜底，chief 固有
+            let roleTemplate = setup?.roleTemplate || ''
+            if (!roleTemplate && bot.id === 'chief') roleTemplate = 'chief'
+            if (!roleTemplate) {
+              const titleMatch = [
+                ['幕僚长', 'chief'], ['工程师', 'coder'], ['调研员', 'researcher'], ['写作官', 'writer'],
+                ['数据分析师', 'analyst'], ['产品经理', 'pm'], ['运维官', 'ops'],
+                ['翻译官', 'translator'], ['秘书', 'secretary'], ['审核官', 'reviewer'],
+              ]
+              for (const [prefix, key] of titleMatch) {
+                if (bot.title && bot.title.startsWith(prefix)) { roleTemplate = key; break }
+              }
+            }
+            base.roleTemplate = roleTemplate
             base.rating = ratingOf(await loadStats(bot.id))
             const dm = await readDm(bot.id, 1)
             const last = dm[dm.length - 1]
