@@ -1,6 +1,6 @@
 {
   "name": "dsh-grokbot",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Always-on named agent crew for DeepSeek Harness — replicate the Grok Bot mode as a pure out-of-tree plugin",
   "keywords": [
     "deepseek",
