@@ -1005,6 +1005,27 @@ export function apply(ctx, config = {}) {
         if (method === 'GET' && suffix === '/crew') {
           respond(res, 200, { crew: crewState.crew }); return
         }
+        // 静态素材：/assets/avatars/chief → assets-design/avatars/chief.svg
+        const assetMatch = /^\/assets\/([a-z]+)\/([a-z0-9-]+)$/.exec(suffix)
+        if (method === 'GET' && assetMatch) {
+          const type = assetMatch[1]
+          const name = assetMatch[2]
+          if (!/^(avatars|states|rating|parts)$/.test(type) || !/^[a-z0-9-]+$/.test(name)) {
+            throw new HttpError(400, '非法素材路径')
+          }
+          const { dirname } = await import('node:path')
+          const { fileURLToPath } = await import('node:url')
+          const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)))
+          const svgPath = join(pluginRoot, 'assets-design', type, `${name}.svg`)
+          try {
+            const svg = await readFile(svgPath, 'utf8')
+            res.writeHead(200, { 'content-type': 'image/svg+xml; charset=utf-8', 'cache-control': 'public, max-age=3600' })
+            res.end(svg)
+          } catch {
+            throw new HttpError(404, `素材不存在：${type}/${name}`)
+          }
+          return
+        }
         if (method === 'GET' && suffix === '/bot-templates') {
           respond(res, 200, { templates: BOT_TEMPLATES }); return
         }

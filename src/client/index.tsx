@@ -271,13 +271,33 @@ function botGradient(id: string): string {
 
 /** Grok 风头像：专家=名字首字白字；群/角色=单线条矢量图标；底=专属渐变 */
 function AvatarView(props: { seed: string; name?: string; glyph?: string; size: number; fontSize?: number; level?: number }): ReactNode {
-  const roleKey = props.glyph && ROLE_DEFS[props.glyph] ? props.glyph : undefined
-  const svgHtml = renderAvatarSVG({ role: roleKey, name: props.name, keywordHit: roleKey?.startsWith('kw-') ? roleKey : undefined, size: props.size })
-  const ring = props.level ? renderLevelRing(props.level) : ''
+  const roleKey = props.glyph
+  const size = props.size
+  const isKnown = roleKey && ROLE_DEFS[roleKey] !== undefined
+  const ring = props.level !== undefined && props.level >= 4 ? renderLevelRing(props.level) : ''
+
+  // 已知角色/群/关键词族 → 直接加载 Codex 高保真 SVG
+  if (isKnown) {
+    return (
+      <span style={{ width: size, height: size, position: 'relative', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flex: 'none' }}>
+        <img
+          src={`/api/plugins/grokbot/assets/avatars/${roleKey}`}
+          width={size}
+          height={size}
+          style={{ borderRadius: '50%', display: 'block', objectFit: 'contain' }}
+          alt={props.name || roleKey}
+        />
+        {ring ? <span style={{ position: 'absolute', inset: -2, pointerEvents: 'none' }} dangerouslySetInnerHTML={{ __html: ring.replace('<svg ', `<svg width="${size + 4}" height="${size + 4}" `) }} /> : null}
+      </span>
+    )
+  }
+
+  // 自定义角色 → 哈希拼装（参数化引擎）
+  const svgHtml = renderAvatarSVG({ name: props.name, size })
   return (
     <span
-      style={{ width: props.size, height: props.size, position: 'relative', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flex: 'none' }}
-      dangerouslySetInnerHTML={{ __html: ring ? svgHtml.replace('</svg>', ring + '</svg>') : svgHtml }}
+      style={{ width: size, height: size, position: 'relative', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flex: 'none' }}
+      dangerouslySetInnerHTML={{ __html: svgHtml }}
     />
   )
 }
@@ -1178,8 +1198,8 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
                   <span className="grokbot-msg__time">
                     {new Date(message.at).toLocaleTimeString()}
                     <span className="grokbot-fb">
-                      <button type="button" title="干得好 +5" onClick={() => void sendFeedback(botIdForFb, message.id, true)}>👍</button>
-                      <button type="button" title="不满意 -3" onClick={() => void sendFeedback(botIdForFb, message.id, false)}>👎</button>
+                      <button type="button" title="干得好 +5" onClick={() => void sendFeedback(botIdForFb, message.id, true)}><img src="/api/plugins/grokbot/assets/rating/thumb-up" width="12" height="12" alt="👍" /></button>
+                      <button type="button" title="不满意 -3" onClick={() => void sendFeedback(botIdForFb, message.id, false)}><img src="/api/plugins/grokbot/assets/rating/thumb-down" width="12" height="12" alt="👎" /></button>
                     </span>
                   </span>
                 </div>
@@ -1195,7 +1215,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
           {pending.map((approval) => (
             <ApprovalCard key={approval.id} approval={approval} />
           ))}
-          {sending && pending.length === 0 ? <div className="grokbot-empty"><span dangerouslySetInnerHTML={{ __html: renderStateIcon('thinking') }} /> 思考中…</div> : null}
+          {sending && pending.length === 0 ? <div className="grokbot-empty"><img src="/api/plugins/grokbot/assets/states/thinking" width={20} height={20} alt="" style={{verticalAlign:'-4px'}} /> 思考中…</div> : null}
         </div>
         {detailsOpen
           ? (
@@ -1203,10 +1223,10 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
               {bot.rating ? (
                 <div className="grokbot-rating">
                   <div className="grokbot-rating__head">
-                    <span className="grokbot-rating__level" dangerouslySetInnerHTML={{ __html: renderBadge(bot.rating.level) }} />
+                    <img src={`/api/plugins/grokbot/assets/rating/badge-lv${bot.rating.level}`} width={18} height={18} alt="Lv" className="grokbot-rating__level" />
                     <span className="grokbot-rating__title">{bot.rating.title}</span>
                     {bot.rating.stars ? (
-                      <span className="grokbot-rating__stars" dangerouslySetInnerHTML={{ __html: Array.from({length:5},(_,i)=>renderStar(i<bot.rating.stars!)).join('') }} />
+                      <span className="grokbot-rating__stars">{Array.from({length:5},(_,i) => <img key={i} src={`/api/plugins/grokbot/assets/rating/star-${i < bot.rating.stars! ? 'filled' : 'empty'}`} width={12} height={12} alt="" />)}</span>
                     ) : null}
                   </div>
                   <div className="grokbot-rating__bar">

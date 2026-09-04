@@ -23,7 +23,8 @@
     "README.md",
     "GOALS.md",
     "LICENSE",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "assets-design"
   ],
   "scripts": {
     "build": "tsdown --config ./tsdown.config.ts --outDir lib.tmp && rm -rf lib.old && mv lib lib.old 2>/dev/null; mv lib.tmp lib && rm -rf lib.old && echo deployed",
