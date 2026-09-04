@@ -13,6 +13,7 @@ export default defineConfig([
   {
     name: 'dsh-grokbot/client',
     entry: { client: 'src/client/index.tsx' },
+    // avatars.ts 通过 import 自动打包进 client bundle
     outDir: 'lib',
     format: 'cjs',
     platform: 'browser',

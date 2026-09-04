@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { renderAvatarSVG, renderBadge, renderStar, renderLevelRing, renderStateIcon, ROLE_DEFS } from './avatars'
 import type { ReactNode } from 'react'
 
 const API_ROOT = '/api/plugins/grokbot'
@@ -268,92 +269,16 @@ function botGradient(id: string): string {
   return `linear-gradient(135deg, hsl(${hue},72%,64%), hsl(${(hue + 30) % 360},76%,50%))`
 }
 
-const GLYPHS: Record<string, ReactNode> = {
-  group: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M4 6.5a2.5 2.5 0 0 1 2.5-2.5h7A2.5 2.5 0 0 1 16 6.5v3a2.5 2.5 0 0 1-2.5 2.5H10l-3.2 2.6v-2.6H6.5A2.5 2.5 0 0 1 4 9.5z" />
-      <path d="M16.5 9h1A2.5 2.5 0 0 1 20 11.5v3a2.5 2.5 0 0 1-2.5 2.5H17v2.6L13.8 17H12" />
-    </svg>
-  ),
-  coder: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M8.5 7.5 4 12l4.5 4.5M15.5 7.5 20 12l-4.5 4.5M13.5 5l-3 14" />
-    </svg>
-  ),
-  researcher: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="10.5" cy="10.5" r="6" /><path d="m15 15 5 5M8 10.5h5M10.5 8v5" />
-    </svg>
-  ),
-  writer: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M4 19.5 6 14 16.5 3.5a1.8 1.8 0 0 1 2.6 0l1.4 1.4a1.8 1.8 0 0 1 0 2.6L10 18z" /><path d="m14.5 5.5 4 4" />
-    </svg>
-  ),
-  analyst: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M4.5 19.5h15M7 16.5v-4M12 16.5V7.5M17 16.5v-6" />
-    </svg>
-  ),
-  pm: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-      <rect x="4" y="4.5" width="5" height="9" rx="1.4" /><rect x="11.5" y="4.5" width="5" height="13" rx="1.4" /><path d="M4.5 19.5h13" />
-    </svg>
-  ),
-  ops: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-      <rect x="4" y="4.5" width="16" height="6" rx="1.6" /><rect x="4" y="13.5" width="16" height="6" rx="1.6" /><path d="M8 7.5h.01M8 16.5h.01" />
-    </svg>
-  ),
-  translator: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="12" cy="12" r="8" /><path d="M4 12h16M12 4c-4.5 4.5-4.5 11.5 0 16M12 4c4.5 4.5 4.5 11.5 0 16" />
-    </svg>
-  ),
-  secretary: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-      <rect x="4.5" y="4" width="15" height="16" rx="2" /><path d="m8.5 10 1.6 1.6L13 8.7M8.5 15.5h7" />
-    </svg>
-  ),
-  reviewer: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M12 3.5 19 6v6c0 4.4-3 7.4-7 8.5-4-1.1-7-4.1-7-8.5V6z" /><path d="m9 12 2.2 2.2L15.5 10" />
-    </svg>
-  ),
-  chief: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="12" cy="9" r="5" /><path d="m12 6.6.9 1.9 2 .3-1.4 1.4.3 2-1.8-1-1.8 1 .3-2L9.1 8.8l2-.3z" /><path d="M8.5 13.5 7 20.5l5-2.5 5 2.5-1.5-7" />
-    </svg>
-  ),
-  plus: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M12 5v14M5 12h14" />
-    </svg>
-  ),
-}
-
-function AvatarGlyph(props: { glyph: string; size?: number }): ReactNode {
-  const node = GLYPHS[props.glyph]
-  if (!node) return null
-  return <span style={{ width: props.size ?? '60%', height: props.size ?? '60%', display: 'inline-flex' }}>{node}</span>
-}
-
 /** Grok 风头像：专家=名字首字白字；群/角色=单线条矢量图标；底=专属渐变 */
-function AvatarView(props: { seed: string; name?: string; glyph?: string; size: number; fontSize?: number }): ReactNode {
-  const background = props.glyph === 'group' ? 'linear-gradient(135deg,#64748b,#475569)' : botGradient(props.seed)
+function AvatarView(props: { seed: string; name?: string; glyph?: string; size: number; fontSize?: number; level?: number }): ReactNode {
+  const roleKey = props.glyph && ROLE_DEFS[props.glyph] ? props.glyph : undefined
+  const svgHtml = renderAvatarSVG({ role: roleKey, name: props.name, keywordHit: roleKey?.startsWith('kw-') ? roleKey : undefined, size: props.size })
+  const ring = props.level ? renderLevelRing(props.level) : ''
   return (
     <span
-      style={{
-        width: props.size, height: props.size, borderRadius: '50%', background,
-        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-        color: '#fff', fontWeight: 600, fontSize: props.fontSize ?? Math.round(props.size * 0.42),
-        letterSpacing: 0, userSelect: 'none',
-        boxShadow: 'inset 0 -1px 2px rgba(0,0,0,.12), 0 1px 3px rgba(29,29,31,.06)',
-        boxSizing: 'border-box',
-      }}
-    >
-      {props.glyph ? <AvatarGlyph glyph={props.glyph} /> : (props.name || '?').slice(0, 1)}
-    </span>
+      style={{ width: props.size, height: props.size, position: 'relative', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flex: 'none' }}
+      dangerouslySetInnerHTML={{ __html: ring ? svgHtml.replace('</svg>', ring + '</svg>') : svgHtml }}
+    />
   )
 }
 
@@ -1206,7 +1131,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
   return (
     <div className="grokbot-chat" onKeyDown={(event) => { if (event.key === 'Escape' && !detailsOpen && !editing) closeTarget() }}>
       <div className="grokbot-chat__head">
-        <AvatarView seed={bot.id} name={bot.name} size={38} fontSize={16} />
+        <AvatarView seed={bot.id} name={bot.name} glyph={bot.id} size={38} level={bot.rating?.level} />
         <span className="grokbot-chat__title" onClick={() => setDetailsOpen((v) => !v)}>
           <span className="grokbot-chat__name">{bot.name}</span>
           <span className="grokbot-chat__meta">
@@ -1270,11 +1195,30 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
           {pending.map((approval) => (
             <ApprovalCard key={approval.id} approval={approval} />
           ))}
-          {sending && pending.length === 0 ? <div className="grokbot-empty">思考中…</div> : null}
+          {sending && pending.length === 0 ? <div className="grokbot-empty"><span dangerouslySetInnerHTML={{ __html: renderStateIcon('thinking') }} /> 思考中…</div> : null}
         </div>
         {detailsOpen
           ? (
             <div className="grokbot-details">
+              {bot.rating ? (
+                <div className="grokbot-rating">
+                  <div className="grokbot-rating__head">
+                    <span className="grokbot-rating__level" dangerouslySetInnerHTML={{ __html: renderBadge(bot.rating.level) }} />
+                    <span className="grokbot-rating__title">{bot.rating.title}</span>
+                    {bot.rating.stars ? (
+                      <span className="grokbot-rating__stars" dangerouslySetInnerHTML={{ __html: Array.from({length:5},(_,i)=>renderStar(i<bot.rating.stars!)).join('') }} />
+                    ) : null}
+                  </div>
+                  <div className="grokbot-rating__bar">
+                    <div className="grokbot-rating__fill" style={{ width: `${bot.rating.nextAt ? Math.min(100, Math.round(100 * bot.rating.exp / bot.rating.nextAt)) : 100}%` }} />
+                  </div>
+                  <div className="grokbot-rating__nums">
+                    {bot.rating.nextAt ? `经验 ${bot.rating.exp}/${bot.rating.nextAt}` : '已满级'}
+                    {'　'}任务 {bot.rating.tasksDone}✓ {bot.rating.tasksFailed}✗
+                    {bot.rating.thumbsUp + bot.rating.thumbsDown > 0 ? `　👍${bot.rating.thumbsUp} 👎${bot.rating.thumbsDown}` : ''}
+                  </div>
+                </div>
+              ) : null}
               <MembersPanel conversation={{ id: bot.id, name: bot.name, memberBotIds: [bot.id] }} bots={propsBots} onChanged={() => refreshState?.()} />
               <div>
                 <div className="grokbot-details__title">例行任务</div>
