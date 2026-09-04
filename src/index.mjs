@@ -105,6 +105,20 @@ export function apply(ctx, config = {}) {
   let disposed = false
   let scanning = false
 
+  const uiStatePath = join(stateDir, 'ui-state.json')
+  const uiState = { lastTarget: null }
+  async function loadUiState() {
+    try {
+      const saved = JSON.parse(await readFile(uiStatePath, 'utf8'))
+      if (saved && (saved.kind === 'bot' || saved.kind === 'room') && typeof saved.id === 'string') {
+        uiState.lastTarget = { kind: saved.kind, id: saved.id }
+      }
+    } catch { /* 首次无文件 */ }
+  }
+  async function persistUiState() {
+    await atomicWrite(uiStatePath, `${JSON.stringify(uiState.lastTarget ?? {}, null, 2)}\n`)
+  }
+
   const chatSessionsPath = join(stateDir, 'chat-sessions.json')
   const memoryDirOf = (botId) => join(stateDir, 'bots', botId, 'memory')
   const profilePathOf = (botId) => join(memoryDirOf(botId), 'PROFILE.md')
@@ -269,6 +283,7 @@ export function apply(ctx, config = {}) {
     crewState.path = loaded.path
     crewState.crew = loaded.crew
     await loadChatSessions()
+    await loadUiState()
     for (const bot of crewState.crew.bots) {
       botState(bot.id)
       await seedBotMemory(bot)
@@ -760,8 +775,19 @@ export function apply(ctx, config = {}) {
             running: [...runningJobs.entries()].map(([jobId, entry]) => ({ jobId, ...entry })),
             queueDepth: pendingJobs.length,
             recentJobs,
+            lastTarget: uiState.lastTarget,
             config: { inboxRoot, stateDir, maxConcurrentJobs, jobTimeoutMs },
           }); return
+        }
+        if (method === 'POST' && suffix === '/ui-state') {
+          const body = await readJsonBody(req)
+          if (body && (body.kind === 'bot' || body.kind === 'room') && typeof body.id === 'string') {
+            uiState.lastTarget = { kind: body.kind, id: body.id }
+          } else if (body === null || body?.clear === true) {
+            uiState.lastTarget = null
+          }
+          await persistUiState()
+          respond(res, 200, { ok: true }); return
         }
         if (method === 'GET' && suffix === '/crew') {
           respond(res, 200, { crew: crewState.crew }); return
@@ -788,6 +814,16 @@ export function apply(ctx, config = {}) {
         }
         if (method === 'POST' && suffix === '/bots') {
           const body = await readJsonBody(req)
+          if (!String(body?.name || '').trim()) {
+            // Grok Bot 语义：无名称直接创建，自动命名，进入会话后通过对话完成设置
+            body.name = `新 Bot ${crewState.crew.bots.filter((bot) => bot.name.startsWith('新 Bot')).length + 1}`
+            body.persona = String(body.persona || '').trim() || [
+              '你是刚加入团队的新成员，正在通过与用户对话完成初始化。',
+              '先问清两件事：用户想叫你什么、你主要负责什么（职责与边界）。',
+              '得到答复后复述确认，并把职责要点记入你的长期记忆；用户随时可能调整你的档案。',
+              '之后直接开始干活，只汇报真实完成的操作。',
+            ].join('\n')
+          }
           let bot
           try {
             bot = createBot(crewState.crew, body)
@@ -796,6 +832,10 @@ export function apply(ctx, config = {}) {
           }
           await persistCrew()
           await seedBotMemory(bot).catch(() => undefined)
+          await appendDm(bot.id, {
+            role: 'bot',
+            text: `你好！我是团队的新成员。先聊聊怎么安排我：\n1. 叫我什么名字？\n2. 我主要负责什么（职责、边界）？\n定下来后我会记住，你也可以随时点右上角 ⚙ 调整我的档案。现在就可以给我第一个任务。`,
+          }).catch(() => undefined)
           respond(res, 201, { bot: publicBot(bot) }); return
         }
         const botMatch = /^\/bots\/([^/]+)$/.exec(suffix)

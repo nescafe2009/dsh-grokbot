@@ -60,6 +60,7 @@ interface ChatMessage {
 }
 
 interface GrokbotState {
+  lastTarget?: { kind: 'bot' | 'room'; id: string } | null
   bots: BotInfo[]
   rooms: RoomInfo[]
   routines: RoutineInfo[]
@@ -168,23 +169,13 @@ function notify(): void {
   for (const listener of listeners) listener()
 }
 
-function persistLastTarget(target: { kind: 'bot' | 'room'; id: string } | null): void {
-  try {
-    if (target) localStorage.setItem('grokbot.lastTarget', JSON.stringify(target))
-    else localStorage.removeItem('grokbot.lastTarget')
-  } catch { /* 无 localStorage 则不记忆 */ }
-}
-
-function readLastTarget(): { kind: 'bot' | 'room'; id: string } | null {
-  try {
-    const raw = localStorage.getItem('grokbot.lastTarget')
-    if (!raw) return null
-    const parsed = JSON.parse(raw)
-    if (parsed && (parsed.kind === 'bot' || parsed.kind === 'room') && typeof parsed.id === 'string') return parsed
-    return null
-  } catch {
-    return null
-  }
+function persistLastTarget(target: { kind: 'bot' | 'room'; id: string }): void {
+  // 存服务端：DSH 每次启动端口变化，localStorage 按 origin 隔离不可用
+  void fetch(`${API_ROOT}/ui-state`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(target),
+  }).catch(() => undefined)
 }
 
 function openBot(botId: string): void {
@@ -464,9 +455,9 @@ export function GrokbotSidebarCrew(): ReactNode {
   const state = useGrokbotState()
   const target = useOpenTarget()
   const nativeVisible = useNativeSidebarVisible()
-  const [creating, setCreating] = useState(false)
   const [grouping, setGrouping] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
+  const [creatingBot, setCreatingBot] = useState(false)
   const [filter, setFilter] = useState('')
   const rootRef = useRef<HTMLDivElement | null>(null)
   const hiddenRef = useRef<HTMLElement[]>([])
@@ -530,7 +521,7 @@ export function GrokbotSidebarCrew(): ReactNode {
   return (
     <div className="grokbot-sidebar" ref={rootRef}>
       <div className="grokbot-sidebar__top">
-        <button type="button" className="grokbot-iconbtn" title="新建：创建 Bot / 拉群聊 / 与 Bot 单聊" onClick={() => { setMenuOpen((v) => !v); setCreating(false); setGrouping(false) }}>＋</button>
+        <button type="button" className="grokbot-iconbtn" title="新建：创建 Bot / 拉群聊 / 与 Bot 单聊" onClick={() => setMenuOpen((v) => !v)}>＋</button>
         <button type="button" className="grokbot-iconbtn" title={nativeVisible ? '隐藏原始列表' : '显示原始工作区/会话列表'} onClick={() => toggleNativeSidebar()}>⇆</button>
       </div>
       <div className="grokbot-sidebar__search">
@@ -540,8 +531,18 @@ export function GrokbotSidebarCrew(): ReactNode {
         {menuOpen
           ? (
             <div className="grokbot-newmenu">
-              <button type="button" className="grokbot-newmenu__item" onClick={() => { setMenuOpen(false); setCreating(true) }}>
-                <span className="grokbot-newmenu__icon">➕</span>创建新 Bot
+              <button type="button" className="grokbot-newmenu__item" disabled={creatingBot} onClick={() => {
+                setMenuOpen(false)
+                setCreatingBot(true)
+                void api('/bots', { method: 'POST', body: JSON.stringify({}) })
+                  .then((outcome) => {
+                    const id = String(outcome?.bot?.id || '')
+                    if (id) openBot(id)
+                  })
+                  .catch(() => undefined)
+                  .finally(() => setCreatingBot(false))
+              }}>
+                <span className="grokbot-newmenu__icon">➕</span>{creatingBot ? '正在创建…' : '创建新 Bot'}
               </button>
               <button type="button" className="grokbot-newmenu__item" onClick={() => { setMenuOpen(false); setGrouping(true) }}>
                 <span className="grokbot-newmenu__icon">👥</span>创建群聊
@@ -555,7 +556,6 @@ export function GrokbotSidebarCrew(): ReactNode {
             </div>
           )
           : null}
-        {creating ? <BotForm onCancel={() => setCreating(false)} onSaved={() => setCreating(false)} /> : null}
         {grouping ? <RoomForm bots={allBots.filter((bot) => !bot.hidden)} onCancel={() => setGrouping(false)} onSaved={(roomId) => { setGrouping(false); openRoom(roomId) }} /> : null}
         {rooms.length > 0 ? <div className="grokbot-sidebar__section">群聊</div> : null}
         {rooms.map((room) => (
@@ -627,9 +627,9 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
   const [editing, setEditing] = useState(false)
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [newRoutine, setNewRoutine] = useState(false)
-  const [, forceRefresh] = useState(0)
+  const [historyRefresh, forceRefresh] = useState(0)
   const logRef = useRef<HTMLDivElement | null>(null)
-  const messages = useMemo(() => historyOf(bot.id), [bot.id, sending])
+  const messages = useMemo(() => historyOf(bot.id), [bot.id, sending, historyRefresh])
   const pending = (state?.approvals ?? []).filter((approval) => approval.botId === bot.id)
 
   useEffect(() => {
@@ -893,14 +893,18 @@ export function GrokbotMainView(): ReactNode {
   const state = useGrokbotState()
   const restoredRef = useRef(false)
 
-  // 启动恢复上次会话（Grok Bot 语义）：校验目标仍存在，已删除则忽略
+  // 启动恢复上次会话（Grok Bot 语义）：lastTarget 存于服务端，校验存在性
   useEffect(() => {
     if (restoredRef.current || openTarget || !state) return
-    restoredRef.current = true
-    const saved = readLastTarget()
-    if (!saved) return
-    if (saved.kind === 'bot' && state.bots.some((bot) => bot.id === saved.id)) openBot(saved.id)
-    else if (saved.kind === 'room' && state.rooms.some((room) => room.id === saved.id)) openRoom(saved.id)
+    const saved = state.lastTarget
+    if (!saved) { restoredRef.current = true; return }
+    if (saved.kind === 'bot' && state.bots.some((bot) => bot.id === saved.id)) {
+      restoredRef.current = true
+      openBot(saved.id)
+    } else if (saved.kind === 'room' && state.rooms.some((room) => room.id === saved.id)) {
+      restoredRef.current = true
+      openRoom(saved.id)
+    }
   }, [state])
   const bot = target?.kind === 'bot' ? (state?.bots.find((entry) => entry.id === target.id) ?? null) : null
   const room = target?.kind === 'room' ? (state?.rooms.find((entry) => entry.id === target.id) ?? null) : null
