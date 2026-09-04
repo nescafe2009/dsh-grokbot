@@ -111,7 +111,7 @@ export function apply(ctx, config = {}) {
   async function loadUiState() {
     try {
       const saved = JSON.parse(await readFile(uiStatePath, 'utf8'))
-      if (saved && (saved.kind === 'bot' || saved.kind === 'room') && typeof saved.id === 'string') {
+      if (saved && (saved.kind === 'bot' || saved.kind === 'room' || saved.kind === 'conversation') && typeof saved.id === 'string') {
         uiState.lastTarget = { kind: saved.kind, id: saved.id }
       }
     } catch { /* 首次无文件 */ }
