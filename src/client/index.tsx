@@ -54,6 +54,11 @@ const GROKBOT_CSS = `
 .grokbot-sidebar__title .grokbot-dot { width:6px; height:6px; border-radius:50%; background:#8a8f98; flex:none; }
 .grokbot-sidebar__title .grokbot-dot.on { background:#2ea043; box-shadow:0 0 5px #2ea04399; }
 .grokbot-sidebar__queue { margin-left:auto; font-size:10px; opacity:.6; text-transform:none; letter-spacing:0; }
+.grokbot-newmenu { display:flex; flex-direction:column; gap:1px; margin:2px 2px 8px; padding:5px; border:1px solid var(--border,#e3e5e8); border-radius:10px; background:var(--background,#fff); box-shadow:0 4px 16px rgba(0,0,0,.08); }
+.grokbot-newmenu__item { display:flex; align-items:center; gap:8px; width:100%; padding:7px 10px; border:none; border-radius:8px; background:transparent; cursor:pointer; font:inherit; font-size:13px; color:inherit; text-align:left; }
+.grokbot-newmenu__item:hover { background:rgba(127,127,127,.12); }
+.grokbot-newmenu__icon { width:22px; height:22px; display:inline-flex; align-items:center; justify-content:center; font-size:15px; flex:none; }
+.grokbot-newmenu__divider { height:1px; background:var(--border,#e3e5e8); margin:4px 2px; }
 .grokbot-sidebar__new { margin-left:auto; border:none; background:none; cursor:pointer; opacity:.55; font-size:14px; padding:0 5px; border-radius:5px; line-height:1; }
 .grokbot-sidebar__new:hover { opacity:1; background:rgba(127,127,127,.15); }
 .grokbot-sidebar__section { font-size:10px; opacity:.45; margin:8px 4px 3px; letter-spacing:.04em; }
@@ -364,6 +369,7 @@ export function GrokbotSidebarCrew(): ReactNode {
   const nativeVisible = useNativeSidebarVisible()
   const [creating, setCreating] = useState(false)
   const [grouping, setGrouping] = useState(false)
+  const [menuOpen, setMenuOpen] = useState(false)
   const rootRef = useRef<HTMLDivElement | null>(null)
   const hiddenRef = useRef<HTMLElement[]>([])
 
@@ -419,14 +425,8 @@ export function GrokbotSidebarCrew(): ReactNode {
         <button
           type="button"
           className="grokbot-sidebar__new"
-          title="新建群聊"
-          onClick={() => setGrouping(true)}
-        >👥</button>
-        <button
-          type="button"
-          className="grokbot-sidebar__new"
-          title="新建专家"
-          onClick={() => setCreating(true)}
+          title="新建：创建 Bot / 拉群聊 / 与 Bot 单聊"
+          onClick={() => setMenuOpen((v) => !v)}
         >＋</button>
         <button
           type="button"
@@ -435,6 +435,31 @@ export function GrokbotSidebarCrew(): ReactNode {
           onClick={() => toggleNativeSidebar()}
         >⇅</button>
       </div>
+      {menuOpen
+        ? (
+          <div className="grokbot-newmenu">
+            <button type="button" className="grokbot-newmenu__item" onClick={() => { setMenuOpen(false); setCreating(true) }}>
+              <span className="grokbot-newmenu__icon">➕</span>创建新 Bot
+            </button>
+            <button type="button" className="grokbot-newmenu__item" onClick={() => { setMenuOpen(false); setGrouping(true) }}>
+              <span className="grokbot-newmenu__icon">👥</span>创建群聊
+            </button>
+            {(allBots.filter((bot) => !bot.hidden)).length > 0
+              ? <div className="grokbot-newmenu__divider" />
+              : null}
+            {allBots.filter((bot) => !bot.hidden).map((bot) => (
+              <button
+                key={bot.id}
+                type="button"
+                className="grokbot-newmenu__item"
+                onClick={() => { setMenuOpen(false); openBot(bot.id) }}
+              >
+                <span className="grokbot-newmenu__icon">{bot.avatar}</span>{bot.name}
+              </button>
+            ))}
+          </div>
+        )
+        : null}
       {creating
         ? <BotForm onCancel={() => setCreating(false)} onSaved={() => setCreating(false)} />
         : null}
