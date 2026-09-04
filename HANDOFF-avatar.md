@@ -1,8 +1,8 @@
 # HANDOFF · Q 版头像体系设计（交给 Codex）
 
-> 目标：在 **H1-EVO 果冻豆**方向上把 dsh-grokbot 的头像做得**更可爱**，并实现完整的角色分配体系。
-> 你（Codex）负责美术精修与 SVG 产出；架构、接入点、约束、验收均已写明，照此执行即可。
-> 仓库：`github.com/nescafe2009/dsh-grokbot`（本地 `/Users/moltbot/Documents/Workspaces/Zcode/DshCustomize`）
+> **交付模式（重要）**：你的任务是**纯美术素材产出**——只交付 SVG/设计规格，**不要改动本仓库的任何工程代码**（不改 src/、不跑构建、不提交代码改动）。
+> 产出物写入 `assets-design/` 目录（新建），按 §9 的文件清单组织。由 ZCode 负责后续集成、构建与验收。
+> 仓库（只读参考）：`github.com/nescafe2009/dsh-grokbot`（本地 `/Users/moltbot/Documents/Workspaces/Zcode/DshCustomize`）
 
 ---
 
@@ -27,11 +27,11 @@
    - 可加"挤压感"：豆体下缘轻微压扁、两侧微鼓（squash & stretch）
    - 配色：糖果奶油系渐变（上浅下深），禁止高饱和荧光色
 3. **角色要素**：每角色 = 身色渐变 + 头顶要素（耳朵/呆毛/天线/皇冠）+ 眼部要素（眼镜/放大镜/特殊瞳）+ 嘴型。见 §4 矩阵。
-4. **技术硬约束**：
-   - 纯 inline SVG（`viewBox="0 0 64 64"`），**禁止**外部图片/字体/依赖/emoji
-   - 渐变 `<defs><linearGradient>` 的 id 必须全局唯一（多个头像同屏渲染，id 冲突会串色——用 `q1`+botId 之类的唯一后缀，或改用 `<radialGradient>` 内联 fill 不带 id 的方案）
-   - 36px 下必须可辨认（把 SVG 缩到 36px 自查：眼睛/配件不能糊成一团）
-   - 确定性：同 seed 渲染结果完全一致（哈希只用于自定义角色的色相/气泡）
+4. **素材硬约束**：
+   - 纯 SVG（`viewBox="0 0 64 64"`；徽章/星星等小件用各自合适的 viewBox），**禁止**位图/外部字体/依赖/emoji
+   - 渐变 id 统一加素材前缀（如 `av-chief`、`bdg-lv3`），保证多素材同屏不串色
+   - 36px 下必须可辨认（自查：眼睛/配件不能糊成一团）
+   - 确定性：同参数渲染结果完全一致
 
 ## 3. 基准草图（12 格，用户已认可的结构，你来精修可爱度）
 
@@ -86,22 +86,11 @@
 | 幂等 | 幕僚长永远皇冠蓝（id=chief 全局唯一已实现）；群聊永远三联云 | 已实现 |
 | 兜底 | ⚙ 编辑表单加 12 宫格头像选择器 | 需新增 |
 
-## 5. 技术接入与交付要求
+## 5. 交付方式（见 §9 文件清单）
 
-1. **改动范围**：`src/client/index.tsx`（AvatarView/GLYPHS 替换为果冻豆体系）+ 少量服务端（`src/index.mjs` 的 /state 给 bot 附 `roleTemplate`，读取 setup.json）。不改其它模块。
-2. **组件 API 不变**：`AvatarView({ seed, name?, glyph?, size, fontSize? })` 签名保留（glyph 值换成模板 id），6 个调用点无需改。
-3. **构建**：`npm run build`（已内置原子部署：先 lib.tmp 再换名，别绕过）。**构建后必须跑冒烟**：
-   ```bash
-   node -e '/* 加载 lib/client.js 并以 stub 执行 factory，确认无异常 */'
-   ```
-   （仓库根有现成命令的历史，参照 commit 89f3782 的消息。）
-4. **验收清单**：
-   - [ ] 12 个基准草图全部替换为精修版，36px 下眼睛/配件可辨
-   - [ ] 同屏多头像无渐变 id 串色
-   - [ ] 同 seed 两次渲染像素一致
-   - [ ] 桌面端（DSH Desktop 重启后）侧栏/会话头/成员面板/向导角色卡全部生效
-   - [ ] 向导选角色 → 头像即时切换正确角色
-5. **风格红线**：不做写实、不引依赖、不改变 AvatarView 调用方、不动与头像无关的代码。
+- 所有产出放 `assets-design/` 目录，**不触碰 src/**
+- 每个 SVG 一个独立文件 + 一份 `README.md` 说明要素构成与使用参数
+- 如需说明拼装逻辑，写在 `assets-design/ASSEMBLY.md`（伪代码/表格即可，不写真实工程代码）
 
 ## 6. 参考坐标
 
@@ -173,12 +162,32 @@
 4. **EXP 进度条**：现用纯 CSS 渐变条，可升级为果冻风格（圆角+微光+端点小豆点），与头像质感统一
 5. **反馈按钮**：👍👎 当前用字符，换成与头像同风的单线 SVG 图标（12px 级别，透明度 0.4→1 悬停）
 
-### 渲染位置（现状代码参考）
-- 会话头 meta：`src/client/index.tsx` 搜 `Lv${bot.rating.level}`（文字徽章处）
-- 详情面板评级卡：搜 `grokbot-rating`（CSS 块）
-- 反馈按钮：搜 `grokbot-fb`
-
 ### 约束
-- 全部纯 SVG/CSS，无外部资源；16px 下可辨
+- 全部纯 SVG，无外部资源；16px 下可辨
 - 等级联动不得破坏头像 36px 可读性（光环用极细描边，角标 ≤10px）
-- AvatarView 的 `level` 参数可选，缺省行为与现在完全一致（向后兼容）
+- 光环/角标以"叠加层"形式单独交付（ZCode 负责接到 AvatarView 上），不需要你改组件
+
+
+---
+
+## 9. 交付文件清单（assets-design/ 目录结构）
+
+```
+assets-design/
+├── README.md                 # 素材总说明：每款要素构成、建议用法参数
+├── avatars/                  # §3+§7 的 18 款头像，每款一个 .svg
+│   ├── chief.svg  coder.svg  researcher.svg  writer.svg  analyst.svg
+│   ├── pm.svg  ops.svg  translator.svg  secretary.svg  reviewer.svg
+│   ├── group.svg  blank.svg
+│   └── kw-shield.svg  kw-scales.svg  kw-book.svg  kw-gear.svg  kw-note.svg  kw-flame.svg
+├── parts/                    # §7 拼装零件（豆身/眼/腮红/嘴×4/内景×3/头顶×4/色板12），每件一个 .svg 或一个总表
+│   └── ASSEMBLY.md           # 拼装伪代码：哈希 → (色, 嘴, 内景, 头顶) 的映射规则
+└── rating/                   # §8 评级素材
+    ├── badge-lv1.svg ~ badge-lv5.svg      # 等级徽章（16px 与 48px 两版可合一）
+    ├── star-filled.svg  star-empty.svg    # 质量星两态
+    ├── ring-gold.svg                       # Lv4+ 金色光环叠加层（透明底，居中）
+    ├── crown-mini.svg                      # Lv5 右上角小皇冠角标（≤10px 设计稿）
+    └── thumb-up.svg  thumb-down.svg        # 反馈图标（12px 级）
+```
+
+**验收（由 ZCode 执行，你只需自检）**：文件齐全、SVG 可直接 inline、36px/16px 缩放可辨、无外部引用。
