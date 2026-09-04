@@ -763,7 +763,7 @@ export function GrokbotSidebarCrew(): ReactNode {
           return (
             <button key={conversation.id} type="button" className={`grokbot-chatrow${target?.id === conversation.id ? ' active' : ''}`} onClick={() => openConversation(conversation.id)}>
               <span className="grokbot-avatar">
-                <AvatarView seed={isGroup ? conversation.id : (bot?.id ?? conversation.id)} name={bot?.name} glyph={isGroup ? 'group' : undefined} size={36} fontSize={15} />
+                <AvatarView seed={isGroup ? conversation.id : (bot?.id ?? conversation.id)} name={bot?.name} glyph={isGroup ? 'group' : (bot?.roleTemplate || undefined)} size={36} level={!isGroup ? bot?.rating?.level : undefined} />
                 {!isGroup ? <span className={`grokbot-avatar__dot${working ? ' working' : ''}`} /> : null}
               </span>
               <span className="grokbot-chatrow__main">
@@ -1027,7 +1027,7 @@ function MembersPanel(props: { conversation: { id: string; name: string; memberB
       {members.map((member) => (
         <div key={member.id} className="grokbot-member" style={{ justifyContent: 'space-between' }}>
           <span style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <span className="mavatar" style={{ display:'inline-flex' }}><AvatarView seed={member.id} name={member.name} size={30} fontSize={13} /></span>{member.name}
+            <span className="mavatar" style={{ display:'inline-flex' }}><AvatarView seed={member.id} name={member.name} glyph={member.roleTemplate || undefined} size={30} /></span>{member.name}
           </span>
           {members.length > 1 ? (
             <button type="button" className="grokbot-iconbtn" title="移出会话" disabled={busy} onClick={() => void mutate(member.id, true)}>✕</button>
@@ -1151,7 +1151,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
   return (
     <div className="grokbot-chat" onKeyDown={(event) => { if (event.key === 'Escape' && !detailsOpen && !editing) closeTarget() }}>
       <div className="grokbot-chat__head">
-        <AvatarView seed={bot.id} name={bot.name} glyph={bot.id} size={38} level={bot.rating?.level} />
+        <AvatarView seed={bot.id} name={bot.name} glyph={bot.roleTemplate || undefined} size={38} level={bot.rating?.level} />
         <span className="grokbot-chat__title" onClick={() => setDetailsOpen((v) => !v)}>
           <span className="grokbot-chat__name">{bot.name}</span>
           <span className="grokbot-chat__meta">
