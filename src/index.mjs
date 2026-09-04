@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { loadOrCreateCrew, routeJob, botWorkspace, serializeCrew, atomicWrite, parseCrew, createBot, updateBot, removeBot, duplicateBot, createRoom, updateRoom, removeRoom, upsertRoutine, removeRoutine } from './crew.mjs'
 import { ensureInbox, scanInbox, claimJob, completeJob, failJob, enqueueJob } from './inbox.mjs'
+import { BOT_TEMPLATES, templateById } from './templates.mjs'
 
 const API_ROOT = '/api/plugins/grokbot'
 const JSON_HEADERS = {
@@ -793,6 +794,9 @@ export function apply(ctx, config = {}) {
         if (method === 'GET' && suffix === '/crew') {
           respond(res, 200, { crew: crewState.crew }); return
         }
+        if (method === 'GET' && suffix === '/bot-templates') {
+          respond(res, 200, { templates: BOT_TEMPLATES }); return
+        }
         if (method === 'GET' && suffix === '/model-catalog') {
           respond(res, 200, { catalog: await modelCatalog(), current: ctx.agentDefaultModel?.currentSelection?.() ?? null }); return
         }
@@ -815,14 +819,33 @@ export function apply(ctx, config = {}) {
         }
         if (method === 'POST' && suffix === '/bots') {
           const body = await readJsonBody(req)
+          const template = body?.templateId ? templateById(String(body.templateId)) : null
+          let greeting = ''
+          if (template && !template.blank) {
+            body.name = String(body?.name || '').trim() || template.name
+            body.avatar = body?.avatar || template.avatar
+            body.title = body?.title || template.title
+            body.persona = String(body?.persona || '').trim() || template.persona
+            greeting = template.greeting || ''
+          }
           if (!String(body?.name || '').trim()) {
-            // Grok Bot 语义：无名称直接创建，自动命名，进入会话后通过对话完成设置
+            // 空白 Bot：对话式初始化（Grok Bot 语义），开场白结构化（Markdown + 快捷选项）
             body.name = `新 Bot ${crewState.crew.bots.filter((bot) => bot.name.startsWith('新 Bot')).length + 1}`
-            body.persona = String(body.persona || '').trim() || [
+            body.persona = String(body?.persona || '').trim() || [
               '你是刚加入团队的新成员，正在通过与用户对话完成初始化。',
               '先问清两件事：用户想叫你什么、你主要负责什么（职责与边界）。',
               '得到答复后复述确认，并把职责要点记入你的长期记忆；用户随时可能调整你的档案。',
               '之后直接开始干活，只汇报真实完成的操作。',
+            ].join('\n')
+            greeting = [
+              '你好！我是团队的新成员，先把我设置好：',
+              '',
+              '1. **叫我什么名字？**',
+              '2. **我主要负责什么**（职责与边界）？',
+              '',
+              '也可以直接选一个方向开始：',
+              '',
+              '[[叫我工程师|叫我调研员|叫我写作官|先随便聊聊]]',
             ].join('\n')
           }
           let bot
@@ -833,10 +856,9 @@ export function apply(ctx, config = {}) {
           }
           await persistCrew()
           await seedBotMemory(bot).catch(() => undefined)
-          await appendDm(bot.id, {
-            role: 'bot',
-            text: `你好！我是团队的新成员。先聊聊怎么安排我：\n1. 叫我什么名字？\n2. 我主要负责什么（职责、边界）？\n定下来后我会记住，你也可以随时点右上角 ⚙ 调整我的档案。现在就可以给我第一个任务。`,
-          }).catch(() => undefined)
+          if (greeting) {
+            await appendDm(bot.id, { role: 'bot', text: greeting }).catch(() => undefined)
+          }
           respond(res, 201, { bot: publicBot(bot) }); return
         }
         const botMatch = /^\/bots\/([^/]+)$/.exec(suffix)
