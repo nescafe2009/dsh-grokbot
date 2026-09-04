@@ -305,6 +305,8 @@ export function apply(ctx, config = {}) {
   // ---------- agent 会话 ----------
 
   const activeSessions = new Set()
+  const approvalBotByAgent = new Map()
+  const pendingApprovals = new Map()
 
   async function createBotAgent(bot, { sessionId, resume = false } = {}) {
     const abort = new AbortController()
@@ -349,12 +351,71 @@ export function apply(ctx, config = {}) {
       abort,
       dispose: async () => {
         activeSessions.delete(session)
+        approvalBotByAgent.delete(String(handle.agent.id))
         try { handle.agent.cancel({ kind: 'user' }, { keepInbox: true }) } catch { /* best effort */ }
         try { await handle.dispose() } catch { /* best effort */ }
       },
     }
     activeSessions.add(session)
+    approvalBotByAgent.set(String(handle.agent.id), bot.id)
     return session
+  }
+
+  // 审批桥：我们创建的 agent 的工具审批交给会话内【同意/取消】卡，其余放行
+  ctx.effect(() => ctx.on('approval/request', (req, next) => {
+    const agentId = String(req?.agent?.id || '')
+    const botId = approvalBotByAgent.get(agentId)
+    if (!botId) return next()
+    const events = req?.agent?.session?.events || []
+    const decided = new Set()
+    let approvalId = ''
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index]
+      if (event.type === 'approval/decided') { decided.add(event.data.id); continue }
+      if (event.type !== 'approval/asked' || decided.has(event.data.id)) continue
+      if ((req.callId ?? null) !== (event.data.callId ?? null)) continue
+      if (pendingApprovals.has(String(event.data.id))) continue
+      approvalId = String(event.data.id)
+      break
+    }
+    if (!approvalId) return next()
+    ctx.logger?.info?.(`grokbot approval ${approvalId} bot=${botId} tool=${req.toolName}`)
+    return new Promise((resolve) => {
+      pendingApprovals.set(approvalId, {
+        id: approvalId,
+        botId,
+        toolName: String(req.toolName || ''),
+        reason: String(req.reason || ''),
+        createdAt: Date.now(),
+        resolve,
+      })
+      req.signal?.addEventListener('abort', () => {
+        if (pendingApprovals.get(approvalId)?.resolve === resolve) pendingApprovals.delete(approvalId)
+        resolve('cancelled')
+      }, { once: true })
+    })
+  }, true), 'grokbot: approval bridge')
+
+  async function appendDm(botId, entry) {
+    const dir = join(stateDir, 'bots', botId)
+    await mkdir(dir, { recursive: true })
+    const path = join(dir, 'dm-transcript.jsonl')
+    const { appendFile } = await import('node:fs/promises')
+    let text = ''
+    try {
+      text = await readFile(path, 'utf8')
+    } catch { text = '' }
+    if (!text.endsWith('\n') && text.length > 0) await appendFile(path, '\n')
+    await appendFile(path, `${JSON.stringify({ ts: Date.now(), ...entry })}\n`)
+  }
+
+  async function readDm(botId, limit = 200) {
+    try {
+      const lines = (await readFile(join(stateDir, 'bots', botId, 'dm-transcript.jsonl'), 'utf8')).split('\n').filter((line) => line.trim())
+      return lines.slice(-limit).map((line) => { try { return JSON.parse(line) } catch { return null } }).filter(Boolean)
+    } catch {
+      return []
+    }
   }
 
   async function chatTurn(bot, text, { preamble = '' } = {}) {
@@ -379,11 +440,17 @@ export function apply(ctx, config = {}) {
     await session.handle.agent.whenIdle()
     const firstSeq = session.handle.agent.session.seq
     session.handle.agent.followup(userMessage(preamble ? `${preamble}\n\n${text}` : text))
+    await appendDm(bot.id, { role: 'user', text: preamble ? `${preamble}\n\n${text}` : text }).catch(() => undefined)
     await session.handle.agent.whenIdle()
-    return {
+    const outcome = {
       ...summarizeTurn(session.handle.agent.session.events, firstSeq),
       activity: activityOf(session.handle.agent.session.events, firstSeq),
     }
+    const dmText = outcome.text?.trim()
+    if (dmText) {
+      await appendDm(bot.id, { role: 'bot', text: dmText, activity: outcome.activity }).catch(() => undefined)
+    }
+    return outcome
   }
 
   function memberBot(room, botId) {
@@ -673,10 +740,23 @@ export function apply(ctx, config = {}) {
           respond(res, 200, { ok: true, time: nowIso() }); return
         }
         if (method === 'GET' && suffix === '/state') {
+          const bots = []
+          for (const bot of crewState.crew.bots) {
+            const base = publicBot(bot)
+            const dm = await readDm(bot.id, 1)
+            const last = dm[dm.length - 1]
+            bots.push({
+              ...base,
+              lastMessage: last ? String(last.text || '').slice(0, 80) : '',
+              lastAt: last?.ts ?? null,
+              lastFrom: last?.role === 'user' ? 'user' : 'bot',
+            })
+          }
           respond(res, 200, {
-            bots: crewState.crew.bots.map(publicBot),
+            bots,
             rooms: crewState.crew.rooms ?? [],
             routines: crewState.crew.routines ?? [],
+            approvals: [...pendingApprovals.values()].map(({ resolve, ...rest }) => rest),
             running: [...runningJobs.entries()].map(([jobId, entry]) => ({ jobId, ...entry })),
             queueDepth: pendingJobs.length,
             recentJobs,
@@ -758,6 +838,34 @@ export function apply(ctx, config = {}) {
           await persistCrew()
           await seedBotMemory(bot).catch(() => undefined)
           respond(res, 201, { bot: publicBot(bot) }); return
+        }
+        const approvalMatch = /^\/approvals\/([^/]+)$/.exec(suffix)
+        if (approvalMatch && method === 'POST') {
+          const approvalId = decodeURIComponent(approvalMatch[1])
+          const entry = pendingApprovals.get(approvalId)
+          if (!entry) throw new HttpError(404, '没有找到待审批的操作')
+          const body = await readJsonBody(req)
+          const outcome = String(body?.outcome || '')
+          if (!['allowed-once', 'rejected'].includes(outcome)) {
+            throw new HttpError(400, '审批结果无效（allowed-once / rejected）')
+          }
+          pendingApprovals.delete(approvalId)
+          entry.resolve(outcome)
+          ctx.logger?.info?.(`grokbot approval ${approvalId} -> ${outcome}`)
+          respond(res, 200, { ok: true, outcome }); return
+        }
+        const stopMatch = /^\/bots\/([^/]+)\/stop$/.exec(suffix)
+        if (method === 'POST' && stopMatch) {
+          const botId = decodeURIComponent(stopMatch[1])
+          const session = chatHandles.get(botId)
+          if (session) {
+            try { session.handle.agent.cancel({ kind: 'user' }, { keepInbox: true }) } catch { /* best effort */ }
+          }
+          respond(res, 200, { ok: true }); return
+        }
+        const historyMatch = /^\/bots\/([^/]+)\/history$/.exec(suffix)
+        if (method === 'GET' && historyMatch) {
+          respond(res, 200, { messages: await readDm(decodeURIComponent(historyMatch[1])) }); return
         }
         if (method === 'GET' && suffix === '/rooms') {
           respond(res, 200, { rooms: crewState.crew.rooms ?? [] }); return
