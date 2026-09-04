@@ -26,7 +26,7 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "build": "tsdown --config ./tsdown.config.ts",
+    "build": "tsdown --config ./tsdown.config.ts --outDir lib.tmp && rm -rf lib.old && mv lib lib.old 2>/dev/null; mv lib.tmp lib && rm -rf lib.old && echo deployed",
     "check": "node --check src/index.mjs && node --check src/crew.mjs && node --check src/inbox.mjs && node --test tests/*.test.mjs",
     "prepublishOnly": "npm run build && npm run check"
   },
