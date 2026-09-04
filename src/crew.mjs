@@ -43,22 +43,22 @@ function normalizeBot(raw, index) {
   }
 }
 
-function normalizeRoom(raw, index, ids) {
+function normalizeConversation(raw, index, ids) {
   if (!raw || typeof raw !== 'object') {
-    throw new Error(`crew.rooms[${index}] 必须是对象`)
+    throw new Error(`crew.conversations[${index}] 必须是对象`)
   }
   const id = String(raw.id || '').trim()
   if (!SAFE_ID_RE.test(id)) {
-    throw new Error(`crew.rooms[${index}].id 非法：${id}`)
+    throw new Error(`crew.conversations[${index}].id 非法：${id}`)
   }
   const members = Array.isArray(raw.memberBotIds) ? raw.memberBotIds.map(String) : []
-  if (members.length < 2 || members.length > 6) {
-    throw new Error(`群聊 ${id} 成员数须在 2-6`)
+  if (members.length < 1 || members.length > 6) {
+    throw new Error(`会话 ${id} 成员数须在 1-6（1=私聊，2-6=群聊）`)
   }
   for (const memberId of members) {
-    if (!ids.has(memberId)) throw new Error(`群聊 ${id} 成员不存在：${memberId}`)
+    if (!ids.has(memberId)) throw new Error(`会话 ${id} 成员不存在：${memberId}`)
   }
-  return { id, name: String(raw.name || id).trim() || id, memberBotIds: [...new Set(members)] }
+  return { id, name: String(raw.name || '').trim(), memberBotIds: [...new Set(members)] }
 }
 
 function normalizeRoutine(raw, index, ids) {
@@ -104,15 +104,21 @@ export function parseCrew(text) {
   const normModel = (value) => value && (value.provider || value.model)
     ? { provider: String(value.provider || ''), model: String(value.model || '') }
     : null
-  const rooms = Array.isArray(raw?.rooms) ? raw.rooms.map((room, i) => normalizeRoom(room, i, ids)) : []
+  // 统一实体：conversations（1 成员=私聊，2-6=群）；旧 rooms 自动迁移
+  let conversations = Array.isArray(raw?.conversations)
+    ? raw.conversations.map((conversation, i) => normalizeConversation(conversation, i, ids))
+    : []
+  if (conversations.length === 0 && Array.isArray(raw?.rooms) && raw.rooms.length > 0) {
+    conversations = raw.rooms.map((room, i) => normalizeConversation(room, i, ids))
+  }
   const routines = Array.isArray(raw?.routines) ? raw.routines.map((routine, i) => normalizeRoutine(routine, i, ids)) : []
-  if (normalized.length + rooms.length > 50) {
-    throw new Error('bots+groups 总数已达上限 50')
+  if (normalized.length + conversations.length > 50) {
+    throw new Error('bots+conversations 总数已达上限 50')
   }
   return {
     routing: { default: defaultBot },
     bots: normalized,
-    rooms,
+    conversations,
     routines,
     defaultModel: normModel(raw?.defaultModel),
     utilityModel: normModel(raw?.utilityModel),
@@ -125,7 +131,7 @@ export function serializeCrew(crew) {
     defaultModel: crew.defaultModel || null,
     utilityModel: crew.utilityModel || null,
     bots: crew.bots.map((bot) => ({ ...bot, model: bot.model || null })),
-    rooms: crew.rooms || [],
+    conversations: crew.conversations || [],
     routines: (crew.routines || []).map((routine) => ({ ...routine, schedule: routine.schedule })),
   }, null, 2)}\n`
 }
@@ -191,8 +197,8 @@ export function createBot(crew, input) {
   if (crew.bots.some((bot) => bot.id === draft.id)) {
     throw new Error(`bot id 已存在：${draft.id}`)
   }
-  if (crew.bots.length + (crew.rooms?.length ?? 0) >= 50) {
-    throw new Error('bots+groups 总数已达上限 50')
+  if (crew.bots.length + (crew.conversations?.length ?? 0) >= 50) {
+    throw new Error('bots+conversations 总数已达上限 50')
   }
   const bot = normalizeBot(draft, crew.bots.length)
   crew.bots.push(bot)
@@ -224,6 +230,11 @@ export function removeBot(crew, botId) {
   if (crew.routing.default === botId) {
     crew.routing.default = crew.bots[0].id
   }
+  // 从所有会话移除该成员；只剩 1 人的群聊保持为私聊语义
+  for (const conversation of crew.conversations ?? []) {
+    conversation.memberBotIds = conversation.memberBotIds.filter((memberId) => memberId !== botId)
+  }
+  crew.conversations = (crew.conversations ?? []).filter((conversation) => conversation.memberBotIds.length > 0)
   return crew.bots
 }
 
@@ -244,36 +255,55 @@ export function duplicateBot(crew, botId) {
   })
 }
 
-export function createRoom(crew, input) {
-  if (!Array.isArray(crew.rooms)) crew.rooms = []
+export function createConversation(crew, input) {
+  if (!Array.isArray(crew.conversations)) crew.conversations = []
   const ids = new Set(crew.bots.map((bot) => bot.id))
+  const memberBotIds = Array.isArray(input?.memberBotIds) ? input.memberBotIds.map(String) : []
   const draft = {
-    id: String(input?.id || '').trim() || slugId(String(input?.name || 'room')),
-    name: String(input?.name || '新群聊').trim(),
-    memberBotIds: Array.isArray(input?.memberBotIds) ? input.memberBotIds.map(String) : [],
+    id: String(input?.id || '').trim() || (memberBotIds.length === 1 ? memberBotIds[0] : slugId(String(input?.name || 'conv'))),
+    name: String(input?.name || '').trim(),
+    memberBotIds,
   }
-  if (crew.rooms.some((room) => room.id === draft.id)) {
-    throw new Error(`room id 已存在：${draft.id}`)
+  if (crew.conversations.some((conversation) => conversation.id === draft.id)) {
+    throw new Error(`conversation id 已存在：${draft.id}`)
   }
-  const room = normalizeRoom(draft, crew.rooms.length, ids)
-  crew.rooms.push(room)
-  return room
+  const conversation = normalizeConversation(draft, crew.conversations.length, ids)
+  crew.conversations.push(conversation)
+  return conversation
 }
 
-export function updateRoom(crew, roomId, patch) {
-  const room = crew.rooms?.find((entry) => entry.id === roomId)
-  if (!room) throw new Error(`room 不存在：${roomId}`)
-  const ids = new Set(crew.bots.map((bot) => bot.id))
-  const next = normalizeRoom({ ...room, ...(patch ?? {}) }, 0, ids)
-  Object.assign(room, next)
-  return room
+export function renameConversation(crew, conversationId, name) {
+  const conversation = crew.conversations?.find((entry) => entry.id === conversationId)
+  if (!conversation) throw new Error(`conversation 不存在：${conversationId}`)
+  conversation.name = String(name || '').trim()
+  return conversation
 }
 
-export function removeRoom(crew, roomId) {
-  const index = crew.rooms?.findIndex((entry) => entry.id === roomId) ?? -1
-  if (index < 0) throw new Error(`room 不存在：${roomId}`)
-  crew.rooms.splice(index, 1)
-  return crew.rooms
+export function addConversationMember(crew, conversationId, botId) {
+  const conversation = crew.conversations?.find((entry) => entry.id === conversationId)
+  if (!conversation) throw new Error(`conversation 不存在：${conversationId}`)
+  if (!crew.bots.some((bot) => bot.id === botId)) throw new Error(`bot 不存在：${botId}`)
+  if (conversation.memberBotIds.includes(botId)) throw new Error(`成员已在会话中：${botId}`)
+  if (conversation.memberBotIds.length >= 6) throw new Error('会话成员已达上限 6')
+  conversation.memberBotIds.push(botId)
+  return conversation
+}
+
+export function removeConversationMember(crew, conversationId, botId) {
+  const conversation = crew.conversations?.find((entry) => entry.id === conversationId)
+  if (!conversation) throw new Error(`conversation 不存在：${conversationId}`)
+  const index = conversation.memberBotIds.indexOf(botId)
+  if (index < 0) throw new Error(`成员不在会话中：${botId}`)
+  if (conversation.memberBotIds.length <= 1) throw new Error('会话至少保留一名成员')
+  conversation.memberBotIds.splice(index, 1)
+  return conversation
+}
+
+export function removeConversation(crew, conversationId) {
+  const index = crew.conversations?.findIndex((entry) => entry.id === conversationId) ?? -1
+  if (index < 0) throw new Error(`conversation 不存在：${conversationId}`)
+  crew.conversations.splice(index, 1)
+  return crew.conversations
 }
 
 export function upsertRoutine(crew, input, routineId) {

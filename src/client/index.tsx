@@ -20,10 +20,14 @@ interface BotInfo {
   lastFrom?: string
 }
 
-interface RoomInfo {
+interface ConversationInfo {
   id: string
   name: string
   memberBotIds: string[]
+  isGroup?: boolean
+  lastMessage?: string
+  lastAt?: number | null
+  lastFrom?: string
 }
 
 interface RoutineInfo {
@@ -60,9 +64,9 @@ interface ChatMessage {
 }
 
 interface GrokbotState {
-  lastTarget?: { kind: 'bot' | 'room'; id: string } | null
+  lastTarget?: { kind: string; id: string } | null
   bots: BotInfo[]
-  rooms: RoomInfo[]
+  conversations: ConversationInfo[]
   routines: RoutineInfo[]
   approvals: ApprovalInfo[]
   running: { jobId: string; botId: string; startedAt: number }[]
@@ -186,7 +190,7 @@ const GROKBOT_CSS = `
 .grokbot-inputbar .side:disabled { opacity:.25; cursor:default; }
 `
 
-let openTarget: { kind: 'bot' | 'room'; id: string } | null = null
+let openTarget: { kind: 'conversation'; id: string } | null = null
 let creatingUi = false
 let nativeSidebarVisible = false
 const listeners = new Set<() => void>()
@@ -200,7 +204,7 @@ function setCreatingUi(value: boolean): void {
   notify()
 }
 
-function persistLastTarget(target: { kind: 'bot' | 'room'; id: string }): void {
+function persistLastTarget(target: { kind: string; id: string }): void {
   // 存服务端：DSH 每次启动端口变化，localStorage 按 origin 隔离不可用
   void fetch(`${API_ROOT}/ui-state`, {
     method: 'POST',
@@ -209,18 +213,20 @@ function persistLastTarget(target: { kind: 'bot' | 'room'; id: string }): void {
   }).catch(() => undefined)
 }
 
-function openBot(botId: string): void {
-  openTarget = { kind: 'bot', id: botId }
+// 统一实体：私聊会话 id === botId；群聊会话 id 独立
+function openConversation(conversationId: string): void {
+  openTarget = { kind: 'conversation', id: conversationId }
   persistLastTarget(openTarget)
   notify()
   refreshState?.()
 }
 
+function openBot(botId: string): void {
+  openConversation(botId)
+}
+
 function openRoom(roomId: string): void {
-  openTarget = { kind: 'room', id: roomId }
-  persistLastTarget(openTarget)
-  notify()
-  refreshState?.()
+  openConversation(roomId)
 }
 
 function closeTarget(): void {
@@ -233,7 +239,7 @@ function toggleNativeSidebar(): void {
   notify()
 }
 
-function useOpenTarget() {
+function useOpenTarget(): { kind: 'conversation'; id: string } | null {
   const [, force] = useState(0)
   useEffect(() => {
     const listener = (): void => force((n) => n + 1)
@@ -423,11 +429,11 @@ function RoomForm(props: {
     setBusy(true)
     setError('')
     try {
-      const outcome = await api('/rooms', {
+      const outcome = await api('/conversations', {
         method: 'POST',
         body: JSON.stringify({ name: name.trim() || '新群聊', memberBotIds: selected }),
       })
-      props.onSaved(String(outcome?.room?.id ?? ''))
+      props.onSaved(String(outcome?.conversation?.id ?? ''))
     } catch (err) {
       setError(String((err as Error)?.message ?? err))
     } finally {
@@ -568,17 +574,37 @@ export function GrokbotSidebarCrew(): ReactNode {
   }, [nativeVisible])
 
   const allBots = state?.bots ?? []
-  const visible = allBots
-    .filter((bot) => !bot.hidden)
-    .filter((bot) => !filter.trim() || bot.name.includes(filter.trim()) || (bot.title || '').includes(filter.trim()))
-    .sort((a, b) => Number(b.pinned) - Number(a.pinned) || (b.lastAt ?? 0) - (a.lastAt ?? 0))
-  const rooms = (state?.rooms ?? []).filter((room) => !filter.trim() || room.name.includes(filter.trim()))
+  const botOf = (botId: string): BotInfo | undefined => allBots.find((bot) => bot.id === botId)
   const routines = state?.routines ?? []
 
-  const rowPreview = (bot: BotInfo): string => {
-    if (bot.status === 'working') return `工作中${bot.currentJob ? ` · ${bot.currentJob}` : ''}`
-    if (bot.lastMessage) return `${bot.lastFrom === 'user' ? '我: ' : ''}${bot.lastMessage}`
-    return bot.title || '待命'
+  // 统一实体：一个会话一行（dm=成员 bot 档案；群=成员名列表）
+  const conversations = (state?.conversations ?? [])
+    .filter((conversation) => conversation.memberBotIds.every((botId) => botOf(botId) && !botOf(botId)!.hidden))
+    .filter((conversation) => {
+      if (!filter.trim()) return true
+      const label = conversation.memberBotIds.length > 1
+        ? (conversation.name || conversation.memberBotIds.map((botId) => botOf(botId)?.name ?? botId).join('、'))
+        : (botOf(conversation.memberBotIds[0])?.name ?? '')
+      return label.includes(filter.trim())
+    })
+    .sort((a, b) => {
+      const pinnedOf = (conversation: ConversationInfo) => (conversation.memberBotIds.length === 1 ? Number(botOf(conversation.memberBotIds[0])?.pinned ?? false) : 0)
+      return pinnedOf(b) - pinnedOf(a) || (b.lastAt ?? 0) - (a.lastAt ?? 0)
+    })
+
+  const rowTitle = (conversation: ConversationInfo): string => conversation.memberBotIds.length > 1
+    ? (conversation.name || conversation.memberBotIds.map((botId) => botOf(botId)?.name ?? botId).join('、'))
+    : (botOf(conversation.memberBotIds[0])?.name ?? conversation.id)
+
+  const rowPreview = (conversation: ConversationInfo): string => {
+    if (conversation.memberBotIds.length === 1) {
+      const bot = botOf(conversation.memberBotIds[0])
+      if (bot?.status === 'working') return `工作中${bot.currentJob ? ` · ${bot.currentJob}` : ''}`
+      if (conversation.lastMessage) return `${conversation.lastFrom === 'user' ? '我: ' : ''}${conversation.lastMessage}`
+      return bot?.title || '待命'
+    }
+    if (conversation.lastMessage) return `${conversation.lastFrom === 'user' ? '我: ' : ''}${conversation.lastMessage}`
+    return `${conversation.memberBotIds.length} 位成员`
   }
 
   return (
@@ -637,35 +663,28 @@ export function GrokbotSidebarCrew(): ReactNode {
           )
           : null}
         {grouping ? <RoomForm bots={allBots.filter((bot) => !bot.hidden)} onCancel={() => setGrouping(false)} onSaved={(roomId) => { setGrouping(false); openRoom(roomId) }} /> : null}
-        {rooms.length > 0 ? <div className="grokbot-sidebar__section">群聊</div> : null}
-        {rooms.map((room) => (
-          <button key={room.id} type="button" className={`grokbot-chatrow${target?.kind === 'room' && target.id === room.id ? ' active' : ''}`} onClick={() => openRoom(room.id)}>
-            <span className="grokbot-avatar"><span className="grokbot-avatar__circle">👥</span></span>
-            <span className="grokbot-chatrow__main">
-              <span className="grokbot-chatrow__line1">
-                <span className="grokbot-chatrow__name">{room.name}</span>
+        <div className="grokbot-sidebar__section">会话</div>
+        {conversations.length === 0 ? <div style={{ fontSize: 12, opacity: .5, padding: '4px 10px' }}>暂无会话，点 ＋ 开始</div> : null}
+        {conversations.map((conversation) => {
+          const isGroup = conversation.memberBotIds.length > 1
+          const bot = isGroup ? undefined : botOf(conversation.memberBotIds[0])
+          const working = !isGroup && bot?.status === 'working'
+          return (
+            <button key={conversation.id} type="button" className={`grokbot-chatrow${target?.id === conversation.id ? ' active' : ''}`} onClick={() => openConversation(conversation.id)}>
+              <span className="grokbot-avatar">
+                <span className="grokbot-avatar__circle">{isGroup ? '👥' : (bot?.avatar ?? '🤖')}</span>
+                {!isGroup ? <span className={`grokbot-avatar__dot${working ? ' working' : ''}`} /> : null}
               </span>
-              <span className="grokbot-chatrow__preview">{room.memberBotIds.length} 位成员</span>
-            </span>
-          </button>
-        ))}
-        <div className="grokbot-sidebar__section">Bot</div>
-        {visible.length === 0 ? <div style={{ fontSize: 12, opacity: .5, padding: '4px 10px' }}>没有匹配的 Bot</div> : null}
-        {visible.map((bot) => (
-          <button key={bot.id} type="button" className={`grokbot-chatrow${target?.kind === 'bot' && target.id === bot.id ? ' active' : ''}`} onClick={() => openBot(bot.id)}>
-            <span className="grokbot-avatar">
-              <span className="grokbot-avatar__circle">{bot.avatar}</span>
-              <span className={`grokbot-avatar__dot${bot.status === 'working' ? ' working' : ''}`} />
-            </span>
-            <span className="grokbot-chatrow__main">
-              <span className="grokbot-chatrow__line1">
-                <span className="grokbot-chatrow__name">{bot.name}</span>
-                <span className="grokbot-chatrow__time">{timeLabel(bot.lastAt ?? bot.lastActivity)}</span>
+              <span className="grokbot-chatrow__main">
+                <span className="grokbot-chatrow__line1">
+                  <span className="grokbot-chatrow__name">{rowTitle(conversation)}</span>
+                  <span className="grokbot-chatrow__time">{timeLabel(conversation.lastAt)}</span>
+                </span>
+                <span className="grokbot-chatrow__preview">{rowPreview(conversation)}</span>
               </span>
-              <span className="grokbot-chatrow__preview">{rowPreview(bot)}</span>
-            </span>
-          </button>
-        ))}
+            </button>
+          )
+        })}
       </div>
       <div className="grokbot-sidebar__foot">
         <span className="grokbot-sidebar__user"><span className="uavatar">B</span>bo zhao</span>
@@ -796,6 +815,60 @@ function splitChips(text: string): { body: string; chips: string[] } {
   }
 }
 
+function MembersPanel(props: { conversation: { id: string; name: string; memberBotIds: string[] }; bots: BotInfo[]; onChanged: () => void }): ReactNode {
+  const [adding, setAdding] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const { conversation, bots } = props
+  const members = conversation.memberBotIds
+    .map((botId) => bots.find((bot) => bot.id === botId))
+    .filter(Boolean) as BotInfo[]
+  const candidates = bots.filter((bot) => !bot.hidden && !conversation.memberBotIds.includes(bot.id))
+
+  const mutate = useCallback(async (botId: string, remove: boolean): Promise<void> => {
+    if (busy) return
+    setBusy(true)
+    try {
+      await api(`/conversations/${encodeURIComponent(conversation.id)}/members`, {
+        method: 'POST',
+        body: JSON.stringify(remove ? { botId, remove: true } : { botId }),
+      })
+      props.onChanged()
+    } catch { /* 错误随轮询消失 */ } finally {
+      setBusy(false)
+    }
+  }, [busy, conversation.id, props])
+
+  return (
+    <div>
+      <div className="grokbot-details__title">成员</div>
+      {members.map((member) => (
+        <div key={member.id} className="grokbot-member" style={{ justifyContent: 'space-between' }}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
+            <span className="mavatar">{member.avatar}</span>{member.name}
+          </span>
+          {members.length > 1 ? (
+            <button type="button" className="grokbot-iconbtn" title="移出会话" disabled={busy} onClick={() => void mutate(member.id, true)}>✕</button>
+          ) : null}
+        </div>
+      ))}
+      {adding
+        ? (
+          <div className="grokbot-form" style={{ margin: '6px 0 0' }}>
+            {candidates.length === 0 ? <div style={{ fontSize: 12, opacity: .55 }}>没有可添加的 Bot（先创建更多专家）</div> : null}
+            {candidates.map((candidate) => (
+              <button key={candidate.id} type="button" className="grokbot-newmenu__item" disabled={busy} onClick={() => { setAdding(false); void mutate(candidate.id, false) }}>
+                <span className="grokbot-newmenu__icon">{candidate.avatar}</span>{candidate.name}
+              </button>
+            ))}
+            <button type="button" className="grokbot-form__cancel" onClick={() => setAdding(false)}>取消</button>
+          </div>
+        )
+        : <button type="button" className="grokbot-details__new" disabled={busy} onClick={() => setAdding(true)}>＋ 添加成员（即成群聊）</button>}
+      <div className="grokbot-details__hint">添加成员后本会话即成为群聊，历史自动保留。</div>
+    </div>
+  )
+}
+
 function ApprovalCard(props: { approval: ApprovalInfo }): ReactNode {
   const [busy, setBusy] = useState(false)
   const decide = useCallback(async (outcome: 'allowed-once' | 'rejected') => {
@@ -821,6 +894,7 @@ function ApprovalCard(props: { approval: ApprovalInfo }): ReactNode {
 
 function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): ReactNode {
   const { bot, state } = props
+  const propsBots = state?.bots ?? []
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
   const [editing, setEditing] = useState(false)
@@ -834,7 +908,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
   useEffect(() => {
     if (loadedHistoryFor.has(bot.id) || histories.get(bot.id)?.length) return
     loadedHistoryFor.add(bot.id)
-    void api(`/bots/${encodeURIComponent(bot.id)}/history`).then((outcome) => {
+    void api(`/conversations/${encodeURIComponent(bot.id)}`).then((outcome) => {
       const list = (outcome?.messages ?? []) as { ts: number; role: string; text: string }[]
       if (list.length === 0 || histories.get(bot.id)?.length) return
       histories.set(bot.id, list.map((message, index) => message.role === 'user'
@@ -859,7 +933,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
     appendLocal(bot.id, { id: `${Date.now()}-u`, role: 'user', text, at: Date.now() })
     setSending(true)
     try {
-      const outcome = await api(`/bots/${encodeURIComponent(bot.id)}/chat`, {
+      const outcome = await api(`/conversations/${encodeURIComponent(bot.id)}/chat`, {
         method: 'POST',
         body: JSON.stringify({ text }),
       })
@@ -948,11 +1022,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
         {detailsOpen
           ? (
             <div className="grokbot-details">
-              <div>
-                <div className="grokbot-details__title">成员</div>
-                <div className="grokbot-member"><span className="mavatar">{bot.avatar}</span>{bot.name}</div>
-                <div className="grokbot-details__hint">创建更多 Bot 后即可添加到这里，组成群聊协作。</div>
-              </div>
+              <MembersPanel conversation={{ id: bot.id, name: bot.name, memberBotIds: [bot.id] }} bots={propsBots} onChanged={() => refreshState?.()} />
               <div>
                 <div className="grokbot-details__title">例行任务</div>
                 {routines.map((routine) => (
@@ -995,8 +1065,10 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
 
 /* ---------------- 群聊视图 ---------------- */
 
-function GroupChatView(props: { room: RoomInfo; bots: BotInfo[] }): ReactNode {
-  const { room, bots } = props
+function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] }): ReactNode {
+  const room = { id: props.conversation.id, name: props.conversation.name || props.conversation.memberBotIds.map((botId) => props.bots.find((bot) => bot.id === botId)?.name ?? botId).join('、'), memberBotIds: props.conversation.memberBotIds }
+  const bots = props.bots
+  const [detailsOpen, setDetailsOpen] = useState(false)
   const [messages, setMessages] = useState<RoomMessage[]>([])
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
@@ -1005,7 +1077,7 @@ function GroupChatView(props: { room: RoomInfo; bots: BotInfo[] }): ReactNode {
   useEffect(() => {
     let alive = true
     const tick = (): void => {
-      api(`/rooms/${encodeURIComponent(room.id)}`).then((outcome) => {
+      api(`/conversations/${encodeURIComponent(room.id)}`).then((outcome) => {
         if (alive) setMessages((outcome?.messages ?? []) as RoomMessage[])
       }).catch(() => undefined)
     }
@@ -1026,7 +1098,7 @@ function GroupChatView(props: { room: RoomInfo; bots: BotInfo[] }): ReactNode {
     setDraft('')
     setSending(true)
     try {
-      const outcome = await api(`/rooms/${encodeURIComponent(room.id)}/chat`, {
+      const outcome = await api(`/conversations/${encodeURIComponent(room.id)}/chat`, {
         method: 'POST',
         body: JSON.stringify({ text }),
       })
@@ -1039,10 +1111,10 @@ function GroupChatView(props: { room: RoomInfo; bots: BotInfo[] }): ReactNode {
   }, [draft, sending, room.id])
 
   return (
-    <div className="grokbot-chat" onKeyDown={(event) => { if (event.key === 'Escape') closeTarget() }}>
+    <div className="grokbot-chat" onKeyDown={(event) => { if (event.key === 'Escape' && !detailsOpen) closeTarget() }}>
       <div className="grokbot-chat__head">
         <span className="grokbot-chat__avatar">👥</span>
-        <span className="grokbot-chat__title">
+        <span className="grokbot-chat__title" onClick={() => setDetailsOpen((v) => !v)}>
           <span className="grokbot-chat__name">{room.name}</span>
           <span className="grokbot-chat__meta">
             {room.memberBotIds.map((botId) => `${botOf(botId)?.avatar ?? '🤖'}${botOf(botId)?.name ?? botId}`).join('　')}
@@ -1050,6 +1122,7 @@ function GroupChatView(props: { room: RoomInfo; bots: BotInfo[] }): ReactNode {
         </span>
         <button type="button" className="grokbot-chat__close" onClick={closeTarget} aria-label="关闭">✕</button>
       </div>
+      <div className="grokbot-body">
       <div className="grokbot-log" ref={logRef}>
         {messages.length === 0
           ? <div className="grokbot-empty">群聊成员会自主决定谁应答；@成员名 可定向，bot 之间也会互相转交。</div>
@@ -1099,6 +1172,14 @@ function GroupChatView(props: { room: RoomInfo; bots: BotInfo[] }): ReactNode {
         />
         <button type="button" className="side" title="语音输入（待实现）" disabled>🎤</button>
       </div>
+      </div>
+      {detailsOpen
+        ? (
+          <div className="grokbot-details">
+            <MembersPanel conversation={{ id: room.id, name: room.name, memberBotIds: room.memberBotIds }} bots={bots} onChanged={() => refreshState?.()} />
+          </div>
+        )
+        : null}
     </div>
   )
 }
@@ -1122,19 +1203,22 @@ export function GrokbotMainView(): ReactNode {
     if (restoredRef.current || openTarget || !state) return
     const saved = state.lastTarget
     if (!saved) { restoredRef.current = true; return }
-    if (saved.kind === 'bot' && state.bots.some((bot) => bot.id === saved.id)) {
+    const savedId = saved.id
+    const known = state.conversations?.some((conversation) => conversation.id === savedId)
+      || (saved.kind === 'bot' && state.bots.some((bot) => bot.id === savedId))
+    if (known) {
       restoredRef.current = true
-      openBot(saved.id)
-    } else if (saved.kind === 'room' && state.rooms.some((room) => room.id === saved.id)) {
-      restoredRef.current = true
-      openRoom(saved.id)
+      openConversation(savedId)
     }
   }, [state])
-  const bot = target?.kind === 'bot' ? (state?.bots.find((entry) => entry.id === target.id) ?? null) : null
-  const room = target?.kind === 'room' ? (state?.rooms.find((entry) => entry.id === target.id) ?? null) : null
+  const conversation = state?.conversations?.find((entry) => entry.id === target?.id) ?? null
+  const isGroup = Boolean(conversation && conversation.memberBotIds.length > 1)
+  const bot = !isGroup && conversation
+    ? (state?.bots.find((entry) => entry.id === conversation.memberBotIds[0]) ?? null)
+    : null
   // activeKey 只依赖 target：不因 /state 轮询未到位而卸载覆盖层（闪现 DSH 首页的根因）
-  const activeKey = target ? `${target.kind}:${target.id}` : (creatingUi ? 'creating' : null)
-  const entering = Boolean(target) && !bot && !room
+  const activeKey = target ? `conversation:${target.id}` : (creatingUi ? 'creating' : null)
+  const entering = Boolean(target) && !conversation
   const [box, setBox] = useState<{ left: number; top: number; width: number; height: number } | null>(null)
   const hiddenRef = useRef<HTMLElement[]>([])
 
@@ -1180,8 +1264,8 @@ export function GrokbotMainView(): ReactNode {
     >
       {bot
         ? <BotChatView bot={bot} state={state} />
-        : room
-          ? <GroupChatView room={room} bots={state?.bots ?? []} />
+        : conversation && isGroup
+          ? <GroupChatView conversation={conversation} bots={state?.bots ?? []} />
           : (
             <div className="grokbot-creating">
               <div className="grokbot-creating__spinner" />

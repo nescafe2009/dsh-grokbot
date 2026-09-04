@@ -2,7 +2,7 @@ import { watch } from 'node:fs'
 import { mkdir, readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { loadOrCreateCrew, routeJob, botWorkspace, serializeCrew, atomicWrite, parseCrew, createBot, updateBot, removeBot, duplicateBot, createRoom, updateRoom, removeRoom, upsertRoutine, removeRoutine } from './crew.mjs'
+import { loadOrCreateCrew, routeJob, botWorkspace, serializeCrew, atomicWrite, parseCrew, createBot, updateBot, removeBot, duplicateBot, createConversation, renameConversation, addConversationMember, removeConversationMember, removeConversation, upsertRoutine, removeRoutine } from './crew.mjs'
 import { ensureInbox, scanInbox, claimJob, completeJob, failJob, enqueueJob } from './inbox.mjs'
 import { BOT_TEMPLATES, templateById } from './templates.mjs'
 
@@ -129,6 +129,40 @@ export function apply(ctx, config = {}) {
   const routinesStatePath = join(stateDir, 'routines-state.json')
 
   const roomTranscriptPath = (roomId) => join(roomsDir, `${roomId}.transcript.jsonl`)
+
+  // 统一会话实体：1 成员=私聊（转录在 bots/<id>/dm-transcript.jsonl），2-6=群（rooms/<id>.transcript.jsonl）
+  function conversationOf(conversationId) {
+    return crewState.crew.conversations?.find((entry) => entry.id === conversationId) ?? null
+  }
+
+  function conversationTranscriptPath(conversation) {
+    return conversation.memberBotIds.length === 1
+      ? join(stateDir, 'bots', conversation.memberBotIds[0], 'dm-transcript.jsonl')
+      : roomTranscriptPath(conversation.id)
+  }
+
+  async function appendConversationMsg(conversation, entry) {
+    if (conversation.memberBotIds.length === 1) {
+      // 私聊：chatTurn 已负责 dm 转录；此函数在 dm 场景仅透传
+      return
+    }
+    await appendRoomMsg(conversation.id, entry)
+  }
+
+  async function readConversationMsgs(conversation, limit = 200) {
+    return conversation.memberBotIds.length === 1
+      ? readDm(conversation.memberBotIds[0], limit)
+      : readRoomMsgs(conversation.id, limit)
+  }
+
+  async function ensureDmConversation(bot) {
+    let conversation = crewState.crew.conversations?.find((entry) => entry.memberBotIds.length === 1 && entry.memberBotIds[0] === bot.id)
+    if (!conversation) {
+      conversation = createConversation(crewState.crew, { memberBotIds: [bot.id] })
+      await persistCrew()
+    }
+    return conversation
+  }
   const routineHistoryPath = (routineId) => join(roomsDir, `routine-${routineId}.history.jsonl`)
 
   async function appendRoomMsg(roomId, entry) {
@@ -213,7 +247,7 @@ export function apply(ctx, config = {}) {
   function personaPrompt(bot) {
     return [
       bot.persona || '你是常驻桌面 agent 团队的一员，用简体中文直接处理用户投递的任务。',
-      `团队共享电脑的工作目录：${botWorkspace(stateDir, bot)}（全队共享，文件读写在这里进行）。`,
+      `团队共享电脑：${botWorkspace(stateDir, bot)}（全队共享）；你的个人目录：${join(botWorkspace(stateDir, bot), 'agents', bot.id)}（自己的笔记与工作产物放这里）。`,
       '只汇报真实完成的操作，不要把工具调用伪装成普通文本。',
       '消息支持 Markdown（标题/列表/代码块/链接）。想让用户快捷选择时，在回复最后一行单独写 [[选项1|选项2|选项3]]，会被渲染成可点击按钮。',
     ].join('\n')
@@ -289,6 +323,8 @@ export function apply(ctx, config = {}) {
     for (const bot of crewState.crew.bots) {
       botState(bot.id)
       await seedBotMemory(bot)
+      await mkdir(join(botWorkspace(stateDir, bot), 'agents', bot.id), { recursive: true }).catch(() => undefined)
+      await ensureDmConversation(bot).catch(() => undefined)
     }
     ctx.logger?.info?.(`grokbot ready: ${crewState.crew.bots.length} bot(s), inbox=${inboxRoot}`)
   }
@@ -490,11 +526,17 @@ export function apply(ctx, config = {}) {
 
   const HANDOFF_LINE_RE = /^@([\w\u4e00-\u9fa5]+)[：:\s]+(.+)$/
 
-  async function roomTurn(room, senderText, { mentionTarget } = {}) {
-    const members = room.memberBotIds
+  async function conversationTurn(conversation, senderText, { mentionTarget } = {}) {
+    if (conversation.memberBotIds.length === 1) {
+      const bot = crewState.crew.bots.find((entry) => entry.id === conversation.memberBotIds[0])
+      if (!bot) throw new Error('会话成员不存在')
+      const outcome = await chatTurn(bot, senderText)
+      return { responder: bot, reply: outcome.text?.trim() || `[${bot.name} 未能给出文本回复]`, handoffTo: null, outcome }
+    }
+    const members = conversation.memberBotIds
       .map((botId) => crewState.crew.bots.find((bot) => bot.id === botId))
       .filter(Boolean)
-    const responder = mentionTarget ?? pickResponder(room, senderText)
+    const responder = mentionTarget ?? pickResponder(conversation, senderText)
     if (!responder) throw new Error('群聊无可应答成员')
     const preamble = [
       `【群聊 ${room.name}】成员：${members.map((bot) => `${bot.avatar}${bot.name}`).join('、')}。`,
@@ -771,7 +813,7 @@ export function apply(ctx, config = {}) {
           }
           respond(res, 200, {
             bots,
-            rooms: crewState.crew.rooms ?? [],
+            conversations: crewState.crew.conversations ?? [],
             routines: crewState.crew.routines ?? [],
             approvals: [...pendingApprovals.values()].map(({ resolve, ...rest }) => rest),
             running: [...runningJobs.entries()].map(([jobId, entry]) => ({ jobId, ...entry })),
@@ -783,7 +825,7 @@ export function apply(ctx, config = {}) {
         }
         if (method === 'POST' && suffix === '/ui-state') {
           const body = await readJsonBody(req)
-          if (body && (body.kind === 'bot' || body.kind === 'room') && typeof body.id === 'string') {
+          if (body && (body.kind === 'bot' || body.kind === 'room' || body.kind === 'conversation') && typeof body.id === 'string') {
             uiState.lastTarget = { kind: body.kind, id: body.id }
           } else if (body === null || body?.clear === true) {
             uiState.lastTarget = null
@@ -856,6 +898,8 @@ export function apply(ctx, config = {}) {
           }
           await persistCrew()
           await seedBotMemory(bot).catch(() => undefined)
+          await mkdir(join(botWorkspace(stateDir, bot), 'agents', bot.id), { recursive: true }).catch(() => undefined)
+          await ensureDmConversation(bot).catch(() => undefined)
           if (greeting) {
             await appendDm(bot.id, { role: 'bot', text: greeting }).catch(() => undefined)
           }
@@ -930,59 +974,90 @@ export function apply(ctx, config = {}) {
         if (method === 'GET' && historyMatch) {
           respond(res, 200, { messages: await readDm(decodeURIComponent(historyMatch[1])) }); return
         }
-        if (method === 'GET' && suffix === '/rooms') {
-          respond(res, 200, { rooms: crewState.crew.rooms ?? [] }); return
+        if (method === 'GET' && suffix === '/conversations') {
+          const conversations = []
+          for (const conversation of crewState.crew.conversations ?? []) {
+            const msgs = await readConversationMsgs(conversation, 1)
+            const last = msgs[msgs.length - 1]
+            conversations.push({
+              ...conversation,
+              isGroup: conversation.memberBotIds.length > 1,
+              lastMessage: last ? String(last.text || '').slice(0, 80) : '',
+              lastAt: last?.ts ?? null,
+              lastFrom: last?.role === 'user' ? 'user' : 'bot',
+            })
+          }
+          respond(res, 200, { conversations }); return
         }
-        if (method === 'POST' && suffix === '/rooms') {
+        if (method === 'POST' && suffix === '/conversations') {
           const body = await readJsonBody(req)
-          let room
+          let conversation
           try {
-            room = createRoom(crewState.crew, body)
+            conversation = createConversation(crewState.crew, body)
           } catch (error) {
             throw new HttpError(400, safeError(error))
           }
           await persistCrew()
-          await appendRoomMsg(room.id, { role: 'system', text: `群聊「${room.name}」创建` })
-          respond(res, 201, { room }); return
+          respond(res, 201, { conversation }); return
         }
-        const roomMatch = /^\/rooms\/([^/]+)(?:\/(chat|messages))?$/.exec(suffix)
-        if (roomMatch) {
-          const roomId = decodeURIComponent(roomMatch[1])
-          const room = crewState.crew.rooms?.find((entry) => entry.id === roomId)
-          if (!room) throw new HttpError(404, `room 不存在：${roomId}`)
-          if (method === 'GET' && !roomMatch[2]) {
-            respond(res, 200, { room, messages: await readRoomMsgs(roomId) }); return
+        const convMatch = /^\/conversations\/([^/]+)(?:\/(chat|members))?$/.exec(suffix)
+        if (convMatch) {
+          const conversationId = decodeURIComponent(convMatch[1])
+          const conversation = conversationOf(conversationId)
+          if (!conversation) throw new HttpError(404, `conversation 不存在：${conversationId}`)
+          if (method === 'GET' && !convMatch[2]) {
+            respond(res, 200, { conversation, messages: await readConversationMsgs(conversation) }); return
           }
-          if (method === 'PATCH' && !roomMatch[2]) {
+          if (method === 'PATCH' && !convMatch[2]) {
             const body = await readJsonBody(req)
-            try {
-              updateRoom(crewState.crew, roomId, body)
-            } catch (error) {
-              throw new HttpError(400, safeError(error))
-            }
+            if (typeof body?.name === 'string') renameConversation(crewState.crew, conversationId, body.name)
             await persistCrew()
-            respond(res, 200, { room }); return
+            respond(res, 200, { conversation }); return
           }
-          if (method === 'DELETE' && !roomMatch[2]) {
+          if (method === 'DELETE' && !convMatch[2]) {
             try {
-              removeRoom(crewState.crew, roomId)
+              removeConversation(crewState.crew, conversationId)
             } catch (error) {
               throw new HttpError(400, safeError(error))
             }
             await persistCrew()
             respond(res, 200, { ok: true }); return
           }
-          if (method === 'POST' && roomMatch[2] === 'chat') {
+          if (method === 'POST' && convMatch[2] === 'members') {
+            const body = await readJsonBody(req)
+            const botId = String(body?.botId || '')
+            let conversation2
+            try {
+              if (body?.remove === true) conversation2 = removeConversationMember(crewState.crew, conversationId, botId)
+              else {
+                const wasDm = conversation.memberBotIds.length === 1
+                conversation2 = addConversationMember(crewState.crew, conversationId, botId)
+                await persistCrew()
+                // 私聊升级为群：把 dm 历史并入群转录，保证上下文连续
+                if (wasDm && conversation2.memberBotIds.length > 1) {
+                  const history = await readDm(botId === conversation2.memberBotIds[0] ? conversation2.memberBotIds[1] : conversation2.memberBotIds[0])
+                  for (const message of history) {
+                    await appendRoomMsg(conversation2.id, message)
+                  }
+                }
+              }
+            } catch (error) {
+              throw new HttpError(400, safeError(error))
+            }
+            await persistCrew()
+            respond(res, 200, { conversation: conversation2 }); return
+          }
+          if (method === 'POST' && convMatch[2] === 'chat') {
             const body = await readJsonBody(req)
             const text = String(body?.text || '').trim()
             if (!text) throw new HttpError(400, 'text 不能为空')
-            await appendRoomMsg(roomId, { role: 'user', text })
-            const result = await roomTurn(room, text)
+            await appendConversationMsg(conversation, { role: 'user', text })
+            const result = await conversationTurn(conversation, text)
             respond(res, 200, {
               responder: publicBot(result.responder),
               reply: result.reply,
               handoffTo: result.handoffTo,
-              messages: await readRoomMsgs(roomId),
+              messages: await readConversationMsgs(conversation),
             }); return
           }
         }
