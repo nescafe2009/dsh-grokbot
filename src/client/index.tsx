@@ -168,13 +168,34 @@ function notify(): void {
   for (const listener of listeners) listener()
 }
 
+function persistLastTarget(target: { kind: 'bot' | 'room'; id: string } | null): void {
+  try {
+    if (target) localStorage.setItem('grokbot.lastTarget', JSON.stringify(target))
+    else localStorage.removeItem('grokbot.lastTarget')
+  } catch { /* 无 localStorage 则不记忆 */ }
+}
+
+function readLastTarget(): { kind: 'bot' | 'room'; id: string } | null {
+  try {
+    const raw = localStorage.getItem('grokbot.lastTarget')
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    if (parsed && (parsed.kind === 'bot' || parsed.kind === 'room') && typeof parsed.id === 'string') return parsed
+    return null
+  } catch {
+    return null
+  }
+}
+
 function openBot(botId: string): void {
   openTarget = { kind: 'bot', id: botId }
+  persistLastTarget(openTarget)
   notify()
 }
 
 function openRoom(roomId: string): void {
   openTarget = { kind: 'room', id: roomId }
+  persistLastTarget(openTarget)
   notify()
 }
 
@@ -870,6 +891,17 @@ function GroupChatView(props: { room: RoomInfo; bots: BotInfo[] }): ReactNode {
 export function GrokbotMainView(): ReactNode {
   const target = useOpenTarget()
   const state = useGrokbotState()
+  const restoredRef = useRef(false)
+
+  // 启动恢复上次会话（Grok Bot 语义）：校验目标仍存在，已删除则忽略
+  useEffect(() => {
+    if (restoredRef.current || openTarget || !state) return
+    restoredRef.current = true
+    const saved = readLastTarget()
+    if (!saved) return
+    if (saved.kind === 'bot' && state.bots.some((bot) => bot.id === saved.id)) openBot(saved.id)
+    else if (saved.kind === 'room' && state.rooms.some((room) => room.id === saved.id)) openRoom(saved.id)
+  }, [state])
   const bot = target?.kind === 'bot' ? (state?.bots.find((entry) => entry.id === target.id) ?? null) : null
   const room = target?.kind === 'room' ? (state?.rooms.find((entry) => entry.id === target.id) ?? null) : null
   const activeKey = bot ? `bot:${bot.id}` : room ? `room:${room.id}` : null
