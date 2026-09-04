@@ -235,6 +235,10 @@ export function removeBot(crew, botId) {
     conversation.memberBotIds = conversation.memberBotIds.filter((memberId) => memberId !== botId)
   }
   crew.conversations = (crew.conversations ?? []).filter((conversation) => conversation.memberBotIds.length > 0)
+  // 连带清理该 bot 的例行任务，避免悬空引用导致下次启动解析失败
+  if (Array.isArray(crew.routines)) {
+    crew.routines = crew.routines.filter((routine) => routine.botId !== botId)
+  }
   return crew.bots
 }
 

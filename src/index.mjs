@@ -506,22 +506,27 @@ export function apply(ctx, config = {}) {
     return outcome
   }
 
-  function memberBot(room, botId) {
-    return crewState.crew.bots.find((bot) => bot.id === botId && room.memberBotIds.includes(bot.id))
+  function eligibleBots(conversation) {
+    // 幕僚长拥有全域参与权：任何群聊中可被 @ 或交接，即使不是成员
+    const members = conversation.memberBotIds
+      .map((botId) => crewState.crew.bots.find((bot) => bot.id === botId))
+      .filter(Boolean)
+    const chief = crewState.crew.bots.find((bot) => bot.id === 'chief')
+    if (chief && !conversation.memberBotIds.includes('chief')) return [...members, chief]
+    return members
   }
 
-  function pickResponder(room, text) {
+  function pickResponder(conversation, text) {
     // @提及定向（Grok Bot 语义）；未提及时由默认收件人（若在群内）应答，否则首位成员
     const mention = /@([\w\u4e00-\u9fa5]+)/.exec(String(text || ''))
     if (mention) {
-      const hit = room.memberBotIds
-        .map((botId) => crewState.crew.bots.find((bot) => bot.id === botId))
+      const hit = eligibleBots(conversation)
         .find((bot) => bot && (bot.name.includes(mention[1]) || mention[1] === bot.id || bot.id.includes(mention[1])))
       if (hit) return hit
     }
     const fallbackId = crewState.crew.routing.default
-    const inRoom = room.memberBotIds.includes(fallbackId)
-    return crewState.crew.bots.find((bot) => bot.id === (inRoom ? fallbackId : room.memberBotIds[0]))
+    const inRoom = conversation.memberBotIds.includes(fallbackId)
+    return crewState.crew.bots.find((bot) => bot.id === (inRoom ? fallbackId : conversation.memberBotIds[0]))
   }
 
   const HANDOFF_LINE_RE = /^@([\w\u4e00-\u9fa5]+)[：:\s]+(.+)$/
@@ -539,7 +544,7 @@ export function apply(ctx, config = {}) {
     const responder = mentionTarget ?? pickResponder(conversation, senderText)
     if (!responder) throw new Error('群聊无可应答成员')
     const preamble = [
-      `【群聊 ${room.name}】成员：${members.map((bot) => `${bot.avatar}${bot.name}`).join('、')}。`,
+      `【群聊 ${conversation.name}】成员：${members.map((bot) => `${bot.avatar}${bot.name}`).join('、')}。`,
       '你现在在群聊中应答用户消息。若你认为某条工作应由其他成员处理，在回复的最后一行单独写「@成员名 交代内容」，系统会异步转交；不要除此行外提交接。',
     ].join('\n')
     const outcome = await chatTurn(responder, senderText, { preamble })
@@ -549,24 +554,24 @@ export function apply(ctx, config = {}) {
     const lastLine = lines[lines.length - 1]?.trim() ?? ''
     const handoff = HANDOFF_LINE_RE.exec(lastLine)
     if (handoff) {
-      const target = members.find((bot) => bot.name.includes(handoff[1]) || bot.id.includes(handoff[1]))
+      const target = eligibleBots(conversation).find((bot) => bot.name.includes(handoff[1]) || bot.id.includes(handoff[1]))
       if (target && target.id !== responder.id) {
         lines.pop()
         const cleanReply = lines.join('\n').trim() || '（已转交）'
-        await appendRoomMsg(room.id, { role: 'bot', botId: responder.id, text: cleanReply })
-        await appendRoomMsg(room.id, { role: 'handoff', fromBotId: responder.id, toBotId: target.id, text: handoff[2] })
+        await appendRoomMsg(conversation.id, { role: 'bot', botId: responder.id, text: cleanReply })
+        await appendRoomMsg(conversation.id, { role: 'handoff', fromBotId: responder.id, toBotId: target.id, text: handoff[2] })
         void (async () => {
           try {
-            const relay = await chatTurn(target, `【群聊转交，来自 ${responder.name}】${handoff[2]}`, { preamble: `【群聊 ${room.name}】你收到队友 ${responder.name} 的转交任务。` })
-            await appendRoomMsg(room.id, { role: 'bot', botId: target.id, text: relay.text?.trim() || '[转交处理失败]' })
+            const relay = await chatTurn(target, `【群聊转交，来自 ${responder.name}】${handoff[2]}`, { preamble: `【群聊 ${conversation.name}】你收到队友 ${responder.name} 的转交任务。` })
+            await appendRoomMsg(conversation.id, { role: 'bot', botId: target.id, text: relay.text?.trim() || '[转交处理失败]' })
           } catch (error) {
-            await appendRoomMsg(room.id, { role: 'system', text: `转交失败：${safeError(error)}` })
+            await appendRoomMsg(conversation.id, { role: 'system', text: `转交失败：${safeError(error)}` })
           }
         })()
         return { responder, reply: cleanReply, handoffTo: target.id }
       }
     }
-    await appendRoomMsg(room.id, { role: 'bot', botId: responder.id, text: reply })
+    await appendRoomMsg(conversation.id, { role: 'bot', botId: responder.id, text: reply })
     return { responder, reply, handoffTo: null }
   }
 
@@ -862,6 +867,13 @@ export function apply(ctx, config = {}) {
         if (method === 'POST' && suffix === '/bots') {
           const body = await readJsonBody(req)
           const template = body?.templateId ? templateById(String(body.templateId)) : null
+          // 幕僚长全局唯一：重复召唤返回既有实例（幂等）
+          if (template && template.id === 'chief') {
+            const existing = crewState.crew.bots.find((bot) => bot.id === 'chief')
+            if (existing) {
+              respond(res, 200, { bot: publicBot(existing), existing: true }); return
+            }
+          }
           let greeting = ''
           if (template && !template.blank) {
             body.name = String(body?.name || '').trim() || template.name
@@ -991,6 +1003,14 @@ export function apply(ctx, config = {}) {
         }
         if (method === 'POST' && suffix === '/conversations') {
           const body = await readJsonBody(req)
+          // 单成员=私聊：已有 dm 则直接复用，不重复建
+          const wanted = Array.isArray(body?.memberBotIds) ? body.memberBotIds.map(String) : []
+          if (wanted.length === 1) {
+            const existingDm = crewState.crew.conversations?.find((entry) => entry.memberBotIds.length === 1 && entry.memberBotIds[0] === wanted[0])
+            if (existingDm) {
+              respond(res, 200, { conversation: existingDm, existing: true }); return
+            }
+          }
           let conversation
           try {
             conversation = createConversation(crewState.crew, body)
