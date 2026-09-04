@@ -168,6 +168,7 @@ const GROKBOT_CSS = `
 .grokbot-chips__item:hover { background:rgba(59,130,246,.18); }
 .grokbot-chips__item:disabled { opacity:.45; cursor:default; }
 .grokbot-msg .grokbot-msg__time { display:block; font-size:10px; opacity:.45; margin-top:4px; text-align:inherit; }
+.grokbot-blank { flex:1; background:var(--background,#fff); }
 .grokbot-creating { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; font-size:13.5px; opacity:.75; }
 .grokbot-creating__spinner { width:26px; height:26px; border-radius:50%; border:3px solid rgba(59,130,246,.25); border-top-color:#3b82f6; animation:grokbot-spin .8s linear infinite; }
 @keyframes grokbot-spin { to { transform:rotate(360deg) } }
@@ -1189,6 +1190,7 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
 export function GrokbotMainView(): ReactNode {
   const target = useOpenTarget()
   const state = useGrokbotState()
+  const nativeVisible = useNativeSidebarVisible()
   const [, forceCreating] = useState(0)
   const restoredRef = useRef(false)
 
@@ -1216,8 +1218,11 @@ export function GrokbotMainView(): ReactNode {
   const bot = !isGroup && conversation
     ? (state?.bots.find((entry) => entry.id === conversation.memberBotIds[0]) ?? null)
     : null
-  // activeKey 只依赖 target：不因 /state 轮询未到位而卸载覆盖层（闪现 DSH 首页的根因）
-  const activeKey = target ? `conversation:${target.id}` : (creatingUi ? 'creating' : null)
+  // 常驻接管：无会话时渲染自家空白页，DSH 默认首页（探索未知之境）任何情况下不再出现；
+  // ⇆ 切回原生模式时释放接管。activeKey 只依赖 target，不因轮询未到位而卸载。
+  const activeKey = nativeVisible
+    ? null
+    : (target ? `conversation:${target.id}` : (creatingUi ? 'creating' : 'home'))
   const entering = Boolean(target) && !conversation
   const [box, setBox] = useState<{ left: number; top: number; width: number; height: number } | null>(null)
   const hiddenRef = useRef<HTMLElement[]>([])
@@ -1262,16 +1267,19 @@ export function GrokbotMainView(): ReactNode {
       className="grokbot-chat grokbot-chat--main"
       style={{ position: 'fixed', left: box.left, top: box.top, width: box.width, height: box.height, zIndex: 900 }}
     >
-      {bot
-        ? <BotChatView bot={bot} state={state} />
-        : conversation && isGroup
-          ? <GroupChatView conversation={conversation} bots={state?.bots ?? []} />
-          : (
+      {(() => {
+        if (bot) return <BotChatView bot={bot} state={state} />
+        if (conversation && isGroup) return <GroupChatView conversation={conversation} bots={state?.bots ?? []} />
+        if (creatingUi || entering) {
+          return (
             <div className="grokbot-creating">
               <div className="grokbot-creating__spinner" />
               <div>{entering ? '正在进入会话…' : '正在召唤专家…'}</div>
             </div>
-          )}
+          )
+        }
+        return <div className="grokbot-blank" />
+      })()}
     </div>
   )
 }
