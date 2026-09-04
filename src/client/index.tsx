@@ -515,7 +515,6 @@ export function GrokbotSidebarCrew(): ReactNode {
       <div className="grokbot-sidebar__search">
         <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="搜索" aria-label="搜索" />
       </div>
-      <button type="button" className="grokbot-newchat" onClick={() => setMenuOpen(true)}>新建聊天</button>
       <div className="grokbot-sidebar__list">
         {menuOpen
           ? (
