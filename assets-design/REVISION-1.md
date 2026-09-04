@@ -1,5 +1,7 @@
 # REVISION 1 · 返工要点（基于应用级保真预览）
 
+> **完成状态：PASS。** 18 个头像已按批准参考图重新进行高保真彩色矢量描摹，并完成 128px 与原生 36px 全量视觉复核。最终总览见 `references/final-svg-contact-sheet.png` 和 `references/final-svg-contact-sheet-36px.png`。
+
 打开 `app-preview.html`（本地直接双击或起静态服务），这是素材在**真实应用尺寸**下的效果——
 侧栏行 36px、会话头 38px、向导卡 48px、状态条 40px。上一轮你的渲染图很好，
 但以下问题在真实小尺寸下暴露出来了。本轮目标：**让 36px 下的可爱度达到你大图的水平**。

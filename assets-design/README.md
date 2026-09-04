@@ -1,5 +1,7 @@
 # DSH Jelly Agents · H1-EVO
 
+> **Current review status:** all 18 files in `avatars/` are final high-fidelity color traces of the approved `references/roles-01...06.png` artwork. All 18 have passed 128px and native 36px visual review.
+
 Pure SVG art package for ZCode integration. No runtime or source files are modified.
 
 ## Visual model
@@ -25,9 +27,10 @@ Face > role prop > state overlay > level overlay. At 36px, show at most one stat
 
 ## Files
 
-- `avatars/`: 18 fixed identities.
+- `references/`: approved high-fidelity role artwork, six source sheets, plus final 128px and native 36px SVG contact sheets.
+- `avatars/`: 18 final high-fidelity SVG identities, ready for integration.
 - `parts/`: deterministic custom-avatar parts and assembly contract (576 combinations).
 - `states/`: seven interaction overlays.
 - `rating/`: badges, stars, ring, crown, EXP endpoint and feedback icons.
 
-SVGs use no external fonts, images, emoji, scripts or dependencies.
+SVGs use no external fonts, images, emoji, scripts or dependencies. Final validation also checks XML parsing, unique IDs, `viewBox="0 0 64 64"` on every avatar, and absence of embedded raster/script/foreign-object content.
