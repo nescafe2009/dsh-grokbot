@@ -213,12 +213,14 @@ function openBot(botId: string): void {
   openTarget = { kind: 'bot', id: botId }
   persistLastTarget(openTarget)
   notify()
+  refreshState?.()
 }
 
 function openRoom(roomId: string): void {
   openTarget = { kind: 'room', id: roomId }
   persistLastTarget(openTarget)
   notify()
+  refreshState?.()
 }
 
 function closeTarget(): void {
@@ -268,6 +270,8 @@ function appendLocal(botId: string, message: ChatMessage): void {
   notify()
 }
 
+let refreshState: (() => void) | null = null
+
 async function api(path: string, init?: RequestInit): Promise<any> {
   const res = await fetch(`${API_ROOT}${path}`, {
     ...init,
@@ -286,9 +290,11 @@ function useGrokbotState(): GrokbotState | null {
       api('/state').then((next) => { if (alive) setState(next as GrokbotState) }).catch(() => undefined)
     }
     tick()
+    refreshState = tick
     const timer = setInterval(tick, POLL_MS)
     return () => {
       alive = false
+      refreshState = null
       clearInterval(timer)
     }
   }, [])
@@ -1126,7 +1132,9 @@ export function GrokbotMainView(): ReactNode {
   }, [state])
   const bot = target?.kind === 'bot' ? (state?.bots.find((entry) => entry.id === target.id) ?? null) : null
   const room = target?.kind === 'room' ? (state?.rooms.find((entry) => entry.id === target.id) ?? null) : null
-  const activeKey = bot ? `bot:${bot.id}` : room ? `room:${room.id}` : (creatingUi ? 'creating' : null)
+  // activeKey 只依赖 target：不因 /state 轮询未到位而卸载覆盖层（闪现 DSH 首页的根因）
+  const activeKey = target ? `${target.kind}:${target.id}` : (creatingUi ? 'creating' : null)
+  const entering = Boolean(target) && !bot && !room
   const [box, setBox] = useState<{ left: number; top: number; width: number; height: number } | null>(null)
   const hiddenRef = useRef<HTMLElement[]>([])
 
@@ -1177,7 +1185,7 @@ export function GrokbotMainView(): ReactNode {
           : (
             <div className="grokbot-creating">
               <div className="grokbot-creating__spinner" />
-              <div>正在召唤专家…</div>
+              <div>{entering ? '正在进入会话…' : '正在召唤专家…'}</div>
             </div>
           )}
     </div>
