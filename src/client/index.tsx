@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { renderAvatarSVG, renderBadge, renderStar, renderLevelRing, renderStateIcon, ROLE_DEFS } from './avatars'
+import { renderAvatarSVG, renderLevelRing, ROLE_DEFS } from './avatars'
 import type { ReactNode } from 'react'
 
 const API_ROOT = '/api/plugins/grokbot'
@@ -258,16 +258,9 @@ const GROKBOT_CSS = `
 .grokbot-wizard__hint { font-size:12.5px; color:var(--gk-text-3); }
 `
 
-function hueOf(key: string): number {
-  let hash = 0
-  for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) | 0
-  return Math.abs(hash) % 360
-}
 
-function botGradient(id: string): string {
-  const hue = hueOf(id)
-  return `linear-gradient(135deg, hsl(${hue},72%,64%), hsl(${(hue + 30) % 360},76%,50%))`
-}
+
+
 
 /** Grok 风头像：专家=名字首字白字；群/角色=单线条矢量图标；底=专属渐变 */
 function AvatarView(props: { seed: string; name?: string; glyph?: string; size: number; fontSize?: number; level?: number }): ReactNode {
@@ -387,8 +380,12 @@ function historyOf(botId: string): ChatMessage[] {
   return list
 }
 
+const MAX_HISTORY = 200
+
 function appendLocal(botId: string, message: ChatMessage): void {
-  historyOf(botId).push(message)
+  const list = historyOf(botId)
+  list.push(message)
+  if (list.length > MAX_HISTORY) list.splice(0, list.length - MAX_HISTORY)
   notify()
 }
 
@@ -1447,7 +1444,6 @@ export function GrokbotMainView(): ReactNode {
     : (target ? `conversation:${target.id}` : (creatingUi ? 'creating' : 'home'))
   const entering = Boolean(target) && !conversation
   const [box, setBox] = useState<{ left: number; top: number; width: number; height: number } | null>(null)
-  const hiddenRef = useRef<HTMLElement[]>([])
 
   useEffect(() => {
     if (!activeKey) return

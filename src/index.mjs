@@ -1,5 +1,5 @@
 import { watch } from 'node:fs'
-import { mkdir, readFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { loadOrCreateCrew, routeJob, botWorkspace, serializeCrew, atomicWrite, parseCrew, createBot, updateBot, removeBot, duplicateBot, createConversation, renameConversation, addConversationMember, removeConversationMember, removeConversation, upsertRoutine, removeRoutine } from './crew.mjs'
@@ -168,7 +168,6 @@ export function apply(ctx, config = {}) {
   async function appendRoomMsg(roomId, entry) {
     await mkdir(roomsDir, { recursive: true })
     const path = roomTranscriptPath(roomId)
-    const { appendFile } = await import('node:fs/promises')
     let text = ''
     try {
       text = await readFile(path, 'utf8')
@@ -189,7 +188,6 @@ export function apply(ctx, config = {}) {
   async function appendRoutineHistory(routineId, line) {
     await mkdir(roomsDir, { recursive: true })
     const path = routineHistoryPath(routineId)
-    const { appendFile } = await import('node:fs/promises')
     let text = ''
     try {
       text = await readFile(path, 'utf8')
@@ -423,8 +421,14 @@ export function apply(ctx, config = {}) {
     ctx.logger?.info?.(`grokbot ready: ${crewState.crew.bots.length} bot(s), inbox=${inboxRoot}`)
   }
 
+  let crewWriteLock = Promise.resolve()
   async function persistCrew() {
-    await atomicWrite(crewState.path, serializeCrew(crewState.crew))
+    // 串行化写盘：防止 routine 调度器 / API / inbox 扫描并发写 crew.json 丢失变更
+    const write = async () => {
+      await atomicWrite(crewState.path, serializeCrew(crewState.crew))
+    }
+    crewWriteLock = crewWriteLock.then(write, write)
+    await crewWriteLock
   }
 
   const catalogCache = { expiresAt: 0, value: null }
@@ -613,7 +617,6 @@ export function apply(ctx, config = {}) {
     const dir = join(stateDir, 'bots', botId)
     await mkdir(dir, { recursive: true })
     const path = join(dir, 'dm-transcript.jsonl')
-    const { appendFile } = await import('node:fs/promises')
     let text = ''
     try {
       text = await readFile(path, 'utf8')
@@ -749,6 +752,8 @@ export function apply(ctx, config = {}) {
         let status = null
         try { status = JSON.parse(await readFile(join(dir, 'status.json'), 'utf8')) } catch { continue }
         if (status?.status !== 'claimed') continue
+        // 跳过正在运行的任务（runInboxJob 可能即将完成）
+        if (runningJobs.has(jobId)) continue
         const age = Date.now() - (Number(status.startedAt) || 0)
         if (age < jobTimeoutMs * 2) continue
         const botId = String(status.botId || routeJob(crewState.crew, entry).id)
@@ -980,7 +985,7 @@ export function apply(ctx, config = {}) {
                 ['翻译官', 'translator'], ['秘书', 'secretary'], ['审核官', 'reviewer'],
               ]
               for (const [prefix, key] of titleMatch) {
-                if (bot.title && bot.title.startsWith(prefix)) { roleTemplate = key; break }
+                if (bot.title && (bot.title === prefix || bot.title.startsWith(prefix + ' · '))) { roleTemplate = key; break }
               }
             }
             base.roleTemplate = roleTemplate
