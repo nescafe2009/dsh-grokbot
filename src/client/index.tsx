@@ -348,6 +348,10 @@ function closeTarget(): void {
 
 function toggleNativeSidebar(): void {
   nativeSidebarVisible = !nativeSidebarVisible
+  if (typeof document !== 'undefined') {
+    if (nativeSidebarVisible) document.body.classList.remove('grokbot-takeover')
+    else document.body.classList.add('grokbot-takeover')
+  }
   notify()
 }
 
@@ -950,7 +954,7 @@ function SetupWizard(props: { bot: BotInfo; onAdvance: () => void }): ReactNode 
               {templates.length === 0 ? <div className="grokbot-wizard__hint">加载角色…</div> : null}
               {templates.map((template) => (
                 <button key={template.id} type="button" className="grokbot-role" disabled={busy} onClick={() => void send(template.title.split(' · ')[0])}>
-                  <span className="grokbot-role__avatar" style={{ background: botGradient(template.id), color: '#fff' }}><AvatarGlyph glyph={template.id} size="52%" /></span>
+                  <AvatarView seed={template.id} glyph={template.id} size={48} />
                   <span className="grokbot-role__name">{template.title.split(' · ')[0]}</span>
                   <span className="grokbot-role__desc">{template.title.split(' · ')[1] || ''}</span>
                 </button>
@@ -1446,23 +1450,13 @@ export function GrokbotMainView(): ReactNode {
   const hiddenRef = useRef<HTMLElement[]>([])
 
   useEffect(() => {
-    hiddenRef.current = []
     if (!activeKey) return
     const center = (document.querySelector('[class*="centerCol"]') as HTMLElement) ?? null
-    const details = (document.querySelector('[class*="detailsCol"]') as HTMLElement) ?? null
     if (!center) return
     const takeover = (): void => {
       const rect = center.getBoundingClientRect()
       setBox({ left: rect.left, top: rect.top, width: rect.width, height: rect.height })
     }
-    const hide = (el: HTMLElement | null): void => {
-      if (!el || el.dataset.grokbotPrevDisplay !== undefined) return
-      el.dataset.grokbotPrevDisplay = el.style.display
-      el.style.display = 'none'
-      hiddenRef.current.push(el)
-    }
-    for (const child of [...center.children]) hide(child as HTMLElement)
-    hide(details)
     takeover()
     const observer = new ResizeObserver(takeover)
     observer.observe(center)
@@ -1470,12 +1464,6 @@ export function GrokbotMainView(): ReactNode {
     return () => {
       observer.disconnect()
       window.removeEventListener('resize', takeover)
-      for (const el of hiddenRef.current) {
-        el.style.display = el.dataset.grokbotPrevDisplay || ''
-        delete el.dataset.grokbotPrevDisplay
-      }
-      hiddenRef.current = []
-      // 不置空 box：避免 activeKey 切换时覆盖层闪卸露出 DSH 默认页
     }
   }, [activeKey])
 
@@ -1508,16 +1496,24 @@ export function apply(ctx: any): void {
   ctx.effect(() => {
     const style = document.createElement('style')
     style.dataset.dshGrokbot = ''
-    style.textContent = GROKBOT_CSS
     document.head.append(style)
-    return () => style.remove()
-  }, 'grokbot: styles')
+    const update = (): void => {
+      style.textContent = GROKBOT_CSS + (nativeSidebarVisible ? '' : '\n.grokbot-takeover [class*="centerCol"] > * { display: none !important; }\n.grokbot-takeover [class*="detailsCol"] { display: none !important; }')
+    }
+    update()
+    listeners.add(update)
+    return () => { listeners.delete(update); style.remove() }
+  }, 'grokbot: styles + takeover CSS')
 
   ctx.slots.inject('sidebar.workspaces', () => ctx.slots.register({
     name: 'sidebar.workspaces',
     id: 'grokbot-crew',
     order: -100,
   }, GrokbotSidebarCrew))
+
+  if (typeof document !== 'undefined' && !nativeSidebarVisible) {
+    document.body.classList.add('grokbot-takeover')
+  }
 
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay',
