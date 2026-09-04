@@ -501,27 +501,19 @@ export function GrokbotSidebarCrew(): ReactNode {
   const nativeVisible = useNativeSidebarVisible()
   const [grouping, setGrouping] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
-  const [menuView, setMenuView] = useState<'main' | 'templates'>('main')
   const [creatingBot, setCreatingBot] = useState(false)
-  const [templates, setTemplates] = useState<{ id: string; name: string; avatar: string; title: string; blank?: boolean }[]>([])
-
-  useEffect(() => {
-    if (!menuOpen || menuView !== 'templates' || templates.length > 0) return
-    void api('/bot-templates').then((outcome) => setTemplates(outcome?.templates ?? [])).catch(() => undefined)
-  }, [menuOpen, menuView, templates.length])
   const [filter, setFilter] = useState('')
   const rootRef = useRef<HTMLDivElement | null>(null)
   const hiddenRef = useRef<HTMLElement[]>([])
 
-  const createFromTemplate = useCallback((templateId: string | null): void => {
+  const createFromTemplate = useCallback((): void => {
     if (creatingBot) return
     setMenuOpen(false)
-    setMenuView('main')
     // 进入"召唤中"过渡视图：保持主区接管，既不闪旧会话也不露 DSH 默认页
     openTarget = null
     setCreatingUi(true)
     setCreatingBot(true)
-    void api('/bots', { method: 'POST', body: JSON.stringify(templateId ? { templateId } : {}) })
+    void api('/bots', { method: 'POST', body: JSON.stringify({}) })
       .then((outcome) => {
         const id = String(outcome?.bot?.id || '')
         if (id) openBot(id)
@@ -611,7 +603,7 @@ export function GrokbotSidebarCrew(): ReactNode {
   return (
     <div className="grokbot-sidebar" ref={rootRef}>
       <div className="grokbot-sidebar__top">
-        <button type="button" className="grokbot-iconbtn" title="新建：召唤专家 / 拉群聊 / 与 Bot 单聊" onClick={() => { setMenuOpen((v) => !v); setMenuView('main') }}>＋</button>
+        <button type="button" className="grokbot-iconbtn" title="新建：召唤专家 / 拉群聊 / 与 Bot 单聊" onClick={() => setMenuOpen((v) => !v)}>＋</button>
         <button type="button" className="grokbot-iconbtn" title={nativeVisible ? '隐藏原始列表' : '显示原始工作区/会话列表'} onClick={() => toggleNativeSidebar()}>⇆</button>
       </div>
       <div className="grokbot-sidebar__search">
@@ -621,45 +613,22 @@ export function GrokbotSidebarCrew(): ReactNode {
         {menuOpen
           ? (
             <div className="grokbot-newmenu">
-              {menuView === 'templates'
-                ? (
-                  <>
-                    <button type="button" className="grokbot-newmenu__item" onClick={() => setMenuView('main')}>
-                      <span className="grokbot-newmenu__icon">‹</span>返回
-                    </button>
-                    <div className="grokbot-newmenu__divider" />
-                    {templates.length === 0 ? <div style={{ fontSize: 12, opacity: .5, padding: '4px 10px' }}>加载预设…</div> : null}
-                    {templates.map((template) => (
-                      <button key={template.id} type="button" className="grokbot-newmenu__item" disabled={creatingBot} onClick={() => createFromTemplate(template.id)} title={template.title}>
-                        <span className="grokbot-newmenu__icon">{template.avatar}</span>
-                        <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-                          <span style={{ fontWeight: 600 }}>{template.name}</span>
-                          <span style={{ fontSize: 11, opacity: .55 }}>{template.title}</span>
-                        </span>
-                      </button>
-                    ))}
-                  </>
-                )
-                : (
-                  <>
-                    <button type="button" className="grokbot-newmenu__item" disabled={creatingBot} onClick={() => setMenuView('templates')}>
-                      <span className="grokbot-newmenu__icon">✨</span>
-                      <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-                        <span style={{ fontWeight: 600 }}>{creatingBot ? '正在创建…' : '创建新 Bot'}</span>
-                        <span style={{ fontSize: 11, opacity: .55 }}>10 个预设专家 · 或对话式定制</span>
-                      </span>
-                    </button>
-                    <button type="button" className="grokbot-newmenu__item" onClick={() => { setMenuOpen(false); setGrouping(true) }}>
-                      <span className="grokbot-newmenu__icon">👥</span>创建群聊
-                    </button>
-                    {allBots.filter((bot) => !bot.hidden).length > 0 ? <div className="grokbot-newmenu__divider" /> : null}
-                    {allBots.filter((bot) => !bot.hidden).map((bot) => (
-                      <button key={bot.id} type="button" className="grokbot-newmenu__item" onClick={() => { setMenuOpen(false); openBot(bot.id) }}>
-                        <span className="grokbot-newmenu__icon">{bot.avatar}</span>{bot.name}
-                      </button>
-                    ))}
-                  </>
-                )}
+              <button type="button" className="grokbot-newmenu__item" disabled={creatingBot} onClick={() => createFromTemplate()}>
+                <span className="grokbot-newmenu__icon">➕</span>
+                <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+                  <span style={{ fontWeight: 600 }}>{creatingBot ? '正在创建…' : '创建新 Bot'}</span>
+                  <span style={{ fontSize: 11, opacity: .55 }}>立即开聊，在对话里选角色和名字</span>
+                </span>
+              </button>
+              <button type="button" className="grokbot-newmenu__item" onClick={() => { setMenuOpen(false); setGrouping(true) }}>
+                <span className="grokbot-newmenu__icon">👥</span>创建群聊
+              </button>
+              {allBots.filter((bot) => !bot.hidden).length > 0 ? <div className="grokbot-newmenu__divider" /> : null}
+              {allBots.filter((bot) => !bot.hidden).map((bot) => (
+                <button key={bot.id} type="button" className="grokbot-newmenu__item" onClick={() => { setMenuOpen(false); openBot(bot.id) }}>
+                  <span className="grokbot-newmenu__icon">{bot.avatar}</span>{bot.name}
+                </button>
+              ))}
             </div>
           )
           : null}

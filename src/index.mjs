@@ -449,6 +449,64 @@ export function apply(ctx, config = {}) {
     })
   }, true), 'grokbot: approval bridge')
 
+  const ROLE_TEMPLATES = new Map([
+    ['工程师', 'coder'], ['调研员', 'researcher'], ['写作官', 'writer'], ['数据分析师', 'analyst'],
+    ['产品经理', 'pm'], ['秘书', 'secretary'], ['运维官', 'ops'], ['翻译官', 'translator'], ['审核官', 'reviewer'],
+  ])
+
+  const setupPathOf = (botId) => join(stateDir, 'bots', botId, 'setup.json')
+
+  async function loadSetup(botId) {
+    try {
+      return JSON.parse(await readFile(setupPathOf(botId), 'utf8'))
+    } catch {
+      return null
+    }
+  }
+
+  async function saveSetup(botId, setup) {
+    await atomicWrite(setupPathOf(botId), `${JSON.stringify(setup, null, 2)}\n`)
+  }
+
+  // 对话式设置协议：角色芯片 → 姓名芯片/输入 → 完成（确定性，不依赖模型）
+  async function trySetupTurn(bot, text) {
+    const setup = await loadSetup(bot.id)
+    if (!setup || setup.stage === 'done') return null
+    const clean = String(text || '').trim()
+    if (setup.stage === 'await-role') {
+      if (clean === '更多角色') {
+        return { reply: '其余角色：\n\n[[运维官|翻译官|审核官]]\n\n也可以直接描述你想让我做什么。' }
+      }
+      const templateId = ROLE_TEMPLATES.get(clean)
+      if (!templateId) return null // 非角色文本走模型自由对话
+      const template = templateById(templateId)
+      updateBot(crewState.crew, bot.id, { persona: template.persona, title: template.title, avatar: template.avatar })
+      await persistCrew()
+      await saveSetup(bot.id, { stage: 'await-name', roleTemplate: templateId })
+      return { reply: `已就任「**${clean}**」。最后一步——叫我什么名字？\n\n[[${template.name}|自己起一个]]`, renameTo: null }
+    }
+    if (setup.stage === 'await-name') {
+      const template = templateById(setup.roleTemplate || '') || { name: '' }
+      let name = ''
+      if (template.name && clean === template.name) {
+        name = template.name
+      } else if (clean === '自己起一个') {
+        return { reply: '好，直接输入名字（2-12 个字）就好。' }
+      } else {
+        const explicit = /^叫(?:我)?\s*([\u4e00-\u9fa5A-Za-z0-9·]{2,12})$/.exec(clean)
+        const bare = /^[\u4e00-\u9fa5A-Za-z0-9·]{2,12}$/.test(clean) && !ROLE_TEMPLATES.has(clean)
+        if (explicit) name = explicit[1]
+        else if (bare && clean !== template.name) name = clean
+      }
+      if (!name) return null
+      updateBot(crewState.crew, bot.id, { name })
+      await persistCrew()
+      await saveSetup(bot.id, { stage: 'done', roleTemplate: setup.roleTemplate })
+      return { reply: `就叫我**${name}**了。${template.title ? `角色：${template.title}。` : ''}设置完成，现在就可以给我第一个任务——说吧。` }
+    }
+    return null
+  }
+
   async function appendDm(botId, entry) {
     const dir = join(stateDir, 'bots', botId)
     await mkdir(dir, { recursive: true })
@@ -892,14 +950,13 @@ export function apply(ctx, config = {}) {
               '之后直接开始干活，只汇报真实完成的操作。',
             ].join('\n')
             greeting = [
-              '你好！我是团队的新成员，先把我设置好：',
+              '你好！我是新成员，在对话里完成设置：',
               '',
-              '1. **叫我什么名字？**（建议人类名字+头衔，如「陈默 · 数据分析师」，方便群里 @ 我）',
-              '2. **我主要负责什么**（职责与边界）？',
+              '**第一步，选角色：**',
               '',
-              '也可以直接选一个方向开始：',
+              '[[工程师|调研员|写作官|产品经理|数据分析师|秘书|更多角色]]',
               '',
-              '[[叫我工程师|叫我调研员|叫我写作官|先随便聊聊]]',
+              '选完我会在对话里问你的名字。也可以直接说「叫XX，做YY」一步到位。',
             ].join('\n')
           }
           let bot
@@ -914,6 +971,7 @@ export function apply(ctx, config = {}) {
           await ensureDmConversation(bot).catch(() => undefined)
           if (greeting) {
             await appendDm(bot.id, { role: 'bot', text: greeting }).catch(() => undefined)
+            await saveSetup(bot.id, { stage: 'await-role' }).catch(() => undefined)
           }
           respond(res, 201, { bot: publicBot(bot) }); return
         }
@@ -1072,6 +1130,19 @@ export function apply(ctx, config = {}) {
             const text = String(body?.text || '').trim()
             if (!text) throw new HttpError(400, 'text 不能为空')
             await appendConversationMsg(conversation, { role: 'user', text })
+            if (conversation.memberBotIds.length === 1) {
+              const memberBot = crewState.crew.bots.find((entry) => entry.id === conversation.memberBotIds[0])
+              const setupReply = memberBot ? await trySetupTurn(memberBot, text) : null
+              if (setupReply) {
+                await appendDm(memberBot.id, { role: 'bot', text: setupReply.reply }).catch(() => undefined)
+                respond(res, 200, {
+                  responder: publicBot(crewState.crew.bots.find((entry) => entry.id === memberBot.id) ?? memberBot),
+                  reply: setupReply.reply,
+                  handoffTo: null,
+                  messages: await readConversationMsgs(conversationOf(conversationId)),
+                }); return
+              }
+            }
             const result = await conversationTurn(conversation, text)
             respond(res, 200, {
               responder: publicBot(result.responder),
