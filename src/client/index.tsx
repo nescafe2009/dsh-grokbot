@@ -77,7 +77,7 @@ interface CatalogProvider {
 
 const GROKBOT_CSS = `
 .grokbot-sidebar { display:flex; flex-direction:column; min-height:0; flex:1; }
-.grokbot-sidebar__top { display:flex; align-items:center; justify-content:flex-end; gap:4px; padding:10px 10px 6px; }
+.grokbot-sidebar__top { display:flex; align-items:center; justify-content:flex-end; gap:4px; padding:20px 10px 6px; }
 .grokbot-iconbtn { border:none; background:none; cursor:pointer; opacity:.55; font-size:15px; padding:3px 7px; border-radius:7px; line-height:1; }
 .grokbot-iconbtn:hover { opacity:1; background:rgba(127,127,127,.14); }
 .grokbot-sidebar__search { margin:2px 10px 8px; }
@@ -453,22 +453,35 @@ export function GrokbotSidebarCrew(): ReactNode {
   useEffect(() => {
     if (nativeVisible) return
     const root = rootRef.current
-    const container = root?.parentElement
-    if (!container) return
+    if (!root) return
+    const sidebarCol = root.closest('[class*="sidebarCol"]') as HTMLElement | null
+    if (!sidebarCol) return
+    // 从侧栏根到我们的根，链上每层隐藏非路径兄弟：去掉 logo 行 / 新会话 / 任务看板 / 底部原生区
+    const chain: HTMLElement[] = []
+    let node: HTMLElement | null = root
+    while (node && node !== sidebarCol) {
+      chain.unshift(node)
+      node = node.parentElement
+    }
+    const onPath = new Set<HTMLElement>(chain)
     const apply = (): void => {
-      for (const child of [...container.children]) {
-        if (child === root || child.contains(root)) continue
-        const el = child as HTMLElement
-        if (el.dataset.grokbotKept === undefined && el.style.display !== 'none') {
-          el.dataset.grokbotPrevDisplay = el.style.display
-          el.style.display = 'none'
-          hiddenRef.current.push(el)
+      for (const el of chain) {
+        const parent = el.parentElement
+        if (!parent) continue
+        for (const child of [...parent.children]) {
+          if (onPath.has(child as HTMLElement) || child.contains(root)) continue
+          const target = child as HTMLElement
+          if (target.dataset.grokbotPrevDisplay === undefined && target.style.display !== 'none') {
+            target.dataset.grokbotPrevDisplay = target.style.display
+            target.style.display = 'none'
+            hiddenRef.current.push(target)
+          }
         }
       }
     }
     apply()
     const observer = new MutationObserver(apply)
-    observer.observe(container, { childList: true })
+    observer.observe(sidebarCol, { childList: true, subtree: true })
     return () => {
       observer.disconnect()
       for (const el of hiddenRef.current) {
