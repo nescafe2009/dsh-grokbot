@@ -18,6 +18,7 @@ interface BotInfo {
   lastMessage?: string
   lastAt?: number | null
   lastFrom?: string
+  setupStage?: 'await-role' | 'await-name'
 }
 
 interface ConversationInfo {
@@ -169,6 +170,26 @@ const GROKBOT_CSS = `
 .grokbot-chips__item:disabled { opacity:.45; cursor:default; }
 .grokbot-msg .grokbot-msg__time { display:block; font-size:10px; opacity:.45; margin-top:4px; text-align:inherit; }
 .grokbot-blank { flex:1; background:var(--background,#fff); }
+.grokbot-wizard { flex:1; overflow-y:auto; display:flex; flex-direction:column; align-items:center; gap:18px; padding:48px 32px; }
+.grokbot-wizard__steps { display:flex; gap:14px; font-size:12px; opacity:.55; }
+.grokbot-wizard__steps .on { opacity:1; color:#3b82f6; font-weight:700; }
+.grokbot-wizard__steps .ok { opacity:.9; }
+.grokbot-wizard__steps .ok::after { content:" ✓"; color:#2ea043; }
+.grokbot-wizard__title { font-size:19px; font-weight:700; }
+.grokbot-wizard__roles { display:flex; flex-wrap:wrap; gap:12px; justify-content:center; max-width:640px; }
+.grokbot-role { width:150px; display:flex; flex-direction:column; align-items:center; gap:6px; padding:18px 10px 14px; border:1px solid var(--border,#e3e5e8); border-radius:14px; background:transparent; cursor:pointer; font:inherit; color:inherit; transition:all .15s; }
+.grokbot-role:hover { border-color:#3b82f6; background:rgba(59,130,246,.06); transform:translateY(-2px); box-shadow:0 4px 14px rgba(59,130,246,.12); }
+.grokbot-role:disabled { opacity:.5; cursor:default; }
+.grokbot-role__avatar { font-size:30px; }
+.grokbot-role__name { font-size:14.5px; font-weight:700; }
+.grokbot-role__desc { font-size:11.5px; opacity:.55; }
+.grokbot-wizard__names { display:flex; gap:8px; flex-wrap:wrap; justify-content:center; }
+.grokbot-wizard__custom { display:flex; gap:8px; width:min(360px,90%); }
+.grokbot-wizard__custom input { flex:1; min-width:0; border:1px solid var(--border,#d8dbe0); border-radius:10px; padding:9px 13px; font:inherit; background:transparent; color:inherit; outline:none; }
+.grokbot-wizard__custom input:focus { border-color:#3b82f6; }
+.grokbot-wizard__skip { border:none; background:none; color:#3b82f6; font-size:12.5px; cursor:pointer; opacity:.75; padding:4px 10px; }
+.grokbot-wizard__skip:hover { opacity:1; text-decoration:underline; }
+.grokbot-wizard__hint { font-size:12.5px; opacity:.5; }
 .grokbot-creating { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; font-size:13.5px; opacity:.75; }
 .grokbot-creating__spinner { width:26px; height:26px; border-radius:50%; border:3px solid rgba(59,130,246,.25); border-top-color:#3b82f6; animation:grokbot-spin .8s linear infinite; }
 @keyframes grokbot-spin { to { transform:rotate(360deg) } }
@@ -785,6 +806,98 @@ function splitChips(text: string): { body: string; chips: string[] } {
   }
 }
 
+function SetupWizard(props: { bot: BotInfo; onAdvance: () => void }): ReactNode {
+  const { bot } = props
+  const [templates, setTemplates] = useState<{ id: string; name: string; avatar: string; title: string; persona: string }[]>([])
+  const [busy, setBusy] = useState(false)
+  const [nameDraft, setNameDraft] = useState('')
+  const [customRole, setCustomRole] = useState(false)
+  const [customText, setCustomText] = useState('')
+
+  useEffect(() => {
+    if (props.bot.setupStage !== 'await-role' || templates.length > 0) return
+    void api('/bot-templates').then((outcome) => setTemplates((outcome?.templates ?? []).filter((t: { blank?: boolean }) => !t.blank && t.id !== 'chief'))).catch(() => undefined)
+  }, [props.bot.setupStage, templates.length])
+
+  const send = useCallback(async (text: string): Promise<void> => {
+    if (busy) return
+    setBusy(true)
+    try {
+      await api(`/conversations/${encodeURIComponent(bot.id)}/chat`, { method: 'POST', body: JSON.stringify({ text }) })
+      props.onAdvance()
+    } catch { /* 随轮询恢复 */ } finally {
+      setBusy(false)
+    }
+  }, [busy, bot.id, props])
+
+  const stage = bot.setupStage
+  const chosenTemplate = stage === 'await-name'
+    ? templates.find((template) => (template.title || '').startsWith(bot.title.split(' · ')[0]))
+    : null
+
+  return (
+    <div className="grokbot-wizard">
+      <div className="grokbot-wizard__steps">
+        <span className={stage === 'await-role' ? 'on' : stage === 'await-name' ? 'ok' : 'ok'}>① 角色</span>
+        <span className={stage === 'await-name' ? 'on' : ''}>② 姓名</span>
+        <span>③ 完成</span>
+      </div>
+      {stage === 'await-role'
+        ? (
+          <>
+            <div className="grokbot-wizard__title">给我一个角色</div>
+            <div className="grokbot-wizard__roles">
+              {templates.length === 0 ? <div className="grokbot-wizard__hint">加载角色…</div> : null}
+              {templates.map((template) => (
+                <button key={template.id} type="button" className="grokbot-role" disabled={busy} onClick={() => void send(template.title.split(' · ')[0])}>
+                  <span className="grokbot-role__avatar">{template.avatar}</span>
+                  <span className="grokbot-role__name">{template.title.split(' · ')[0]}</span>
+                  <span className="grokbot-role__desc">{template.title.split(' · ')[1] || ''}</span>
+                </button>
+              ))}
+            </div>
+            {customRole
+              ? (
+                <div className="grokbot-wizard__custom">
+                  <input value={customText} onChange={(e) => setCustomText(e.target.value)} placeholder="描述角色，如：懂法律的合规顾问" aria-label="自定义角色" />
+                  <button type="button" className="grokbot-form__submit" disabled={busy || customText.trim().length < 2} onClick={() => void send(`我的角色：${customText.trim()}`)}>就这个</button>
+                </div>
+              )
+              : <button type="button" className="grokbot-wizard__skip" onClick={() => setCustomRole(true)}>＋ 自定义角色</button>}
+          </>
+        )
+        : null}
+      {stage === 'await-name'
+        ? (
+          <>
+            <div className="grokbot-wizard__title">叫我什么名字？</div>
+            {chosenTemplate
+              ? (
+                <div className="grokbot-wizard__names">
+                  {[chosenTemplate.name, chosenTemplate.name.slice(0, 1) + '小' + chosenTemplate.name.slice(1)].map((suggestion) => (
+                    <button key={suggestion} type="button" className="grokbot-chips__item" disabled={busy} onClick={() => void send(suggestion)}>{suggestion}</button>
+                  ))}
+                </div>
+              )
+              : null}
+            <div className="grokbot-wizard__custom">
+              <input value={nameDraft} onChange={(e) => setNameDraft(e.target.value)} placeholder="输入名字（2-12 字），回车确认" aria-label="名字"
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && nameDraft.trim().length >= 2 && !busy) {
+                    event.preventDefault()
+                    void send(`叫${nameDraft.trim()}`)
+                  }
+                }} />
+              <button type="button" className="grokbot-form__submit" disabled={busy || nameDraft.trim().length < 2} onClick={() => void send(`叫${nameDraft.trim()}`)}>就叫这个</button>
+            </div>
+          </>
+        )
+        : null}
+      <button type="button" className="grokbot-wizard__skip" disabled={busy} onClick={() => void send('跳过设置')}>跳过设置，直接聊</button>
+    </div>
+  )
+}
+
 function MembersPanel(props: { conversation: { id: string; name: string; memberBotIds: string[] }; bots: BotInfo[]; onChanged: () => void }): ReactNode {
   const [adding, setAdding] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -952,6 +1065,14 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
         <button type="button" className="grokbot-chat__close" onClick={closeTarget} aria-label="关闭">✕</button>
       </div>
       {editing ? <div style={{ padding: '0 20px' }}><BotForm initial={bot} onCancel={() => setEditing(false)} onSaved={() => setEditing(false)} /></div> : null}
+      {bot.setupStage
+        ? (
+          <div className="grokbot-body">
+            <SetupWizard bot={bot} onAdvance={() => refreshState?.()} />
+          </div>
+        )
+        : (
+        <>
       <div className="grokbot-body">
         <div className="grokbot-log" ref={logRef}>
           {messages.length === 0 && pending.length === 0
@@ -1029,6 +1150,8 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
         />
         <button type="button" className="side" title="语音输入（待实现）" disabled>🎤</button>
       </div>
+        </>
+      )}
     </div>
   )
 }

@@ -474,6 +474,10 @@ export function apply(ctx, config = {}) {
     if (!setup || setup.stage === 'done') return null
     const clean = String(text || '').trim()
     if (setup.stage === 'await-role') {
+      if (clean === '跳过设置') {
+        await saveSetup(bot.id, { stage: 'done', skipped: true })
+        return { reply: '好，跳过设置。我先用默认身份干活，随时可以让我调整角色或名字。' }
+      }
       if (clean === '更多角色') {
         return { reply: '其余角色：\n\n[[运维官|翻译官|审核官]]\n\n也可以直接描述你想让我做什么。' }
       }
@@ -486,6 +490,10 @@ export function apply(ctx, config = {}) {
       return { reply: `已就任「**${clean}**」。最后一步——叫我什么名字？\n\n[[${template.name}|自己起一个]]`, renameTo: null }
     }
     if (setup.stage === 'await-name') {
+      if (clean === '跳过设置') {
+        await saveSetup(bot.id, { stage: 'done', roleTemplate: setup.roleTemplate })
+        return { reply: '设置完成（沿用默认名字）。现在就可以给我第一个任务。' }
+      }
       const template = templateById(setup.roleTemplate || '') || { name: '' }
       let name = ''
       if (template.name && clean === template.name) {
@@ -865,6 +873,8 @@ export function apply(ctx, config = {}) {
           const bots = []
           for (const bot of crewState.crew.bots) {
             const base = publicBot(bot)
+            const setup = await loadSetup(bot.id)
+            if (setup && setup.stage && setup.stage !== 'done') base.setupStage = setup.stage
             const dm = await readDm(bot.id, 1)
             const last = dm[dm.length - 1]
             bots.push({
