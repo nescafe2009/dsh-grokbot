@@ -387,6 +387,14 @@ function persistLastTarget(target: { kind: string; id: string }): void {
   }).catch(() => undefined)
 }
 
+// 原生会话视图是否已出现：centerCol 里渲染出输入框即视为会话已打开，
+// 否则是 DSH 默认首页（探索未知之境）或过渡态
+function nativeSessionVisible(): boolean {
+  const center = document.querySelector('[class*="centerCol"]')
+  if (!center) return false
+  return Boolean(center.querySelector('textarea, [contenteditable="true"]'))
+}
+
 // 统一实体：私聊会话 id === botId；群聊会话 id 独立
 function openConversation(conversationId: string): void {
   openTarget = { kind: 'conversation', id: conversationId }
@@ -1568,7 +1576,33 @@ export function GrokbotMainView(): ReactNode {
   // 空态/创建中：保持接管（空白页/过渡页）
   const isDmConversation = conversation && !isGroup
   const isComputer = target?.kind === 'computer'
-  const activeKey = nativeVisible || isDmConversation
+  // 单聊：等原生会话视图确认出现（nativeReady）才释放主区，避免
+  // sessionsService.open() 首屏竞态失败时露出 DSH 默认首页（探索未知之境）；
+  // 重试耗尽（openExhausted）则保持接管并回退到自家聊天视图。
+  const [nativeReady, setNativeReady] = useState(false)
+  const [openExhausted, setOpenExhausted] = useState(false)
+  useEffect(() => { setNativeReady(false); setOpenExhausted(false) }, [target?.id])
+  useEffect(() => {
+    if (!isDmConversation) return
+    const check = (): void => { if (nativeSessionVisible()) setNativeReady(true) }
+    check()
+    const mo = new MutationObserver(check)
+    mo.observe(document.documentElement, { childList: true, subtree: true })
+    const timer = window.setInterval(check, 1000)
+    return () => { mo.disconnect(); window.clearInterval(timer) }
+  }, [isDmConversation, target?.id])
+  useEffect(() => {
+    if (!isDmConversation || nativeReady || !bot?.dshSessionId) return
+    let attempts = 0
+    const timer = window.setInterval(() => {
+      if (nativeSessionVisible()) return
+      attempts += 1
+      if (attempts > 12) { setOpenExhausted(true); window.clearInterval(timer); return }
+      try { sessionsService?.open(bot.dshSessionId!) } catch { /* 会话未就绪，继续重试 */ }
+    }, 700)
+    return () => window.clearInterval(timer)
+  }, [isDmConversation, nativeReady, bot?.dshSessionId])
+  const activeKey = nativeVisible || (isDmConversation && nativeReady)
     ? null
     : (target ? `conversation:${target.id}` : (creatingUi ? 'creating' : 'home'))
   const entering = Boolean(target) && !conversation
@@ -1585,18 +1619,31 @@ export function GrokbotMainView(): ReactNode {
 
   useEffect(() => {
     if (!activeKey) return
-    const center = (document.querySelector('[class*="centerCol"]') as HTMLElement) ?? null
-    if (!center) return
+    // centerCol 可能晚于本组件挂载（首屏竞态）：MutationObserver 持续等它出现
+    let center: HTMLElement | null = document.querySelector('[class*="centerCol"]') as HTMLElement | null
+    let resizeObserver: ResizeObserver | null = null
     const takeover = (): void => {
+      if (!center) return
       const rect = center.getBoundingClientRect()
       setBox({ left: rect.left, top: rect.top, width: rect.width, height: rect.height })
     }
-    takeover()
-    const observer = new ResizeObserver(takeover)
-    observer.observe(center)
+    const attach = (el: HTMLElement): void => {
+      center = el
+      resizeObserver?.disconnect()
+      resizeObserver = new ResizeObserver(takeover)
+      resizeObserver.observe(el)
+      takeover()
+    }
+    const mo = new MutationObserver(() => {
+      const el = document.querySelector('[class*="centerCol"]') as HTMLElement | null
+      if (el) { mo.disconnect(); attach(el) }
+    })
+    if (center) attach(center)
+    else mo.observe(document.documentElement, { childList: true, subtree: true })
     window.addEventListener('resize', takeover)
     return () => {
-      observer.disconnect()
+      mo.disconnect()
+      resizeObserver?.disconnect()
       window.removeEventListener('resize', takeover)
     }
   }, [activeKey])
@@ -1609,13 +1656,13 @@ export function GrokbotMainView(): ReactNode {
     >
       {(() => {
         if (isComputer) return <iframe src="http://127.0.0.1:6080/vnc.html?autoconnect=true" style={{ width: '100%', height: '100%', border: 'none' }} />
-        if (bot) return <BotChatView bot={bot} state={state} />
+        if (bot && (!isDmConversation || openExhausted)) return <BotChatView bot={bot} state={state} />
         if (conversation && isGroup) return <GroupChatView conversation={conversation} bots={state?.bots ?? []} />
-        if (creatingUi || entering) {
+        if (creatingUi || entering || (isDmConversation && !openExhausted)) {
           return (
             <div className="grokbot-creating">
               <div className="grokbot-creating__spinner" />
-              <div>{entering ? '正在进入会话…' : '正在召唤专家…'}</div>
+              <div>{entering ? '正在进入会话…' : (isDmConversation ? '正在打开会话…' : '正在召唤专家…')}</div>
             </div>
           )
         }
@@ -1644,18 +1691,30 @@ export function apply(ctx: any): void {
     return () => { listeners.delete(update); style.remove() }
   }, 'grokbot: styles + takeover CSS')
 
-  ctx.slots.inject('sidebar.workspaces', () => ctx.slots.register({
-    name: 'sidebar.workspaces',
-    id: 'grokbot-crew',
-    order: -100,
-  }, GrokbotSidebarCrew))
+  ctx.slots.inject('sidebar.workspaces', () => {
+    try {
+      ctx.slots.register({
+        name: 'sidebar.workspaces',
+        id: 'grokbot-crew',
+        order: -100,
+      }, GrokbotSidebarCrew)
+    } catch (error) {
+      console.error('[grokbot] sidebar slot 注册失败', error)
+    }
+  })
 
   // body class 由 GrokbotMainView 的 activeKey effect 动态管理（单聊释放/群聊接管）
   // 这里不再静态添加，避免单聊时 CSS 隐藏主区
 
-  ctx.slots.inject('shell.overlay', () => ctx.slots.register({
-    name: 'shell.overlay',
-    id: 'grokbot-main',
-    order: 51,
-  }, GrokbotMainView))
+  ctx.slots.inject('shell.overlay', () => {
+    try {
+      ctx.slots.register({
+        name: 'shell.overlay',
+        id: 'grokbot-main',
+        order: 51,
+      }, GrokbotMainView)
+    } catch (error) {
+      console.error('[grokbot] overlay slot 注册失败', error)
+    }
+  })
 }
