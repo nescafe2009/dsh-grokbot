@@ -512,6 +512,45 @@ export function apply(ctx, config = {}) {
     return session
   }
 
+  // 全局人设注入：无论 agent 由谁创建（我们的 API 或 DSH 原生 UI），
+  // 只要 session 属于我们的 bot，就在 system prompt 里注入身份和记忆
+  ctx.effect(() => ctx.on('system-prompt/assemble', async (assembly, context, next) => {
+    const resolved = await next()
+    // 从 context 中提取 session/agent 信息，判断是否是我们的 bot
+    const sessionId = context?.sessionId || context?.session?.id || ''
+    if (!sessionId) return resolved
+    // 在 chatSessionIds 中查找对应的 botId
+    let botId = null
+    for (const [bid, sid] of chatSessionIds.entries()) {
+      if (sid === sessionId) { botId = bid; break }
+    }
+    if (!botId) return resolved
+    const bot = crewState.crew.bots.find((b) => b.id === botId)
+    if (!bot) return resolved
+    // 注入人设和记忆（放在最前面，order 逻辑由 section order 决定）
+    const sections = [...(resolved.sections || [])]
+    // 避免重复注入（如果已有 grokbot:identity 就跳过）
+    if (!sections.some((s) => s.name === 'grokbot:identity')) {
+      sections.unshift({
+        name: 'grokbot:identity',
+        order: -20,
+        text: personaPrompt(bot),
+      })
+      // 记忆注入
+      try {
+        const profile = await readFile(profilePathOf(bot.id), 'utf8')
+        if (profile.trim()) {
+          sections.push({
+            name: 'grokbot:memory',
+            order: -18,
+            text: `## 你的长期记忆\n文件路径：${profilePathOf(bot.id)}（可读写）\n当前内容：\n${profile.trim()}\n\n记忆维护规则：每回合结束时，若产生了值得长期记住的稳定偏好或重要事实，用工具向该文件追加一行「YYYY-MM-DD 事实」。`,
+          })
+        }
+      } catch { /* 无记忆文件 */ }
+    }
+    return { ...resolved, sections }
+  }), 'grokbot: global persona injection')
+
   // 审批桥：我们创建的 agent 的工具审批交给会话内【同意/取消】卡，其余放行
   ctx.effect(() => ctx.on('approval/request', (req, next) => {
     const agentId = String(req?.agent?.id || '')
