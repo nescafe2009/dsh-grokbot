@@ -402,6 +402,76 @@ export function apply(ctx, config = {}) {
           } catch (error) { return JSON.stringify({ error: safeError(error) }) }
         },
       },
+      {
+        name: 'team_setup_project',
+        description: 'One-shot: create team members, create a group chat, and dispatch initial tasks. Use this instead of calling team_create_member + team_create_group + team_send_task separately.',
+        parameters: {
+          type: 'object',
+          properties: {
+            group_name: { type: 'string', description: 'Project group name' },
+            members: {
+              type: 'array',
+              description: 'Team members to create and add to the group',
+              items: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string', description: 'Member name' },
+                  role: { type: 'string', description: 'Role/title' },
+                  task: { type: 'string', description: 'Initial task for this member' },
+                },
+                required: ['name', 'role'],
+              },
+            },
+          },
+          required: ['group_name', 'members'],
+        },
+        output,
+        async execute(params) {
+          if (bot.id !== 'chief') return JSON.stringify({ error: 'Only chief can setup projects' })
+          const results = { created: [], group: null, tasks: [] }
+          try {
+            // 1. Create members
+            const memberIds = []
+            for (const m of params.members) {
+              try {
+                const newBot = createBot(crewState.crew, { name: m.name, title: m.role })
+                await persistCrew()
+                await seedBotMemory(newBot)
+                await ensureDmConversation(newBot)
+                memberIds.push(newBot.id)
+                results.created.push({ name: newBot.name, role: newBot.title, id: newBot.id })
+              } catch (e) {
+                // Maybe already exists
+                const existing = crewState.crew.bots.find((b) => b.name.includes(m.name) || m.name.includes(b.name))
+                if (existing) {
+                  memberIds.push(existing.id)
+                  results.created.push({ name: existing.name, role: existing.title, id: existing.id, existing: true })
+                }
+              }
+            }
+            // 2. Create group (include chief)
+            if (!memberIds.includes(bot.id)) memberIds.push(bot.id)
+            if (memberIds.length >= 2) {
+              const conv = createConversation(crewState.crew, { name: params.group_name, memberBotIds: memberIds })
+              await persistCrew()
+              await appendRoomMsg(conv.id, { role: 'system', text: `Group "${params.group_name}" created by ${bot.name}` })
+              results.group = { id: conv.id, name: conv.name, memberCount: memberIds.length }
+            }
+            // 3. Dispatch tasks
+            for (let i = 0; i < params.members.length; i++) {
+              const m = params.members[i]
+              if (m.task && memberIds[i]) {
+                const job = await enqueueJob(inboxRoot, { toBot: memberIds[i], text: `[${params.group_name}] ${m.task}` })
+                results.tasks.push({ to: m.name, jobId: job.jobId })
+              }
+            }
+            void scan()
+            return JSON.stringify(results)
+          } catch (error) {
+            return JSON.stringify({ ...results, error: safeError(error) })
+          }
+        },
+      },
     ]
   }
 
