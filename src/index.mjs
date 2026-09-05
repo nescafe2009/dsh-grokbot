@@ -339,6 +339,68 @@ export function apply(ctx, config = {}) {
       child.stdin.end(command)
     })
   }
+  // ---------- 共享电脑服务：HTTP 预览 + SSH 隧道自愈 + VM→Mac 镜像 ----------
+  const PREVIEW_PORT = 8000
+  const NOVNC_PORT = 6080
+  let tunnelProc = null
+  let lastVmHttpCheck = 0
+  let lastMirrorSync = 0
+  function tunnelAlive() {
+    return tunnelProc !== null && tunnelProc.exitCode === null && !tunnelProc.killed
+  }
+  function ensureTunnels(config) {
+    if (tunnelAlive()) return
+    try {
+      const { spawn } = require('node:child_process')
+      const keyPath = config.sshKey.replace(/^~/, process.env.HOME || '')
+      const args = ['-i', keyPath, '-N',
+        '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3',
+        '-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=accept-new']
+      if (config.sshJump) args.push('-J', config.sshJump)
+      args.push('-L', `${NOVNC_PORT}:127.0.0.1:${NOVNC_PORT}`, '-L', `${PREVIEW_PORT}:127.0.0.1:${PREVIEW_PORT}`)
+      args.push(config.sshUser + '@' + config.sshHost)
+      tunnelProc = spawn('ssh', args, { stdio: 'ignore' })
+      tunnelProc.on('exit', () => { tunnelProc = null })
+      ctx.logger?.info?.('grokbot 共享电脑隧道已建立（noVNC 6080 + 预览 8000）')
+    } catch { /* 下个周期重试 */ }
+  }
+  async function ensureVmHttpServer(config) {
+    const probe = await sshExec(config, 'curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:' + PREVIEW_PORT + '/ 2>/dev/null', 20000)
+    if (probe.ok && probe.text.includes('200')) return
+    await sshExec(config, `nohup python3 -m http.server ${PREVIEW_PORT} -d ${config.workspace || '/home/bot/workspace'} >/tmp/ws-http.log 2>&1 & sleep 1`, 20000)
+    ctx.logger?.info?.('grokbot 共享电脑 HTTP 预览服务已启动 :' + PREVIEW_PORT)
+  }
+  async function mirrorWorkspace(config) {
+    try {
+      const { spawn } = require('node:child_process')
+      const keyPath = config.sshKey.replace(/^~/, process.env.HOME || '')
+      const macWorkspace = join(stateDir, 'workspace')
+      const sshOpts = `ssh -i ${JSON.stringify(keyPath)} -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new${config.sshJump ? ' -J ' + config.sshJump : ''}`
+      await new Promise((resolve) => {
+        const child = spawn('rsync', ['-az', '-e', sshOpts,
+          `${config.sshUser}@${config.sshHost}:${config.workspace || '/home/bot/workspace'}/`, macWorkspace + '/'],
+          { stdio: 'ignore' })
+        const timer = setTimeout(() => child.kill('SIGKILL'), 60000)
+        child.on('close', () => { clearTimeout(timer); resolve() })
+      })
+    } catch (error) {
+      ctx.logger?.warn?.(`grokbot 工作区镜像同步失败：${safeError(error)}`)
+    }
+  }
+  async function ensureComputerServices() {
+    const config = await loadComputerConfig()
+    if (!config?.enabled) return
+    ensureTunnels(config)
+    const now = Date.now()
+    if (now - lastVmHttpCheck > 300_000) {
+      lastVmHttpCheck = now
+      await ensureVmHttpServer(config).catch(() => undefined)
+    }
+    if (now - lastMirrorSync > 120_000) {
+      lastMirrorSync = now
+      await mirrorWorkspace(config)
+    }
+  }
   function computerTools(bot) {
     // render(args, value)：value 才是 execute 返回值；必须返回 ContentBlock[]
     const output = { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: String(value) }] }
@@ -353,6 +415,20 @@ export function apply(ctx, config = {}) {
         async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); const r = await sshExec(c, 'mkdir -p /home/bot/workspace && cat > /home/bot/workspace/' + params.path + " <<'EOF'\n" + params.content + '\nEOF'); return r.ok ? 'File written: ' + params.path : 'Write failed: ' + r.text } },
       { name: 'computer_read_file', description: 'Read a file from the team computer workspace.', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, output,
         async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); const r = await sshExec(c, 'cat /home/bot/workspace/' + params.path); return r.ok ? r.text : 'ERROR: ' + r.text } },
+      { name: 'computer_preview', description: 'Get a preview URL for a deliverable on the team computer (HTML game/page etc.) and open it in the user\'s browser. path is relative to the shared workspace. Always prefer this over local `open` commands — the shared computer files are not on this Mac.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Workspace-relative path, e.g. agents/zhaogongcheng/index.html' } }, required: ['path'] }, output,
+        async execute(params) {
+          const c = await loadComputerConfig()
+          if (!c?.enabled) return 'Computer not configured'
+          await ensureComputerServices()
+          let p = String(params.path || '').trim().replace(/^\/+/, '')
+          p = p.replace(/^home\/bot\/workspace\//, '').replace(/^workspace\//, '')
+          const url = `http://127.0.0.1:${PREVIEW_PORT}/${encodeURI(p)}`
+          try {
+            const { spawn } = require('node:child_process')
+            spawn('open', [url], { detached: true, stdio: 'ignore' }).unref()
+          } catch { /* 打开失败不影响返回 URL */ }
+          return JSON.stringify({ ok: true, url, note: '已在用户浏览器打开；请把该链接也写进回复里' })
+        } },
     ]
   }
 
@@ -537,7 +613,8 @@ export function apply(ctx, config = {}) {
   function personaPrompt(bot) {
     return [
       bot.persona || '你是常驻桌面 agent 团队的一员，用简体中文直接处理用户投递的任务。',
-      `团队共享电脑：${botWorkspace(stateDir, bot)}（全队共享）；你的个人目录：${join(botWorkspace(stateDir, bot), 'agents', bot.id)}（自己的笔记与工作产物放这里）。`,
+      '团队共享电脑是 Linux VM：产物一律写到 /home/bot/workspace/（相对写法 workspace/），你的个人目录 /home/bot/workspace/agents/' + bot.id + '。本机 Mac 路径不是共享电脑——不要用本地 open/写文件来交付团队产物。',
+      '交付可玩的 HTML/游戏时，用 computer_preview 工具生成预览链接（会自动在用户浏览器打开），并把链接写进回复。',
       ...(bot.id === 'chief'
         ? ['你是幕僚长：团队协调者而非执行者。成员交付后你会被自动唤醒——届时派发下游工作（带上游产物路径）、催办等待者、全部完成后向群里做收尾总结。尽量把活分给成员，不要自己代做。']
         : []),
@@ -1340,6 +1417,9 @@ export function apply(ctx, config = {}) {
   }
   let debounceTimer = null
   void scan()
+  // 共享电脑服务守护：隧道自愈 + VM HTTP 预览 + VM→Mac 工作区镜像
+  void ensureComputerServices()
+  const servicesTimer = setInterval(() => void ensureComputerServices(), 30_000)
 
   // ---------- HTTP API ----------
 
@@ -1884,9 +1964,11 @@ export function apply(ctx, config = {}) {
     disposed = true
     clearInterval(rescanTimer)
     clearInterval(routineTimer)
+    clearInterval(servicesTimer)
     clearTimeout(debounceTimer)
     watcher?.close()
     chatHandles.clear()
+    try { tunnelProc?.kill() } catch { /* 已退出 */ }
     for (const session of [...activeSessions]) {
       void session.dispose()
     }
