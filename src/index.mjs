@@ -1016,6 +1016,7 @@ export function apply(ctx, config = {}) {
               }
             }
             base.roleTemplate = roleTemplate
+            base.dshSessionId = chatSessionIds.get(bot.id) || null
             base.rating = ratingOf(await loadStats(bot.id))
             const dm = await readDm(bot.id, 1)
             const last = dm[dm.length - 1]

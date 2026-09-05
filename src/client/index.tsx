@@ -21,6 +21,7 @@ interface BotInfo {
   lastFrom?: string
   setupStage?: 'await-role' | 'await-name'
   model?: { provider: string; model: string } | null
+  dshSessionId?: string | null
 }
 
 interface ConversationInfo {
@@ -389,8 +390,19 @@ function openConversation(conversationId: string): void {
   persistLastTarget(openTarget)
   notify()
   refreshState?.()
-  // 更新 body class：单聊释放主区，群聊保持接管
-  // 这个会在 MainView 渲染时由 activeKey 逻辑间接控制（CSS 只在 overlay 存在时生效）
+  // 单聊：导航到 DSH 原生 session（ZCode 体验）；群聊不导航（保持 Grok 覆盖层）
+  const st = lastKnownState
+  if (st) {
+    const conv = st.conversations?.find((c) => c.id === conversationId)
+    const isGroup = conv && conv.memberBotIds.length > 1
+    if (!isGroup) {
+      const botId = conv ? conv.memberBotIds[0] : conversationId
+      const bot = st.bots?.find((b) => b.id === botId)
+      if (bot?.dshSessionId && sessionsService?.open) {
+        try { sessionsService.open(bot.dshSessionId) } catch { /* session 可能未就绪 */ }
+      }
+    }
+  }
 }
 
 function openBot(botId: string): void {
@@ -478,12 +490,20 @@ async function api(path: string, init?: RequestInit): Promise<any> {
   return body
 }
 
+let lastKnownState: GrokbotState | null = null
+
 function useGrokbotState(): GrokbotState | null {
   const [state, setState] = useState<GrokbotState | null>(null)
   useEffect(() => {
     let alive = true
     const tick = (): void => {
-      api('/state').then((next) => { if (alive) setState(next as GrokbotState) }).catch(() => undefined)
+      api('/state').then((next) => {
+        if (alive) {
+          const s = next as GrokbotState
+          setState(s)
+          lastKnownState = s
+        }
+      }).catch(() => undefined)
     }
     tick()
     refreshState = tick
@@ -1591,9 +1611,13 @@ export function GrokbotMainView(): ReactNode {
   )
 }
 
-export const inject = ['slots']
+export const inject = ['slots', 'sessions']
+
+let sessionsService: any = null
 
 export function apply(ctx: any): void {
+  sessionsService = ctx.sessions || null
+
   ctx.effect(() => {
     const style = document.createElement('style')
     style.dataset.dshGrokbot = ''
