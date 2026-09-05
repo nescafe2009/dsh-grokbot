@@ -415,7 +415,7 @@ export function apply(ctx, config = {}) {
         async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); const r = await sshExec(c, 'mkdir -p /home/bot/workspace && cat > /home/bot/workspace/' + params.path + " <<'EOF'\n" + params.content + '\nEOF'); return r.ok ? 'File written: ' + params.path : 'Write failed: ' + r.text } },
       { name: 'computer_read_file', description: 'Read a file from the team computer workspace.', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, output,
         async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); const r = await sshExec(c, 'cat /home/bot/workspace/' + params.path); return r.ok ? r.text : 'ERROR: ' + r.text } },
-      { name: 'computer_preview', description: 'Get a preview URL for a deliverable on the team computer (HTML game/page etc.) and open it in the user\'s browser. path is relative to the shared workspace. Always prefer this over local `open` commands — the shared computer files are not on this Mac.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Workspace-relative path, e.g. agents/zhaogongcheng/index.html' } }, required: ['path'] }, output,
+      { name: 'computer_preview', description: 'Deliver a playable/viewable artifact (HTML game/page etc.) the Grok way: open it in the team computer\'s own browser, and tell the user to watch or take over via the 电脑 (Agent Computer) view. path is relative to the shared workspace.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Workspace-relative path, e.g. agents/zhaogongcheng/index.html' } }, required: ['path'] }, output,
         async execute(params) {
           const c = await loadComputerConfig()
           if (!c?.enabled) return 'Computer not configured'
@@ -423,11 +423,13 @@ export function apply(ctx, config = {}) {
           let p = String(params.path || '').trim().replace(/^\/+/, '')
           p = p.replace(/^home\/bot\/workspace\//, '').replace(/^workspace\//, '')
           const url = `http://127.0.0.1:${PREVIEW_PORT}/${encodeURI(p)}`
-          try {
-            const { spawn } = require('node:child_process')
-            spawn('open', [url], { detached: true, stdio: 'ignore' }).unref()
-          } catch { /* 打开失败不影响返回 URL */ }
-          return JSON.stringify({ ok: true, url, note: '已在用户浏览器打开；请把该链接也写进回复里' })
+          // Grok 语义：在团队电脑的浏览器打开，用户从「电脑」视图观看/接管
+          const r = await sshExec(c, `if ! pgrep -u "$USER" chromium >/dev/null 2>&1 || ! pgrep -f "chromium.*${p.replace(/[^a-z0-9/._-]/gi, '')}" >/dev/null 2>&1; then DISPLAY=:99 sh -c '(chromium-browser || chromium) --no-sandbox --start-maximized "${url}" >/dev/null 2>&1 &' ; fi`, 20000)
+          return JSON.stringify({
+            ok: r.ok,
+            url,
+            note: '已在团队电脑的浏览器打开。请在回复里告诉用户：打开「电脑」视图即可观看，可直接接管操作。本机也可直接访问该 URL。',
+          })
         } },
     ]
   }
@@ -614,7 +616,7 @@ export function apply(ctx, config = {}) {
     return [
       bot.persona || '你是常驻桌面 agent 团队的一员，用简体中文直接处理用户投递的任务。',
       '团队共享电脑是 Linux VM：产物一律写到 /home/bot/workspace/（相对写法 workspace/），你的个人目录 /home/bot/workspace/agents/' + bot.id + '。本机 Mac 路径不是共享电脑——不要用本地 open/写文件来交付团队产物。',
-      '交付可玩的 HTML/游戏时，用 computer_preview 工具生成预览链接（会自动在用户浏览器打开），并把链接写进回复。',
+      '交付可玩/可看的 HTML、游戏时用 computer_preview 工具：它会在团队电脑的浏览器里打开；然后告诉用户打开「电脑」视图观看或接管操作（Grok 方式）。',
       ...(bot.id === 'chief'
         ? ['你是幕僚长：团队协调者而非执行者。成员交付后你会被自动唤醒——届时派发下游工作（带上游产物路径）、催办等待者、全部完成后向群里做收尾总结。尽量把活分给成员，不要自己代做。']
         : []),
