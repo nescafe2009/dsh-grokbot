@@ -1592,7 +1592,13 @@ export function GrokbotMainView(): ReactNode {
     return () => { mo.disconnect(); window.clearInterval(timer) }
   }, [isDmConversation, target?.id])
   useEffect(() => {
-    if (!isDmConversation || nativeReady || !bot?.dshSessionId) return
+    if (!isDmConversation || nativeReady) return
+    // 无 dshSessionId（服务端预建失败等）：短暂等待后回退自家聊天视图，
+    // 不再停在「正在打开会话」（#1-3）
+    if (!bot?.dshSessionId) {
+      const t = window.setTimeout(() => { if (!nativeSessionVisible()) setOpenExhausted(true) }, 4000)
+      return () => window.clearTimeout(t)
+    }
     let attempts = 0
     const timer = window.setInterval(() => {
       if (nativeSessionVisible()) return

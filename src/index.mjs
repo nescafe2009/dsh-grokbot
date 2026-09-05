@@ -3,7 +3,7 @@ import { appendFile, mkdir, readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { loadOrCreateCrew, routeJob, botWorkspace, serializeCrew, atomicWrite, parseCrew, createBot, updateBot, removeBot, duplicateBot, createConversation, renameConversation, addConversationMember, removeConversationMember, removeConversation, upsertRoutine, removeRoutine } from './crew.mjs'
-import { ensureInbox, scanInbox, claimJob, completeJob, failJob, enqueueJob } from './inbox.mjs'
+import { ensureInbox, scanInbox, claimJob, completeJob, failJob, cancelJob, enqueueJob } from './inbox.mjs'
 import { BOT_TEMPLATES, templateById } from './templates.mjs'
 
 const API_ROOT = '/api/plugins/grokbot'
@@ -401,16 +401,54 @@ export function apply(ctx, config = {}) {
       await mirrorWorkspace(config)
     }
   }
+  // 在 VM 上启动浏览器打开 url：先解析可执行文件再传参（(a||b) --args 是非法 sh 语法），
+  // 启动后验证 chromium/chrome 进程（snap 包装器会交接给已有会话后退出，不能按包装器路径 pgrep）
+  async function launchVmBrowser(config, url) {
+    const r = await sshExec(config, [
+      'BROWSER="$(command -v chromium-browser || command -v chromium || true)"',
+      'if [ -z "$BROWSER" ]; then echo NO_BROWSER; exit 3; fi',
+      `DISPLAY=:99 "$BROWSER" --no-sandbox --start-maximized "${url}" >/dev/null 2>&1 &`,
+      'sleep 3',
+      'if pgrep -u "$USER" -f "chromium|chrome" >/dev/null 2>&1; then echo LAUNCHED; else echo LAUNCH_FAILED; fi',
+    ].join('\n'), 25000)
+    if (!r.ok) return { ok: false, error: `ssh/启动失败: ${r.text.slice(0, 200)}` }
+    if (r.text.includes('LAUNCHED')) return { ok: true }
+    if (r.text.includes('NO_BROWSER')) return { ok: false, error: '团队电脑上未找到 chromium 可执行文件' }
+    return { ok: false, error: '启动命令已执行但未检测到浏览器进程' }
+  }
+
   function computerTools(bot) {
     // render(args, value)：value 才是 execute 返回值；必须返回 ContentBlock[]
     const output = { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: String(value) }] }
     return [
       { name: 'computer_exec', description: 'Run a shell command on the team computer (Linux VM).', parameters: { type: 'object', properties: { command: { type: 'string', description: 'Shell command' } }, required: ['command'] }, output,
         async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return 'Computer not configured'; const r = await sshExec(c, params.command); return r.ok ? r.text : 'ERROR: ' + r.text } },
-      { name: 'computer_browser', description: 'Open a URL in Chromium on the team computer.', parameters: { type: 'object', properties: { url: { type: 'string', description: 'URL' } }, required: ['url'] }, output,
-        async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); await sshExec(c, 'DISPLAY=:99 chromium-browser --no-sandbox "' + params.url + '" > /dev/null 2>&1 &'); return 'Browser opened: ' + params.url } },
-      { name: 'computer_screenshot', description: 'Screenshot the team computer desktop.', parameters: { type: 'object', properties: {}, required: [] }, output,
-        async execute() { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); const r = await sshExec(c, 'DISPLAY=:99 import -window root /home/bot/workspace/screenshot.png 2>/dev/null && echo saved || echo no-tool'); return 'Screenshot saved: workspace/screenshot.png' } },
+      { name: 'computer_browser', description: 'Open a URL in Chromium on the team computer (visible in the 电脑 view).', parameters: { type: 'object', properties: { url: { type: 'string', description: 'URL' } }, required: ['url'] }, output,
+        async execute(params) {
+          const c = await loadComputerConfig()
+          if (!c?.enabled) return JSON.stringify({ error: 'not configured' })
+          const launched = await launchVmBrowser(c, String(params.url))
+          return launched.ok
+            ? `浏览器已在团队电脑打开：${params.url}（可在「电脑」视图查看/接管）`
+            : `浏览器打开失败：${launched.error}`
+        } },
+      { name: 'computer_screenshot', description: 'Screenshot the team computer desktop; returns a viewable image URL.', parameters: { type: 'object', properties: {}, required: [] }, output,
+        async execute() {
+          const c = await loadComputerConfig()
+          if (!c?.enabled) return JSON.stringify({ error: 'not configured' })
+          const path = `screenshots/${Date.now()}.png`
+          const r = await sshExec(c, [
+            'command -v scrot >/dev/null 2>&1 || { echo NO_SCROT; exit 3; }',
+            `mkdir -p /home/bot/workspace/screenshots && DISPLAY=:99 scrot /home/bot/workspace/${path}`,
+            `[ -s /home/bot/workspace/${path} ] && echo SHOT_OK || echo SHOT_EMPTY`,
+          ].join('\n'), 25000)
+          if (r.ok && r.text.includes('SHOT_OK')) {
+            await ensureComputerServices().catch(() => undefined)
+            return JSON.stringify({ ok: true, url: `http://127.0.0.1:${PREVIEW_PORT}/${path}` })
+          }
+          if (r.text.includes('NO_SCROT')) return JSON.stringify({ error: '团队电脑缺少截图工具（scrot）' })
+          return JSON.stringify({ error: `截图失败: ${r.text.slice(0, 200)}` })
+        } },
       { name: 'computer_write_file', description: 'Write a file on the team computer workspace.', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] }, output,
         async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); const r = await sshExec(c, 'mkdir -p /home/bot/workspace && cat > /home/bot/workspace/' + params.path + " <<'EOF'\n" + params.content + '\nEOF'); return r.ok ? 'File written: ' + params.path : 'Write failed: ' + r.text } },
       { name: 'computer_read_file', description: 'Read a file from the team computer workspace.', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, output,
@@ -424,11 +462,12 @@ export function apply(ctx, config = {}) {
           p = p.replace(/^home\/bot\/workspace\//, '').replace(/^workspace\//, '')
           const url = `http://127.0.0.1:${PREVIEW_PORT}/${encodeURI(p)}`
           // Grok 语义：在团队电脑的浏览器打开，用户从「电脑」视图观看/接管
-          const r = await sshExec(c, `if ! pgrep -u "$USER" chromium >/dev/null 2>&1 || ! pgrep -f "chromium.*${p.replace(/[^a-z0-9/._-]/gi, '')}" >/dev/null 2>&1; then DISPLAY=:99 sh -c '(chromium-browser || chromium) --no-sandbox --start-maximized "${url}" >/dev/null 2>&1 &' ; fi`, 20000)
-          return JSON.stringify({
-            ok: r.ok,
-            url,
+          const launched = await launchVmBrowser(c, url)
+          return JSON.stringify(launched.ok ? {
+            ok: true, url,
             note: '已在团队电脑的浏览器打开。请在回复里告诉用户：打开「电脑」视图即可观看，可直接接管操作。本机也可直接访问该 URL。',
+          } : {
+            ok: false, error: `预览打开失败：${launched.error}。URL 仍可手动访问：${url}`,
           })
         } },
     ]
@@ -1011,39 +1050,51 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  // 每 bot 回合互斥：同一 bot 的并发请求（私聊+多群+协调唤醒）串行执行，
+  // 防止 whenIdle 竞态导致交错提交与回复串话（#1-4）
+  const botTurnQueues = new Map()
+  function serializeBotTurn(botId, run) {
+    const prev = botTurnQueues.get(botId) ?? Promise.resolve()
+    const next = prev.then(run, run)
+    botTurnQueues.set(botId, next.catch(() => undefined))
+    return next
+  }
+
   async function chatTurn(bot, text, { preamble = '' } = {}) {
-    let session = chatHandles.get(bot.id)
-    if (!session) {
-      const known = chatSessionIds.get(bot.id)
-      if (known) {
-        session = await createBotAgent(bot, { sessionId: known, resume: true })
-      } else {
-        const sessionId = randomUUID()
-        chatSessionIds.set(bot.id, sessionId)
-        await persistChatSessions()
-        session = await createBotAgent(bot, { sessionId })
+    return serializeBotTurn(bot.id, async () => {
+      let session = chatHandles.get(bot.id)
+      if (!session) {
+        const known = chatSessionIds.get(bot.id)
+        if (known) {
+          session = await createBotAgent(bot, { sessionId: known, resume: true })
+        } else {
+          const sessionId = randomUUID()
+          chatSessionIds.set(bot.id, sessionId)
+          await persistChatSessions()
+          session = await createBotAgent(bot, { sessionId })
+        }
+        const actualId = session.handle.agent?.session?.id
+        if (actualId && actualId !== chatSessionIds.get(bot.id)) {
+          chatSessionIds.set(bot.id, String(actualId))
+          await persistChatSessions()
+        }
+        chatHandles.set(bot.id, session)
       }
-      const actualId = session.handle.agent?.session?.id
-      if (actualId && actualId !== chatSessionIds.get(bot.id)) {
-        chatSessionIds.set(bot.id, String(actualId))
-        await persistChatSessions()
+      await session.handle.agent.whenIdle()
+      const firstSeq = session.handle.agent.session.seq
+      session.handle.agent.followup(userMessage(preamble ? `${preamble}\n\n${text}` : text))
+      await appendDm(bot.id, { role: 'user', text: preamble ? `${preamble}\n\n${text}` : text }).catch(() => undefined)
+      await session.handle.agent.whenIdle()
+      const outcome = {
+        ...summarizeTurn(session.handle.agent.session.events, firstSeq),
+        activity: activityOf(session.handle.agent.session.events, firstSeq),
       }
-      chatHandles.set(bot.id, session)
-    }
-    await session.handle.agent.whenIdle()
-    const firstSeq = session.handle.agent.session.seq
-    session.handle.agent.followup(userMessage(preamble ? `${preamble}\n\n${text}` : text))
-    await appendDm(bot.id, { role: 'user', text: preamble ? `${preamble}\n\n${text}` : text }).catch(() => undefined)
-    await session.handle.agent.whenIdle()
-    const outcome = {
-      ...summarizeTurn(session.handle.agent.session.events, firstSeq),
-      activity: activityOf(session.handle.agent.session.events, firstSeq),
-    }
-    const dmText = outcome.text?.trim()
-    if (dmText) {
-      await appendDm(bot.id, { role: 'bot', text: dmText, activity: outcome.activity }).catch(() => undefined)
-    }
-    return outcome
+      const dmText = outcome.text?.trim()
+      if (dmText) {
+        await appendDm(bot.id, { role: 'bot', text: dmText, activity: outcome.activity }).catch(() => undefined)
+      }
+      return outcome
+    })
   }
 
   function eligibleBots(conversation) {
@@ -1253,10 +1304,11 @@ export function apply(ctx, config = {}) {
     const state = botState(bot.id)
     state.status = 'working'
     state.currentJob = job.jobId
-    runningJobs.set(job.jobId, { botId: bot.id, startedAt: Date.now() })
     let session = null
     try {
       await claimJob(job, bot.id)
+      // 保存取消句柄：stop 接口可中止后台任务（#1-5）
+      runningJobs.set(job.jobId, { botId: bot.id, startedAt: Date.now(), get abort() { return session?.abort } })
       // 工作成员在本任务中派发的子任务同样回流本群
       if (job.conversationId) activeConversationByBot.set(bot.id, job.conversationId)
       const promptText = job.text?.trim()
@@ -1639,6 +1691,17 @@ export function apply(ctx, config = {}) {
             await appendDm(bot.id, { role: 'bot', text: greeting }).catch(() => undefined)
             await saveSetup(bot.id, { stage: 'await-role' }).catch(() => undefined)
           }
+          // 立即建立 DSH session：新 bot 首聊即可走原生会话视图（#1-3），
+          // 失败不阻塞创建（客户端有 BotChatView 回退）
+          try {
+            const sessionId = randomUUID()
+            chatSessionIds.set(bot.id, sessionId)
+            await persistChatSessions()
+            const session = await createBotAgent(bot, { sessionId })
+            void session.dispose()
+          } catch (error) {
+            ctx.logger?.warn?.(`grokbot 预建 session 失败（${bot.id}）：${safeError(error)}`)
+          }
           respond(res, 201, { bot: publicBot(bot) }); return
         }
         const botMatch = /^\/bots\/([^/]+)$/.exec(suffix)
@@ -1713,11 +1776,33 @@ export function apply(ctx, config = {}) {
         const stopMatch = /^\/bots\/([^/]+)\/stop$/.exec(suffix)
         if (method === 'POST' && stopMatch) {
           const botId = decodeURIComponent(stopMatch[1])
+          const body = await readJsonBody(req).catch(() => ({}))
+          const scope = body?.scope === 'turn' ? 'turn' : 'bot'
+          let cancelledRunning = 0
+          let cancelledQueued = 0
+          // 1) 前台当前回合
           const session = chatHandles.get(botId)
           if (session) {
-            try { session.handle.agent.cancel({ kind: 'user' }, { keepInbox: true }) } catch { /* best effort */ }
+            try { session.handle.agent.cancel({ kind: 'user' }, { keepInbox: true }); cancelledRunning += 1 } catch { /* best effort */ }
           }
-          respond(res, 200, { ok: true }); return
+          if (scope === 'bot') {
+            // 2) 后台运行中的 inbox 任务：中止
+            for (const entry of runningJobs.values()) {
+              if (entry.botId !== botId) continue
+              try { entry.abort?.abort(new Error('用户停止')); cancelledRunning += 1 } catch { /* best effort */ }
+            }
+            // 3) 排队中的任务标记取消，不再派发（#1-5）
+            const remaining = []
+            for (const job of pendingJobs.splice(0)) {
+              if (routeJob(crewState.crew, job).id === botId) {
+                cancelledQueued += 1
+                await cancelJob(job, botId, '用户停止').catch(() => undefined)
+                recordRecent({ jobId: job.jobId, botId, status: 'cancelled', endedAt: Date.now() })
+              } else remaining.push(job)
+            }
+            pendingJobs.push(...remaining)
+          }
+          respond(res, 200, { ok: true, scope, cancelledRunning, cancelledQueued }); return
         }
         const historyMatch = /^\/bots\/([^/]+)\/history$/.exec(suffix)
         if (method === 'GET' && historyMatch) {

@@ -123,6 +123,18 @@ export async function failJob(job, botId, errorText) {
   })
 }
 
+export async function cancelJob(job, botId, reasonText) {
+  const claimed = await readStatusIfPresent(job.dir)
+  await writeStatus(job.dir, {
+    status: 'cancelled',
+    botId,
+    jobId: job.jobId,
+    startedAt: claimed?.startedAt ?? null,
+    endedAt: Date.now(),
+    reason: String(reasonText || 'cancelled').slice(0, 500),
+  })
+}
+
 export async function writeStatus(dir, payload) {
   await atomicWriteFile(join(dir, 'status.json'), `${JSON.stringify(payload, null, 2)}\n`)
 }
