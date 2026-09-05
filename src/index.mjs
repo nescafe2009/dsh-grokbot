@@ -771,6 +771,24 @@ export function apply(ctx, config = {}) {
     return { ...resolved, sections }
   }), 'grokbot: global persona injection')
 
+  // 原生会话工具注入：DSH 原生输入框创建的 agent（非我们 createBotAgent 驱动）
+  // 也挂上团队/电脑工具。agent/created 在 setup 完成后触发，我们自己的 agent
+  // 已由 setup 注册过，重复注册抛错直接跳过。
+  ctx.effect(() => ctx.on('agent/created', (ev) => {
+    const agent = ev?.agent ?? ev
+    if (!agent?.ctx?.tools?.register || !agent?.session?.id) return
+    let botId = null
+    for (const [bid, sid] of chatSessionIds.entries()) {
+      if (sid === agent.session.id) { botId = bid; break }
+    }
+    if (!botId) return
+    const bot = crewState.crew.bots.find((b) => b.id === botId)
+    if (!bot) return
+    for (const tool of [...teamManagementTools(bot), ...computerTools(bot)]) {
+      try { agent.ctx.tools.register(tool) } catch { /* setup 已注册 */ }
+    }
+  }), 'grokbot: native session tool injection')
+
   // 审批桥：我们创建的 agent 的工具审批交给会话内【同意/取消】卡，其余放行
   ctx.effect(() => ctx.on('approval/request', (req, next) => {
     const agentId = String(req?.agent?.id || '')
