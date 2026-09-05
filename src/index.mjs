@@ -92,7 +92,7 @@ export function apply(ctx, config = {}) {
   const stateDir = resolve(String(config.stateDir || join(process.cwd(), '.dsh-grokbot')))
   const inboxRoot = resolve(String(config.inboxDir || join(stateDir, 'inbox')))
   const maxConcurrentJobs = Math.max(1, Math.min(8, Number(config.maxConcurrentJobs) || 2))
-  const jobTimeoutMs = Math.max(30_000, Number(config.jobTimeoutMs) || 600_000)
+  const jobTimeoutMs = Math.max(30_000, Number(config.jobTimeoutMs) || 1_800_000)
   const rescanIntervalMs = Math.max(1_000, Number(config.rescanIntervalMs) || 5_000)
 
   const crewState = { path: '', crew: { routing: { default: '' }, bots: [] } }
@@ -1184,6 +1184,14 @@ export function apply(ctx, config = {}) {
         || `（无文字内容${job.images.length > 0 ? '，请查看同目录图片附件' : ''}）`
       session = await createBotAgent(bot)
       const timeout = setTimeout(() => session.abort.abort(new Error(`job timeout after ${jobTimeoutMs}ms`)), jobTimeoutMs)
+      // 长任务群内心跳：让群里知道成员还活着在干活（不触发幕僚长唤醒）
+      const startedAt = Date.now()
+      const heartbeat = job.conversationId
+        ? setInterval(() => {
+            const minutes = Math.round((Date.now() - startedAt) / 60000)
+            appendRoomMsg(job.conversationId, { role: 'system', text: `⏳ ${bot.name} 仍在处理任务（已进行 ${minutes} 分钟）…` }).catch(() => undefined)
+          }, 240_000)
+        : null
       let outcome
       try {
         await session.handle.agent.whenIdle()
@@ -1196,6 +1204,7 @@ export function apply(ctx, config = {}) {
         outcome = summarizeTurn(session.handle.agent.session.events, firstSeq)
       } finally {
         clearTimeout(timeout)
+        if (heartbeat) clearInterval(heartbeat)
       }
       const reply = outcome.text?.trim()
       // 回复回流：群任务 → 发回群里（所有人可见）；无群上下文 → 记入该成员私聊
@@ -1218,6 +1227,8 @@ export function apply(ctx, config = {}) {
         await failJob(job, bot.id, reason)
         if (job.conversationId) {
           await appendRoomMsg(job.conversationId, { role: 'system', text: `${bot.name} 任务失败：${reason}` }).catch(() => undefined)
+          // 失败也要唤醒幕僚长：重派/换人/向用户说明
+          if (bot.id !== 'chief') wakeChiefForGroup(job.conversationId)
         }
         recordRecent({ jobId: job.jobId, botId: bot.id, status: 'failed', error: reason, endedAt: Date.now() })
         ctx.logger?.warn?.(`grokbot job ${job.jobId} failed: ${reason}`)
@@ -1236,6 +1247,7 @@ export function apply(ctx, config = {}) {
       await failJob(job, bot.id, reason).catch(() => undefined)
       if (job.conversationId) {
         await appendRoomMsg(job.conversationId, { role: 'system', text: `${bot.name} 任务失败：${reason}` }).catch(() => undefined)
+        if (bot.id !== 'chief') wakeChiefForGroup(job.conversationId)
       }
       recordRecent({ jobId: job.jobId, botId: bot.id, status: 'failed', error: reason, endedAt: Date.now() })
       ctx.logger?.warn?.(`grokbot job ${job.jobId} error: ${reason}`)
