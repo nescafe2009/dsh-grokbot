@@ -343,15 +343,15 @@ export function apply(ctx, config = {}) {
     const output = { schema: { type: 'string' }, render: (r) => String(r) }
     return [
       { name: 'computer_exec', description: 'Run a shell command on the team computer (Linux VM).', parameters: { type: 'object', properties: { command: { type: 'string', description: 'Shell command' } }, required: ['command'] }, output,
-        async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'Computer not configured' }); return JSON.stringify(await sshExec(c, params.command)) } },
+        async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return 'Computer not configured'; const r = await sshExec(c, params.command); return r.ok ? r.text : 'ERROR: ' + r.text } },
       { name: 'computer_browser', description: 'Open a URL in Chromium on the team computer.', parameters: { type: 'object', properties: { url: { type: 'string', description: 'URL' } }, required: ['url'] }, output,
-        async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); await sshExec(c, 'DISPLAY=:99 chromium-browser --no-sandbox "' + params.url + '" > /dev/null 2>&1 &'); return JSON.stringify({ ok: true, action: 'browser_open', url: params.url }) } },
+        async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); await sshExec(c, 'DISPLAY=:99 chromium-browser --no-sandbox "' + params.url + '" > /dev/null 2>&1 &'); return 'Browser opened: ' + params.url } },
       { name: 'computer_screenshot', description: 'Screenshot the team computer desktop.', parameters: { type: 'object', properties: {}, required: [] }, output,
-        async execute() { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); const r = await sshExec(c, 'DISPLAY=:99 import -window root /home/bot/workspace/screenshot.png 2>/dev/null && echo saved || echo no-tool'); return JSON.stringify({ ok: r.text.includes('saved'), file: '/home/bot/workspace/screenshot.png' }) } },
+        async execute() { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); const r = await sshExec(c, 'DISPLAY=:99 import -window root /home/bot/workspace/screenshot.png 2>/dev/null && echo saved || echo no-tool'); return 'Screenshot saved: workspace/screenshot.png' } },
       { name: 'computer_write_file', description: 'Write a file on the team computer workspace.', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] }, output,
-        async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); const r = await sshExec(c, 'mkdir -p /home/bot/workspace && cat > /home/bot/workspace/' + params.path + " <<'EOF'\n" + params.content + '\nEOF'); return JSON.stringify({ ok: r.ok, path: params.path }) } },
+        async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); const r = await sshExec(c, 'mkdir -p /home/bot/workspace && cat > /home/bot/workspace/' + params.path + " <<'EOF'\n" + params.content + '\nEOF'); return r.ok ? 'File written: ' + params.path : 'Write failed: ' + r.text } },
       { name: 'computer_read_file', description: 'Read a file from the team computer workspace.', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, output,
-        async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); return JSON.stringify(await sshExec(c, 'cat /home/bot/workspace/' + params.path)) } },
+        async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); const r = await sshExec(c, 'cat /home/bot/workspace/' + params.path); return r.ok ? r.text : 'ERROR: ' + r.text } },
     ]
   }
 
@@ -384,7 +384,7 @@ export function apply(ctx, config = {}) {
         },
         output,
         async execute(params) {
-          if (bot.id !== 'chief') return JSON.stringify({ error: 'Only chief can create members' })
+          if (bot.id !== 'chief') return 'Only chief can create members'
           try {
             const newBot = createBot(crewState.crew, { name: params.name, title: params.role, persona: params.persona || '' })
             await persistCrew()
@@ -469,7 +469,7 @@ export function apply(ctx, config = {}) {
         },
         output,
         async execute(params) {
-          if (bot.id !== 'chief') return JSON.stringify({ error: 'Only chief can setup projects' })
+          if (bot.id !== 'chief') return 'Only chief can setup projects'
           const results = { created: [], group: null, tasks: [] }
           try {
             // 1. Create members
