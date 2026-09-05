@@ -20,6 +20,7 @@ interface BotInfo {
   lastAt?: number | null
   lastFrom?: string
   setupStage?: 'await-role' | 'await-name'
+  model?: { provider: string; model: string } | null
 }
 
 interface ConversationInfo {
@@ -200,6 +201,12 @@ const GROKBOT_CSS = `
 .grokbot-routine__sched { font-size:11px; color:var(--gk-text-3); margin-top:3px; }
 .grokbot-details__new { border:1px dashed rgba(37,99,235,.4); border-radius:11px; background:rgba(37,99,235,.04); color:var(--gk-accent); padding:8px; font-size:12.5px; font-weight:600; cursor:pointer; width:100%; transition:all .14s; }
 .grokbot-details__new:hover { background:var(--gk-accent-soft); border-color:var(--gk-accent-2); }
+.gk-modelbar { display:flex; align-items:center; gap:8px; padding:5px 20px; border-bottom:1px solid var(--gk-line); background:#fafafc; font-family:ui-monospace,"SF Mono",Menlo,monospace; }
+.gk-modelbar__label { font-size:9.5px; font-weight:700; color:var(--gk-text-3); letter-spacing:.1em; }
+.gk-modelbar__select { border:1px solid var(--gk-line); border-radius:6px; padding:2px 8px; font:inherit; font-size:11px; background:#fff; color:var(--gk-text); outline:none; cursor:pointer; max-width:280px; }
+.gk-modelbar__select:focus { border-color:var(--gk-accent-2); }
+.gk-modelbar__custom { font-size:9.5px; color:var(--gk-accent); font-weight:700; }
+.gk-modelbar__default { font-size:9.5px; color:var(--gk-text-3); }
 .grokbot-inputbar { display:flex; align-items:flex-end; gap:4px; padding:12px 18px 18px; }
 .grokbot-inputbar textarea { flex:1; resize:none; border:1px solid var(--gk-line); border-radius:14px; padding:11px 15px; font:inherit; font-size:13.5px; line-height:1.55; min-height:46px; max-height:150px; background:var(--gk-bg); color:var(--gk-text); transition:border-color .16s, box-shadow .16s; }
 .grokbot-inputbar textarea:focus { outline:none; border-color:var(--gk-accent-2); box-shadow:0 0 0 4px var(--gk-accent-soft); }
@@ -1084,6 +1091,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
   const [editing, setEditing] = useState(false)
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [newRoutine, setNewRoutine] = useState(false)
+  const [catalog, setCatalog] = useState<CatalogProvider[]>([])
   const [historyRefresh, forceRefresh] = useState(0)
   const logRef = useRef<HTMLDivElement | null>(null)
   const messages = useMemo(() => historyOf(bot.id), [bot.id, sending, historyRefresh])
@@ -1101,6 +1109,11 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
       forceRefresh((n) => n + 1)
     }).catch(() => undefined)
   }, [bot.id])
+
+  useEffect(() => {
+    if (catalog.length > 0) return
+    void fetchCatalog().then(setCatalog).catch(() => undefined)
+  }, [catalog.length])
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight })
@@ -1164,6 +1177,25 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
           : null}
         <button type="button" className="grokbot-iconbtn" title="编辑资料" onClick={() => setEditing((v) => !v)}>⚙</button>
         <button type="button" className="grokbot-chat__close" onClick={closeTarget} aria-label="关闭">✕</button>
+      </div>
+      <div className="gk-modelbar">
+        <span className="gk-modelbar__label">MODEL</span>
+        <select
+          className="gk-modelbar__select"
+          value={bot.model ? `${bot.model.provider}/${bot.model.model}` : ''}
+          onChange={(e) => {
+            const val = e.target.value
+            if (!val) { void api(`/bots/${encodeURIComponent(bot.id)}`, { method: 'PATCH', body: JSON.stringify({ model: null }) }).then(() => refreshState?.()).catch(() => undefined); return }
+            const [provider, model] = val.split('/')
+            void api(`/bots/${encodeURIComponent(bot.id)}`, { method: 'PATCH', body: JSON.stringify({ model: { provider, model } }) }).then(() => refreshState?.()).catch(() => undefined)
+          }}
+        >
+          <option value="">跟随团队默认</option>
+          {catalog.map((p) => p.models.map((m) => (
+            <option key={`${p.id}/${m.id}`} value={`${p.id}/${m.id}`}>{p.name} / {m.name}</option>
+          )))}
+        </select>
+        {bot.model ? <span className="gk-modelbar__custom">自定义</span> : <span className="gk-modelbar__default">默认</span>}
       </div>
       {editing ? <div style={{ padding: '0 20px' }}><BotForm initial={bot} onCancel={() => setEditing(false)} onSaved={() => setEditing(false)} /></div> : null}
       {bot.setupStage
