@@ -69,6 +69,8 @@ export async function scanInbox(inboxRoot, { limit = 50 } = {}) {
       text: promptMd.trim() || String(entry.text || jobJson?.text || '').trim(),
       images: Array.isArray(entry.images) ? entry.images.map(String) : [],
       createdAt: Number(entry.createdAt) || null,
+      ...(entry.fromBotId || jobJson?.fromBotId ? { fromBotId: String(entry.fromBotId || jobJson.fromBotId) } : {}),
+      ...(entry.conversationId || jobJson?.conversationId ? { conversationId: String(entry.conversationId || jobJson.conversationId) } : {}),
     })
     if (jobs.length >= limit) break
   }
@@ -131,11 +133,15 @@ export async function atomicWriteFile(path, text) {
   await rename(tmp, path)
 }
 
-export async function enqueueJob(inboxRoot, { jobId, toBot, text, images = [] }) {
+export async function enqueueJob(inboxRoot, { jobId, toBot, text, images = [], fromBotId, conversationId }) {
   const id = String(jobId || `job_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`)
   const dir = join(inboxRoot, id)
   await mkdir(dir, { recursive: true })
-  const payload = { jobId: id, id, text, dir, toBot: String(toBot || ''), images, createdAt: Date.now() }
+  const payload = {
+    jobId: id, id, text, dir, toBot: String(toBot || ''), images, createdAt: Date.now(),
+    ...(fromBotId ? { fromBotId: String(fromBotId) } : {}),
+    ...(conversationId ? { conversationId: String(conversationId) } : {}),
+  }
   await atomicWriteFile(join(dir, 'job.json'), `${JSON.stringify(payload, null, 2)}\n`)
   await atomicWriteFile(join(dir, 'prompt.md'), `${String(text || '').trim()}\n`)
   const queueLine = `${JSON.stringify(payload)}\n`

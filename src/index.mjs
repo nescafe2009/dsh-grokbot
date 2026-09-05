@@ -439,9 +439,19 @@ export function apply(ctx, config = {}) {
           try {
             const target = crewState.crew.bots.find((b) => b.name.includes(params.member_name) || params.member_name.includes(b.name))
             if (!target) throw new Error('Member not found: ' + params.member_name)
-            const job = await enqueueJob(inboxRoot, { toBot: target.id, text: params.task })
+            const conversationId = activeConversationByBot.get(bot.id) || undefined
+            const job = await enqueueJob(inboxRoot, {
+              toBot: target.id,
+              text: conversationId ? `[${crewState.crew.conversations?.find((c) => c.id === conversationId)?.name || '群聊'}] ${params.task}` : params.task,
+              fromBotId: bot.id,
+              ...(conversationId ? { conversationId } : {}),
+            })
             void scan()
-            return JSON.stringify({ ok: true, jobId: job.jobId, assignedTo: target.name })
+            return JSON.stringify({
+              ok: true, jobId: job.jobId, assignedTo: target.name,
+              ...(conversationId ? { replyTo: conversationId } : {}),
+              note: '任务已异步派发；成员完成后回复会自动发回' + (conversationId ? '本群' : '该成员的私聊'),
+            })
           } catch (error) { return JSON.stringify({ error: safeError(error) }) }
         },
       },
@@ -500,15 +510,21 @@ export function apply(ctx, config = {}) {
               await appendRoomMsg(conv.id, { role: 'system', text: `Group "${params.group_name}" created by ${bot.name}` })
               results.group = { id: conv.id, name: conv.name, memberCount: memberIds.length }
             }
-            // 3. Dispatch tasks
+            // 3. Dispatch tasks（携带群 id：成员完成后回复自动回流本群）
             for (let i = 0; i < params.members.length; i++) {
               const m = params.members[i]
               if (m.task && memberIds[i]) {
-                const job = await enqueueJob(inboxRoot, { toBot: memberIds[i], text: `[${params.group_name}] ${m.task}` })
+                const job = await enqueueJob(inboxRoot, {
+                  toBot: memberIds[i],
+                  text: `[${params.group_name}] ${m.task}`,
+                  fromBotId: bot.id,
+                  ...(results.group ? { conversationId: results.group.id } : {}),
+                })
                 results.tasks.push({ to: m.name, jobId: job.jobId })
               }
             }
             void scan()
+            results.note = '团队与任务已就绪；成员完成后的回复会自动发到群里。'
             return JSON.stringify(results)
           } catch (error) {
             return JSON.stringify({ ...results, error: safeError(error) })
@@ -664,6 +680,8 @@ export function apply(ctx, config = {}) {
   const activeSessions = new Set()
   const approvalBotByAgent = new Map()
   const pendingApprovals = new Map()
+  // 某个 bot 当前回合所处的会话（群 id）：工具派发的任务完成后回复回流该群
+  const activeConversationByBot = new Map()
 
   async function createBotAgent(bot, { sessionId, resume = false } = {}) {
     const abort = new AbortController()
@@ -983,6 +1001,8 @@ export function apply(ctx, config = {}) {
       .filter(Boolean)
     const responder = mentionTarget ?? pickResponder(conversation, senderText)
     if (!responder) throw new Error('群聊无可应答成员')
+    // 标记当前会话：本回合中该成员用 team_send_task 派发的任务，完成后回复回流本群
+    activeConversationByBot.set(responder.id, conversation.id)
     // 复刻 Grok：群聊上下文对所有成员可见（注入最近对话历史）
     const recentMsgs = await readRoomMsgs(conversation.id, 10)
     const historyLines = recentMsgs
@@ -1008,7 +1028,12 @@ export function apply(ctx, config = {}) {
       '\n你现在在群聊中应答。你能看到上方队友的最近发言和交接——可以接着他们的进度干活（共享电脑里的文件直接读），不要重复已完成的步骤。',
       '若你认为某条工作应由其他成员处理，在回复的最后一行单独写「@成员名 交代内容」，系统会异步转交；不要除此行外提交接。',
     ].filter(Boolean).join('\n')
-    const outcome = await chatTurn(responder, senderText, { preamble })
+    let outcome
+    try {
+      outcome = await chatTurn(responder, senderText, { preamble })
+    } finally {
+      activeConversationByBot.delete(responder.id)
+    }
     const reply = outcome.text?.trim() || `[${responder.name} 未能给出文本回复：${outcome.error || outcome.stopReason}]`
     // 解析末尾交接行 → bot↔bot 异步交接
     const lines = reply.split('\n')
@@ -1022,6 +1047,7 @@ export function apply(ctx, config = {}) {
         await appendRoomMsg(conversation.id, { role: 'bot', botId: responder.id, text: cleanReply })
         await appendRoomMsg(conversation.id, { role: 'handoff', fromBotId: responder.id, toBotId: target.id, text: handoff[2] })
         void (async () => {
+          activeConversationByBot.set(target.id, conversation.id)
           try {
             const relayPreamble = [
               `【群聊 ${conversation.name}】你收到队友 ${responder.name} 的转交任务。`,
@@ -1033,6 +1059,8 @@ export function apply(ctx, config = {}) {
             await appendRoomMsg(conversation.id, { role: 'bot', botId: target.id, text: relay.text?.trim() || '[转交处理失败]' })
           } catch (error) {
             await appendRoomMsg(conversation.id, { role: 'system', text: `转交失败：${safeError(error)}` })
+          } finally {
+            activeConversationByBot.delete(target.id)
           }
         })()
         return { responder, reply: cleanReply, handoffTo: target.id }
@@ -1080,6 +1108,8 @@ export function apply(ctx, config = {}) {
     let session = null
     try {
       await claimJob(job, bot.id)
+      // 工作成员在本任务中派发的子任务同样回流本群
+      if (job.conversationId) activeConversationByBot.set(bot.id, job.conversationId)
       const promptText = job.text?.trim()
         || `（无文字内容${job.images.length > 0 ? '，请查看同目录图片附件' : ''}）`
       session = await createBotAgent(bot)
@@ -1098,11 +1128,25 @@ export function apply(ctx, config = {}) {
         clearTimeout(timeout)
       }
       const reply = outcome.text?.trim()
+      // 回复回流：群任务 → 发回群里（所有人可见）；无群上下文 → 记入该成员私聊
+      const deliverReply = async (text) => {
+        if (job.conversationId) {
+          await appendRoomMsg(job.conversationId, { role: 'bot', botId: bot.id, text }).catch((error) => {
+            ctx.logger?.warn?.(`grokbot job ${job.jobId} 回流群聊失败：${safeError(error)}`)
+          })
+        } else {
+          await appendDm(bot.id, { role: 'user', text: `[任务] ${promptText.slice(0, 120)}` }).catch(() => undefined)
+          await appendDm(bot.id, { role: 'bot', text }).catch(() => undefined)
+        }
+      }
       if (!reply) {
         const reason = outcome.error
           ? `${outcome.error}（stopReason=${outcome.stopReason}）`
           : `stopReason=${outcome.stopReason}，无文本输出`
         await failJob(job, bot.id, reason)
+        if (job.conversationId) {
+          await appendRoomMsg(job.conversationId, { role: 'system', text: `${bot.name} 任务失败：${reason}` }).catch(() => undefined)
+        }
         recordRecent({ jobId: job.jobId, botId: bot.id, status: 'failed', error: reason, endedAt: Date.now() })
         ctx.logger?.warn?.(`grokbot job ${job.jobId} failed: ${reason}`)
       } else {
@@ -1110,6 +1154,7 @@ export function apply(ctx, config = {}) {
           ctx.logger?.warn?.(`grokbot job ${job.jobId} 回复已产出但回合报错：${outcome.error}`)
         }
         await completeJob(job, bot.id, reply)
+        await deliverReply(reply)
         await awardBot(bot.id, { expDelta: 10, tasksDoneDelta: 1 }).catch(() => undefined)
         recordRecent({ jobId: job.jobId, botId: bot.id, status: 'replied', bytes: reply.length, endedAt: Date.now() })
         ctx.logger?.info?.(`grokbot job ${job.jobId} replied by ${bot.id} (${reply.length} bytes)`)
@@ -1117,11 +1162,15 @@ export function apply(ctx, config = {}) {
     } catch (error) {
       const reason = safeError(error)
       await failJob(job, bot.id, reason).catch(() => undefined)
+      if (job.conversationId) {
+        await appendRoomMsg(job.conversationId, { role: 'system', text: `${bot.name} 任务失败：${reason}` }).catch(() => undefined)
+      }
       recordRecent({ jobId: job.jobId, botId: bot.id, status: 'failed', error: reason, endedAt: Date.now() })
       ctx.logger?.warn?.(`grokbot job ${job.jobId} error: ${reason}`)
     } finally {
       void session?.dispose()
       runningJobs.delete(job.jobId)
+      activeConversationByBot.delete(bot.id)
       state.status = 'idle'
       state.currentJob = null
       state.lastActivity = Date.now()
