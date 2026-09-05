@@ -457,7 +457,7 @@ export function apply(ctx, config = {}) {
       },
       {
         name: 'team_setup_project',
-        description: 'One-shot: create team members, create a group chat, and dispatch initial tasks. Use this instead of calling team_create_member + team_create_group + team_send_task separately.',
+        description: 'One-shot: create team members, create a group chat, and dispatch initial tasks. Use this instead of calling team_create_member + team_create_group + team_send_task separately. 派发建议：有依赖关系的工作分阶段（如 美术→工程→测试）只派第一阶段，成员交付会自动回流群里并唤醒你协调派发下游；无依赖的可同时派。',
         parameters: {
           type: 'object',
           properties: {
@@ -538,6 +538,9 @@ export function apply(ctx, config = {}) {
     return [
       bot.persona || '你是常驻桌面 agent 团队的一员，用简体中文直接处理用户投递的任务。',
       `团队共享电脑：${botWorkspace(stateDir, bot)}（全队共享）；你的个人目录：${join(botWorkspace(stateDir, bot), 'agents', bot.id)}（自己的笔记与工作产物放这里）。`,
+      ...(bot.id === 'chief'
+        ? ['你是幕僚长：团队协调者而非执行者。成员交付后你会被自动唤醒——届时派发下游工作（带上游产物路径）、催办等待者、全部完成后向群里做收尾总结。尽量把活分给成员，不要自己代做。']
+        : []),
       '只汇报真实完成的操作，不要把工具调用伪装成普通文本。',
       '消息支持 Markdown（标题/列表/代码块/链接）。想让用户快捷选择时，在回复最后一行单独写 [[选项1|选项2|选项3]]，会被渲染成可点击按钮。',
     ].join('\n')
@@ -1057,6 +1060,8 @@ export function apply(ctx, config = {}) {
             ].filter(Boolean).join('\n')
             const relay = await chatTurn(target, handoff[2], { preamble: relayPreamble })
             await appendRoomMsg(conversation.id, { role: 'bot', botId: target.id, text: relay.text?.trim() || '[转交处理失败]' })
+            // 转交交付同样唤醒幕僚长协调（与 inbox 任务回流同语义）
+            if (target.id !== 'chief') wakeChiefForGroup(conversation.id)
           } catch (error) {
             await appendRoomMsg(conversation.id, { role: 'system', text: `转交失败：${safeError(error)}` })
           } finally {
@@ -1068,6 +1073,71 @@ export function apply(ctx, config = {}) {
     }
     await appendRoomMsg(conversation.id, { role: 'bot', botId: responder.id, text: reply })
     return { responder, reply, handoffTo: null }
+  }
+
+  // ---------- 幕僚长协调：成员交付回流群后自动唤醒 ----------
+
+  const chiefWakeTimers = new Map()
+  function wakeChiefForGroup(conversationId) {
+    try {
+      const conv = crewState.crew.conversations?.find((c) => c.id === conversationId)
+      if (!conv || conv.memberBotIds?.length < 2 || !conv.memberBotIds.includes('chief')) return
+      // 防抖：短时间多条交付合并为一次协调
+      if (chiefWakeTimers.has(conversationId)) clearTimeout(chiefWakeTimers.get(conversationId))
+      chiefWakeTimers.set(conversationId, setTimeout(() => {
+        chiefWakeTimers.delete(conversationId)
+        void chiefCoordinationTurn(conversationId)
+      }, 6000))
+    } catch { /* 会话已删除等 */ }
+  }
+
+  async function chiefCoordinationTurn(conversationId, retried = 0) {
+    const chief = crewState.crew.bots.find((bot) => bot.id === 'chief')
+    const conv = crewState.crew.conversations?.find((c) => c.id === conversationId)
+    if (!chief || !conv) return
+    const state = botState(chief.id)
+    if (state.status === 'working') {
+      // 幕僚长忙（可能在处理上一轮交付）：稍后重试一次
+      if (retried < 2) setTimeout(() => void chiefCoordinationTurn(conversationId, retried + 1), 25000)
+      return
+    }
+    const msgs = await readRoomMsgs(conversationId, 12).catch(() => [])
+    const digest = msgs.slice(-6)
+      .map((msg) => {
+        if (msg.role === 'bot') {
+          const speaker = crewState.crew.bots.find((b) => b.id === msg.botId)
+          return `${speaker?.name || msg.botId}: ${String(msg.text || '').slice(0, 160)}`
+        }
+        if (msg.role === 'system') return `[系统] ${String(msg.text || '').slice(0, 120)}`
+        if (msg.role === 'handoff') return `[转交] ${msg.fromBotId} → ${msg.toBotId}: ${String(msg.text || '').slice(0, 100)}`
+        return `用户: ${String(msg.text || '').slice(0, 120)}`
+      })
+      .join('\n')
+    if (!digest) return
+    state.status = 'working'
+    activeConversationByBot.set(chief.id, conversationId)
+    try {
+      const outcome = await chatTurn(chief, [
+        `【群「${conv.name}」有新动态，幕僚长请协调】`,
+        `【群内最近消息】\n${digest}`,
+        '\n你是幕僚长，负责让这个项目走完：',
+        '1. 若有成员交付了上游产物，立即派发依赖它的下游工作（如测试/集成），用 team_send_task，把上游产物路径与要点带给下游；',
+        '2. 若有成员在等待依赖，告知其已就绪或安排替代；',
+        '3. 若全部完成，向群里做收尾总结（成果路径、测试结论、遗留事项）；',
+        '4. 无需行动时简单确认进展即可。不要自己动手做成员的活。回复简明扼要。',
+      ].join('\n'))
+      const reply = outcome.text?.trim()
+      if (reply) {
+        await appendRoomMsg(conversationId, { role: 'bot', botId: chief.id, text: reply }).catch(() => undefined)
+      }
+      ctx.logger?.info?.(`grokbot chief 协调了群 ${conv.name}`)
+    } catch (error) {
+      ctx.logger?.warn?.(`grokbot chief 协调失败：${safeError(error)}`)
+    } finally {
+      activeConversationByBot.delete(chief.id)
+      state.status = 'idle'
+      state.lastActivity = Date.now()
+    }
   }
 
   // 陈旧任务清扫：claimed 超过 2×jobTimeout 仍未出结果的，判失败释放队列
@@ -1134,6 +1204,8 @@ export function apply(ctx, config = {}) {
           await appendRoomMsg(job.conversationId, { role: 'bot', botId: bot.id, text }).catch((error) => {
             ctx.logger?.warn?.(`grokbot job ${job.jobId} 回流群聊失败：${safeError(error)}`)
           })
+          // Grok 语义：成员交付后幕僚长被唤醒，看群内进展协调下游（测试/集成/汇报）
+          if (bot.id !== 'chief') wakeChiefForGroup(job.conversationId)
         } else {
           await appendDm(bot.id, { role: 'user', text: `[任务] ${promptText.slice(0, 120)}` }).catch(() => undefined)
           await appendDm(bot.id, { role: 'bot', text }).catch(() => undefined)
