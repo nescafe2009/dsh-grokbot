@@ -129,6 +129,9 @@ const GROKBOT_CSS = `
 .grokbot-chatrow__name { font-size:13.5px; font-weight:600; letter-spacing:-.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .grokbot-chatrow__time { margin-left:auto; font-size:10.5px; color:var(--gk-text-3); flex:none; font-variant-numeric:tabular-nums; }
 .grokbot-chatrow__preview { font-size:12px; color:var(--gk-text-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.grokbot-sidebar__computer { display:flex; align-items:center; justify-content:space-between; width:100%; padding:8px 10px; border:none; border-radius:9px; background:transparent; cursor:pointer; font:inherit; font-size:13px; color:var(--gk-text); transition:background .12s; }
+.grokbot-sidebar__computer:hover { background:rgba(29,29,31,.06); }
+.grokbot-sidebar__computer-status { width:8px; height:8px; border-radius:50%; background:var(--gk-green); }
 .grokbot-sidebar__foot { border-top:1px solid var(--gk-line); padding:10px 14px; display:flex; align-items:center; gap:8px; }
 .grokbot-sidebar__user { display:flex; align-items:center; gap:8px; flex:1; min-width:0; font-size:12.5px; font-weight:600; color:var(--gk-text-2); }
 .grokbot-sidebar__user .uavatar { width:26px; height:26px; border-radius:50%; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:#fff; display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; }
@@ -403,6 +406,11 @@ function openConversation(conversationId: string): void {
       }
     }
   }
+}
+
+function openComputer(): void {
+  openTarget = { kind: 'computer' as never, id: 'computer' } as never
+  notify()
 }
 
 function openBot(botId: string): void {
@@ -866,6 +874,10 @@ export function GrokbotSidebarCrew(): ReactNode {
         })}
       </div>
       <div className="grokbot-sidebar__foot">
+        <button type="button" className="grokbot-sidebar__computer" onClick={() => openComputer()}>
+          <span>🖥️ 电脑</span>
+          <span className="grokbot-sidebar__computer-status" />
+        </button>
         <span className="grokbot-sidebar__user"><span className="uavatar">B</span>bo zhao</span>
         <button type="button" className="grokbot-iconbtn" title={routines.length > 0 ? `${routines.length} 个例行任务` : '例行任务'}>⏱</button>
       </div>
@@ -1555,6 +1567,7 @@ export function GrokbotMainView(): ReactNode {
   // 群聊：保持接管（Grok 风格覆盖层）
   // 空态/创建中：保持接管（空白页/过渡页）
   const isDmConversation = conversation && !isGroup
+  const isComputer = target?.kind === 'computer'
   const activeKey = nativeVisible || isDmConversation
     ? null
     : (target ? `conversation:${target.id}` : (creatingUi ? 'creating' : 'home'))
@@ -1595,6 +1608,7 @@ export function GrokbotMainView(): ReactNode {
       style={{ position: 'fixed', left: box.left, top: box.top, width: box.width, height: box.height, zIndex: 900 }}
     >
       {(() => {
+        if (isComputer) return <iframe src="http://127.0.0.1:6080/vnc.html?autoconnect=true" style={{ width: '100%', height: '100%', border: 'none' }} />
         if (bot) return <BotChatView bot={bot} state={state} />
         if (conversation && isGroup) return <GroupChatView conversation={conversation} bots={state?.bots ?? []} />
         if (creatingUi || entering) {
