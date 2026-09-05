@@ -624,15 +624,21 @@ export function apply(ctx, config = {}) {
 
   async function createBotAgent(bot, { sessionId, resume = false } = {}) {
     const abort = new AbortController()
-    // 只在有明确自定义时才传 agentOptions，否则让 DSH 原生界面的模型选择生效
+    // 模型优先级：bot.model > crew.defaultModel > DSH 全局默认
+    // 首次创建时必须传 agentOptions（否则 agent 不知道用什么模型）
+    // resume 时不传（让 DSH 原生界面的模型选择覆盖）
+    const fallback = typeof ctx.agentDefaultModel?.currentSelection === 'function'
+      ? ctx.agentDefaultModel.currentSelection()
+      : null
     const selection = bot.model?.provider && bot.model?.model
       ? bot.model
       : (crewState.crew.defaultModel?.provider && crewState.crew.defaultModel?.model
           ? crewState.crew.defaultModel
-          : null)
+          : (fallback?.provider && fallback?.model ? fallback : null))
     const base = {
       sessionId: sessionId || randomUUID(),
       meta: { cwd: botWorkspace(stateDir, bot) },
+      // DSH persona 模板需要 {{model}} 变量，必须始终传 agentOptions
       ...(selection ? { agentOptions: selection } : {}),
       signal: abort.signal,
       async setup(agentCtx) {
