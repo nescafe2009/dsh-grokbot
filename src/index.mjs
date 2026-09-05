@@ -340,7 +340,8 @@ export function apply(ctx, config = {}) {
     })
   }
   function computerTools(bot) {
-    const output = { schema: { type: 'string' }, render: (r) => String(r) }
+    // render(args, value)：value 才是 execute 返回值；必须返回 ContentBlock[]
+    const output = { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: String(value) }] }
     return [
       { name: 'computer_exec', description: 'Run a shell command on the team computer (Linux VM).', parameters: { type: 'object', properties: { command: { type: 'string', description: 'Shell command' } }, required: ['command'] }, output,
         async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return 'Computer not configured'; const r = await sshExec(c, params.command); return r.ok ? r.text : 'ERROR: ' + r.text } },
@@ -358,7 +359,7 @@ export function apply(ctx, config = {}) {
   function teamManagementTools(bot) {
     const output = {
       schema: { type: 'string' },
-      render: (result) => String(result),
+      render: (_args, value) => [{ type: 'text', text: String(value) }],
     }
     return [
       {
