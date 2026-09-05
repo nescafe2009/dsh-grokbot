@@ -389,6 +389,8 @@ function openConversation(conversationId: string): void {
   persistLastTarget(openTarget)
   notify()
   refreshState?.()
+  // 更新 body class：单聊释放主区，群聊保持接管
+  // 这个会在 MainView 渲染时由 activeKey 逻辑间接控制（CSS 只在 overlay 存在时生效）
 }
 
 function openBot(botId: string): void {
@@ -1529,11 +1531,24 @@ export function GrokbotMainView(): ReactNode {
     : null
   // 常驻接管：无会话时渲染自家空白页，DSH 默认首页（探索未知之境）任何情况下不再出现；
   // ⇆ 切回原生模式时释放接管。activeKey 只依赖 target，不因轮询未到位而卸载。
-  const activeKey = nativeVisible
+  // 单聊：释放主区让 DSH 原生会话视图显示（用户熟悉的 ZCode 体验）
+  // 群聊：保持接管（Grok 风格覆盖层）
+  // 空态/创建中：保持接管（空白页/过渡页）
+  const isDmConversation = conversation && !isGroup
+  const activeKey = nativeVisible || isDmConversation
     ? null
     : (target ? `conversation:${target.id}` : (creatingUi ? 'creating' : 'home'))
   const entering = Boolean(target) && !conversation
   const [box, setBox] = useState<{ left: number; top: number; width: number; height: number } | null>(null)
+
+  // 动态管理 body class：单聊释放主区（DSH 原生显示），群聊/空白保持 CSS 接管
+  useEffect(() => {
+    if (activeKey) {
+      document.body.classList.add('grokbot-takeover')
+    } else {
+      document.body.classList.remove('grokbot-takeover')
+    }
+  }, [activeKey])
 
   useEffect(() => {
     if (!activeKey) return
@@ -1597,9 +1612,8 @@ export function apply(ctx: any): void {
     order: -100,
   }, GrokbotSidebarCrew))
 
-  if (typeof document !== 'undefined' && !nativeSidebarVisible) {
-    document.body.classList.add('grokbot-takeover')
-  }
+  // body class 由 GrokbotMainView 的 activeKey effect 动态管理（单聊释放/群聊接管）
+  // 这里不再静态添加，避免单聊时 CSS 隐藏主区
 
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay',
