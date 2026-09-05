@@ -624,14 +624,12 @@ export function apply(ctx, config = {}) {
 
   async function createBotAgent(bot, { sessionId, resume = false } = {}) {
     const abort = new AbortController()
-    const fallback = typeof ctx.agentDefaultModel?.currentSelection === 'function'
-      ? ctx.agentDefaultModel.currentSelection()
-      : null
+    // 只在有明确自定义时才传 agentOptions，否则让 DSH 原生界面的模型选择生效
     const selection = bot.model?.provider && bot.model?.model
       ? bot.model
       : (crewState.crew.defaultModel?.provider && crewState.crew.defaultModel?.model
           ? crewState.crew.defaultModel
-          : (fallback?.provider && fallback?.model ? fallback : null))
+          : null)
     const base = {
       sessionId: sessionId || randomUUID(),
       meta: { cwd: botWorkspace(stateDir, bot) },
