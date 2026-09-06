@@ -1,3 +1,9 @@
+## 定位
+
+**dsh-grokbot 是一个纯 out-of-tree DSH 插件**：安装即得 Grok Bot 式的常驻团队（多专家/群聊/派发回流/幕僚长协调/任务闭环）。bots 用 DSH 原生工具在**宿主本机**毫秒级干活（本插件通过 profile patch 启用 web profile 默认禁用的 bash/fs 等执行工具，沙箱与审批沿用 DSH 原生体系）。
+
+可选配件：配置 computer.json 后获得一台团队共享电脑（Linux VM）——用于无头构建、长时任务、托管可试玩的 HTML（noVNC 观摩）。默认不启用，不影响插件本体。
+
 # dsh-grokbot
 
 在 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) 上复刻 Grok Bot 模式的常驻 agent 团队插件。

@@ -1,3 +1,15 @@
+# dsh-grokbot 的 profile 补丁层：
+# 1) 启用 web profile 默认禁用的执行工具—— bots 直接在宿主环境（用户 Mac）用
+#    DSH 原生工具毫秒级干活（沙箱按 DSH_PERMISSION_MODE，默认 workspace-write + ask 审批）
+# 2) 插入 grokbot 本体
+- id: tool-bash
+  disabled: false
+- id: tool-fs
+  disabled: false
+- id: compaction-basic
+  disabled: false
+- id: tool-jobs
+  disabled: false
 - insert:
     - id: grokbot
       name: dsh-grokbot
