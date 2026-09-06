@@ -1,0 +1,16 @@
+[Unit]
+Description=DSH Harness (grokbot cloud runtime, #3 A3)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bot
+ExecStart=/home/bot/start-dsh.sh
+Restart=always
+RestartSec=5
+Environment=HOME=/home/bot
+# 日志走 journald；Web 端口固定 8800
+
+[Install]
+WantedBy=multi-user.target

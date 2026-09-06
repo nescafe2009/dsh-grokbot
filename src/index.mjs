@@ -322,7 +322,24 @@ export function apply(ctx, config = {}) {
   async function loadComputerConfig() {
     try { return JSON.parse(await readFile(computerConfigPath, 'utf8')) } catch { return null }
   }
+  function localExec(command, timeoutMs) {
+    return new Promise((resolve) => {
+      const { spawn } = require('node:child_process')
+      const child = spawn('/bin/bash', ['-c', command], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let out = '', err = ''
+      const timer = setTimeout(() => { child.kill('SIGKILL'); resolve({ ok: false, text: 'exec timeout' }) }, timeoutMs || 30000)
+      child.stdout.on('data', (d) => { out += d })
+      child.stderr.on('data', (d) => { err += d })
+      child.on('close', (code) => {
+        clearTimeout(timer)
+        if (code === 0) resolve({ ok: true, text: out.trim() })
+        else resolve({ ok: false, text: (err || out || 'exit ' + code).trim().slice(0, 2000) })
+      })
+    })
+  }
   function sshExec(config, command, timeoutMs = 30000) {
+    // A3 本地模式：harness 跑在共享电脑上时免 SSH 直执（毫秒级）
+    if (config?.local) return localExec(command, timeoutMs)
     return new Promise((resolve) => {
       const { spawn } = require('node:child_process')
       const keyPath = config.sshKey.replace(/^~/, process.env.HOME || '')
@@ -393,6 +410,18 @@ export function apply(ctx, config = {}) {
   async function ensureComputerServices() {
     const config = await loadComputerConfig()
     if (!config?.enabled) return
+    // A3 本地模式：无隧道/镜像/远程拉起（预览 server 也是本机的，按需本地启动）
+    if (config.local) {
+      const now0 = Date.now()
+      if (now0 - lastVmHttpCheck > 300_000) {
+        lastVmHttpCheck = now0
+        const probe = await localExec(`curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:${PREVIEW_PORT}/ 2>/dev/null`, 15000).catch(() => ({ ok: false }))
+        if (!(probe.ok && probe.text.includes('200'))) {
+          await localExec(`nohup python3 -m http.server ${PREVIEW_PORT} -d ${config.workspace || '/home/bot/workspace'} >/tmp/ws-http.log 2>&1 & sleep 1`, 15000).catch(() => undefined)
+        }
+      }
+      return
+    }
     ensureTunnels(config)
     const now = Date.now()
     if (now - lastVmHttpCheck > 300_000) {
