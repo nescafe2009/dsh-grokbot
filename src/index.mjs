@@ -1114,17 +1114,16 @@ export function apply(ctx, config = {}) {
   }
 
   function eligibleBots(conversation) {
-    // 幕僚长拥有全域参与权：任何群聊中可被 @ 或交接，即使不是成员
-    const members = conversation.memberBotIds
+    // A2：群内可应答/可被转交者仅为在册成员；幕僚长不再隐式全域参与
+    // （管理团队 ≠ 加入所有群；需要时显式拉入或由群内成员 team_send_task 派发）
+    return conversation.memberBotIds
       .map((botId) => crewState.crew.bots.find((bot) => bot.id === botId))
       .filter(Boolean)
-    const chief = crewState.crew.bots.find((bot) => bot.id === 'chief')
-    if (chief && !conversation.memberBotIds.includes('chief')) return [...members, chief]
-    return members
   }
 
   function pickResponder(conversation, text) {
-    // @提及定向（Grok Bot 语义）；未提及时由默认收件人（若在群内）应答，否则首位成员
+    // @提及定向（Grok Bot 语义）；未提及时由默认收件人（若在群内）应答，否则首位成员。
+    // @到非成员：回落默认响应者，由调用方提示未派发（拒绝但不静默，A2）
     const mention = /@([\w\u4e00-\u9fa5]+)/.exec(String(text || ''))
     if (mention) {
       const hit = eligibleBots(conversation)
@@ -1150,6 +1149,11 @@ export function apply(ctx, config = {}) {
       .filter(Boolean)
     const responder = mentionTarget ?? pickResponder(conversation, senderText)
     if (!responder) throw new Error('群聊无可应答成员')
+    // @到非成员：明确提示未定向派发，由默认成员应答（拒绝但不静默，A2）
+    const userMention = /@([\w\u4e00-\u9fa5]+)/.exec(String(senderText || ''))
+    if (userMention && !mentionTarget && !eligibleBots(conversation).some((bot) => bot.name.includes(userMention[1]) || bot.id.includes(userMention[1]))) {
+      await appendRoomMsg(conversation.id, { role: 'system', text: `「@${userMention[1]}」不是本群成员，未定向派发；由 ${responder.name} 应答。` }).catch(() => undefined)
+    }
     // 复刻 Grok：群聊上下文对所有成员可见（注入最近对话历史）；
     // 上下文由 chatTurn 在互斥段内管理（#3 A1），群回合只写群 transcript
     // 复刻 Grok：群聊上下文对所有成员可见（注入最近对话历史）
@@ -1201,7 +1205,7 @@ export function apply(ctx, config = {}) {
             const relay = await chatTurn(target, handoff[2], { preamble: relayPreamble, conversationId: conversation.id, writeDm: false })
             await appendRoomMsg(conversation.id, { role: 'bot', botId: target.id, text: relay.text?.trim() || '[转交处理失败]' })
             // 转交交付同样唤醒幕僚长协调（与 inbox 任务回流同语义）
-            if (target.id !== 'chief') wakeChiefForGroup(conversation.id)
+            if (target.id !== 'chief') wakeChiefForGroup(conversation.id, responder.id)
           } catch (error) {
             await appendRoomMsg(conversation.id, { role: 'system', text: `转交失败：${safeError(error)}` })
           }
@@ -1216,14 +1220,20 @@ export function apply(ctx, config = {}) {
   // ---------- 幕僚长协调：成员交付回流群后自动唤醒 ----------
 
   const chiefWakeTimers = new Map()
-  function wakeChiefForGroup(conversationId) {
+  const chiefWakeLast = new Map()
+  function wakeChiefForGroup(conversationId, fromBotId = null) {
     try {
       const conv = crewState.crew.conversations?.find((c) => c.id === conversationId)
       if (!conv || conv.memberBotIds?.length < 2 || !conv.memberBotIds.includes('chief')) return
+      // A2 收窄：仅 chief 派发的交付触发协调回合（其他交付只落群 transcript）；
+      // 同群 60s 限频，避免交付风暴把幕僚长刷成轮询机
+      if (fromBotId && fromBotId !== 'chief') return
+      if (Date.now() - (chiefWakeLast.get(conversationId) || 0) < 60_000) return
       // 防抖：短时间多条交付合并为一次协调
       if (chiefWakeTimers.has(conversationId)) clearTimeout(chiefWakeTimers.get(conversationId))
       chiefWakeTimers.set(conversationId, setTimeout(() => {
         chiefWakeTimers.delete(conversationId)
+        chiefWakeLast.set(conversationId, Date.now())
         void chiefCoordinationTurn(conversationId)
       }, 6000))
     } catch { /* 会话已删除等 */ }
@@ -1351,7 +1361,7 @@ export function apply(ctx, config = {}) {
             ctx.logger?.warn?.(`grokbot job ${job.jobId} 回流群聊失败：${safeError(error)}`)
           })
           // Grok 语义：成员交付后幕僚长被唤醒，看群内进展协调下游（测试/集成/汇报）
-          if (bot.id !== 'chief') wakeChiefForGroup(job.conversationId)
+          if (bot.id !== 'chief') wakeChiefForGroup(job.conversationId, job.fromBotId)
         } else {
           await appendDm(bot.id, { role: 'user', text: `[任务] ${promptText.slice(0, 120)}` }).catch(() => undefined)
           await appendDm(bot.id, { role: 'bot', text }).catch(() => undefined)
@@ -1365,7 +1375,7 @@ export function apply(ctx, config = {}) {
         if (job.conversationId) {
           await appendRoomMsg(job.conversationId, { role: 'system', text: `${bot.name} 任务失败：${reason}` }).catch(() => undefined)
           // 失败也要唤醒幕僚长：重派/换人/向用户说明
-          if (bot.id !== 'chief') wakeChiefForGroup(job.conversationId)
+          if (bot.id !== 'chief') wakeChiefForGroup(job.conversationId, job.fromBotId)
         }
         recordRecent({ jobId: job.jobId, botId: bot.id, status: 'failed', error: reason, endedAt: Date.now() })
         ctx.logger?.warn?.(`grokbot job ${job.jobId} failed: ${reason}`)
@@ -1384,7 +1394,7 @@ export function apply(ctx, config = {}) {
       await failJob(job, bot.id, reason).catch(() => undefined)
       if (job.conversationId) {
         await appendRoomMsg(job.conversationId, { role: 'system', text: `${bot.name} 任务失败：${reason}` }).catch(() => undefined)
-        if (bot.id !== 'chief') wakeChiefForGroup(job.conversationId)
+        if (bot.id !== 'chief') wakeChiefForGroup(job.conversationId, job.fromBotId)
       }
       recordRecent({ jobId: job.jobId, botId: bot.id, status: 'failed', error: reason, endedAt: Date.now() })
       ctx.logger?.warn?.(`grokbot job ${job.jobId} error: ${reason}`)
@@ -1913,7 +1923,14 @@ export function apply(ctx, config = {}) {
                 }); return
               }
             }
-            const result = await conversationTurn(conversation, text)
+            // mentions[]：前端结构化 @（精确 botId，须为在册成员；A2），
+            // 未提供时回落文本 @ 解析（兼容入口）
+            let mentionTarget = null
+            if (Array.isArray(body?.mentions) && body.mentions.length > 0) {
+              const wanted = String(body.mentions[0])
+              mentionTarget = eligibleBots(conversation).find((bot) => bot.id === wanted) ?? null
+            }
+            const result = await conversationTurn(conversation, text, { mentionTarget })
             respond(res, 200, {
               responder: publicBot(result.responder),
               reply: result.reply,

@@ -112,9 +112,8 @@ export function parseCrew(text) {
     conversations = raw.rooms.map((room, i) => normalizeConversation(room, i, ids))
   }
   const routines = Array.isArray(raw?.routines) ? raw.routines.map((routine, i) => normalizeRoutine(routine, i, ids)) : []
-  if (normalized.length + conversations.length > 50) {
-    throw new Error('bots+conversations 总数已达上限 50')
-  }
+  // 上限只在创建时拦截（createBot/createConversation）；已超限的存量数据必须可读，
+  // 否则连 DELETE 都被挡住、无法自愈
   return {
     routing: { default: defaultBot },
     bots: normalized,
