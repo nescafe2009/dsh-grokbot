@@ -1657,6 +1657,23 @@ export function apply(ctx, config = {}) {
           })
           if (!recheck.ok) throw new Error(`任务校验失败（锁内复查）：${recheck.error}`)
         }
+        // 锁内复查指定成果归属：存在 + 属于该任务（有任务时）+ 来源会话匹配；不匹配即失败，不带病执行
+        if (hoPre?.artifactId) {
+          let artMeta = null
+          try { artMeta = JSON.parse(await readFile(join(stateDir, 'artifacts', hoPre.artifactId, 'meta.json'), 'utf8')) } catch { /* 不存在 */ }
+          if (!artMeta) throw new Error(`指定成果不存在：${hoPre.artifactId}`)
+          if (jobTaskIdPre) {
+            const taskNow = await getTask(stateDir, jobTaskIdPre).catch(() => null)
+            if (!taskNow || !taskNow.artifacts?.includes(hoPre.artifactId)) {
+              throw new Error(`指定成果 ${hoPre.artifactId} 不属于任务 ${jobTaskIdPre}（锁内复查）`)
+            }
+          }
+          const artConv = artMeta.conversationId
+          const expectedConv = job.conversationId || bot.id
+          if (artConv === undefined || String(artConv) !== String(expectedConv)) {
+            throw new Error(`指定成果 ${hoPre.artifactId} 来源会话不符（锁内复查）`)
+          }
+        }
         await runJobBody(job, bot, convKey4Job, jobTaskIdPre)
       },
     ).catch(async (error) => {
@@ -1759,10 +1776,13 @@ export function apply(ctx, config = {}) {
         }
         recordRecent({ jobId: job.jobId, botId: bot.id, status: 'failed', error: reason, endedAt: Date.now() })
         ctx.logger?.warn?.(`grokbot job ${job.jobId} failed: ${reason}`)
+      } else if (outcome.error) {
+        // 有部分文本但回合报错：run/job/奖励同一失败分类；部分文本可回流但明确标注失败，不加成功计数
+        await failJob(job, bot.id, `回合报错：${outcome.error}`).catch(() => undefined)
+        await deliverReply(`${reply}\n\n〔任务标记为失败：${outcome.error}；以上为部分结果〕`).catch(() => undefined)
+        recordRecent({ jobId: job.jobId, botId: bot.id, status: 'failed', error: outcome.error, endedAt: Date.now() })
+        ctx.logger?.warn?.(`grokbot job ${job.jobId} partial reply but errored: ${outcome.error}`)
       } else {
-        if (outcome.error) {
-          ctx.logger?.warn?.(`grokbot job ${job.jobId} 回复已产出但回合报错：${outcome.error}`)
-        }
         await completeJob(job, bot.id, reply)
         await deliverReply(reply)
         await awardBot(bot.id, { expDelta: 10, tasksDoneDelta: 1 }).catch(() => undefined)
