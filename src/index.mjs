@@ -505,7 +505,12 @@ export function apply(ctx, config = {}) {
         await writeFile(join(dir, 'meta.json'), JSON.stringify(meta, null, 1))
         const card = { id, name, size: meta.size, mime: meta.mime, sha256 }
         // 会话身份固定（v3）：DM 是统一实体（会话 id === botId），其余会话（含单成员群）一律写该会话 transcript
+        // 会话身份固定（v3）：DM（统一实体 conversationId === botId 或无上下文）写 DM；
+        // 群（含单成员群）写该会话；群已被删除时拒绝交付——绝不静默落入成员私聊
         const conv = (crewState.crew.conversations ?? []).find((c) => c.id === conversationId)
+        if (conversationId && conversationId !== bot.id && !conv) {
+          return `ERROR: 目标会话 ${conversationId} 已不存在（可能已被删除），已取消交付：${name}。请告知用户重新建会话后重新交付。`
+        }
         if (conv && conversationId !== bot.id) {
           await appendRoomMsg(conv.id, { role: 'bot', botId: bot.id, text: String(params?.note || `交付文件：${name}`), artifact: card })
         } else {
