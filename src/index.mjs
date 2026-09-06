@@ -1383,7 +1383,11 @@ export function apply(ctx, config = {}) {
       } finally {
         state.status = prevStatus === 'working' ? 'idle' : prevStatus
         state.currentJob = prevJob ?? null
-        if (taskId && runRef) await endRun(stateDir, taskId, runRef.id, failed ? 'failed' : 'done').catch(() => null)
+        // 关闭本回合实际活动的 run：入口带来的，或回合内 task_begin 新建的
+        const liveCtx = activeTurnCtx.get(convKey)
+        const finTaskId = runRef ? taskId : (liveCtx?.taskId ?? null)
+        const finRunId = runRef ? runRef.id : (liveCtx?.runId ?? null)
+        if (finTaskId && finRunId) await endRun(stateDir, finTaskId, finRunId, failed ? 'failed' : 'done').catch(() => null)
         setTurnCtx(convKey, null)
       }
     }))
