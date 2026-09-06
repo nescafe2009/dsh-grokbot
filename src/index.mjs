@@ -207,10 +207,13 @@ export function apply(ctx, config = {}) {
   }
 
   async function loadChatSessions() {
+    // 键为 `${conversationId}:${botId}`（A1 会话隔离）。旧格式（纯 botId，混合历史）
+    // 迁移为 DM 键：旧会话记录保留可查，群聊上下文从新映射起隔离
     try {
       const map = JSON.parse(await readFile(chatSessionsPath, 'utf8'))
-      for (const [botId, sessionId] of Object.entries(map || {})) {
-        if (typeof sessionId === 'string' && sessionId) chatSessionIds.set(botId, sessionId)
+      for (const [key, sessionId] of Object.entries(map || {})) {
+        if (typeof sessionId !== 'string' || !sessionId) continue
+        chatSessionIds.set(key.includes(':') ? key : `${key}:${key}`, sessionId)
       }
     } catch { /* 首次启动无文件 */ }
   }
@@ -556,7 +559,7 @@ export function apply(ctx, config = {}) {
           try {
             const target = crewState.crew.bots.find((b) => b.name.includes(params.member_name) || params.member_name.includes(b.name))
             if (!target) throw new Error('Member not found: ' + params.member_name)
-            const conversationId = activeConversationByBot.get(bot.id) || undefined
+            const conversationId = turnContexts.get(bot.id)?.conversationId || undefined
             const job = await enqueueJob(inboxRoot, {
               toBot: target.id,
               text: conversationId ? `[${crewState.crew.conversations?.find((c) => c.id === conversationId)?.name || '群聊'}] ${params.task}` : params.task,
@@ -801,8 +804,6 @@ export function apply(ctx, config = {}) {
   const activeSessions = new Set()
   const approvalBotByAgent = new Map()
   const pendingApprovals = new Map()
-  // 某个 bot 当前回合所处的会话（群 id）：工具派发的任务完成后回复回流该群
-  const activeConversationByBot = new Map()
 
   async function createBotAgent(bot, { sessionId, resume = false } = {}) {
     const abort = new AbortController()
@@ -878,10 +879,10 @@ export function apply(ctx, config = {}) {
     // 从 context 中提取 session/agent 信息，判断是否是我们的 bot
     const sessionId = context?.sessionId || context?.session?.id || ''
     if (!sessionId) return resolved
-    // 在 chatSessionIds 中查找对应的 botId
+    // 在 chatSessionIds（复合键 `${conversationId}:${botId}`）中查找对应 botId
     let botId = null
-    for (const [bid, sid] of chatSessionIds.entries()) {
-      if (sid === sessionId) { botId = bid; break }
+    for (const [key, sid] of chatSessionIds.entries()) {
+      if (sid === sessionId) { botId = key.split(':')[1]; break }
     }
     if (!botId) return resolved
     const bot = crewState.crew.bots.find((b) => b.id === botId)
@@ -917,8 +918,8 @@ export function apply(ctx, config = {}) {
     const agent = ev?.agent ?? ev
     if (!agent?.ctx?.tools?.register || !agent?.session?.id) return
     let botId = null
-    for (const [bid, sid] of chatSessionIds.entries()) {
-      if (sid === agent.session.id) { botId = bid; break }
+    for (const [key, sid] of chatSessionIds.entries()) {
+      if (sid === agent.session.id) { botId = key.split(':')[1]; break }
     }
     if (!botId) return
     const bot = crewState.crew.bots.find((b) => b.id === botId)
@@ -1060,40 +1061,55 @@ export function apply(ctx, config = {}) {
     return next
   }
 
-  async function chatTurn(bot, text, { preamble = '' } = {}) {
+  // 回合执行上下文（#3 A1）：在互斥段内设置/清除，工具（team_send_task 等）
+  // 从这里取当前会话归属，取代此前可被排队请求覆盖的 activeConversationByBot 单值槽
+  const turnContexts = new Map()
+  const dmConvKey = (botId) => `${botId}:${botId}`
+
+  async function chatTurn(bot, text, { preamble = '', conversationId = null, writeDm = true, taskId = null } = {}) {
+    // 会话按 (conversationId, botId) 隔离：群/私聊临时上下文互不串扰，
+    // 人格与长期记忆仍按 bot 共享（#3 A1）。DM 无显式 conversationId 时回落 DM 键。
+    const convKey = conversationId ? `${conversationId}:${bot.id}` : dmConvKey(bot.id)
     return serializeBotTurn(bot.id, async () => {
-      let session = chatHandles.get(bot.id)
-      if (!session) {
-        const known = chatSessionIds.get(bot.id)
-        if (known) {
-          session = await createBotAgent(bot, { sessionId: known, resume: true })
-        } else {
-          const sessionId = randomUUID()
-          chatSessionIds.set(bot.id, sessionId)
-          await persistChatSessions()
-          session = await createBotAgent(bot, { sessionId })
+      turnContexts.set(bot.id, { conversationId, convKey, taskId, botId: bot.id })
+      try {
+        let session = chatHandles.get(convKey)
+        if (!session) {
+          const known = chatSessionIds.get(convKey)
+          if (known) {
+            session = await createBotAgent(bot, { sessionId: known, resume: true })
+          } else {
+            const sessionId = randomUUID()
+            chatSessionIds.set(convKey, sessionId)
+            await persistChatSessions()
+            session = await createBotAgent(bot, { sessionId })
+          }
+          const actualId = session.handle.agent?.session?.id
+          if (actualId && actualId !== chatSessionIds.get(convKey)) {
+            chatSessionIds.set(convKey, String(actualId))
+            await persistChatSessions()
+          }
+          chatHandles.set(convKey, session)
         }
-        const actualId = session.handle.agent?.session?.id
-        if (actualId && actualId !== chatSessionIds.get(bot.id)) {
-          chatSessionIds.set(bot.id, String(actualId))
-          await persistChatSessions()
+        await session.handle.agent.whenIdle()
+        const firstSeq = session.handle.agent.session.seq
+        session.handle.agent.followup(userMessage(preamble ? `${preamble}\n\n${text}` : text))
+        if (writeDm) {
+          await appendDm(bot.id, { role: 'user', text: preamble ? `${preamble}\n\n${text}` : text }).catch(() => undefined)
         }
-        chatHandles.set(bot.id, session)
+        await session.handle.agent.whenIdle()
+        const outcome = {
+          ...summarizeTurn(session.handle.agent.session.events, firstSeq),
+          activity: activityOf(session.handle.agent.session.events, firstSeq),
+        }
+        const turnText = outcome.text?.trim()
+        if (turnText && writeDm) {
+          await appendDm(bot.id, { role: 'bot', text: turnText, activity: outcome.activity }).catch(() => undefined)
+        }
+        return outcome
+      } finally {
+        turnContexts.delete(bot.id)
       }
-      await session.handle.agent.whenIdle()
-      const firstSeq = session.handle.agent.session.seq
-      session.handle.agent.followup(userMessage(preamble ? `${preamble}\n\n${text}` : text))
-      await appendDm(bot.id, { role: 'user', text: preamble ? `${preamble}\n\n${text}` : text }).catch(() => undefined)
-      await session.handle.agent.whenIdle()
-      const outcome = {
-        ...summarizeTurn(session.handle.agent.session.events, firstSeq),
-        activity: activityOf(session.handle.agent.session.events, firstSeq),
-      }
-      const dmText = outcome.text?.trim()
-      if (dmText) {
-        await appendDm(bot.id, { role: 'bot', text: dmText, activity: outcome.activity }).catch(() => undefined)
-      }
-      return outcome
     })
   }
 
@@ -1126,7 +1142,7 @@ export function apply(ctx, config = {}) {
     if (conversation.memberBotIds.length === 1) {
       const bot = crewState.crew.bots.find((entry) => entry.id === conversation.memberBotIds[0])
       if (!bot) throw new Error('会话成员不存在')
-      const outcome = await chatTurn(bot, senderText)
+      const outcome = await chatTurn(bot, senderText, { conversationId: conversation.id, writeDm: true })
       return { responder: bot, reply: outcome.text?.trim() || `[${bot.name} 未能给出文本回复]`, handoffTo: null, outcome }
     }
     const members = conversation.memberBotIds
@@ -1134,8 +1150,8 @@ export function apply(ctx, config = {}) {
       .filter(Boolean)
     const responder = mentionTarget ?? pickResponder(conversation, senderText)
     if (!responder) throw new Error('群聊无可应答成员')
-    // 标记当前会话：本回合中该成员用 team_send_task 派发的任务，完成后回复回流本群
-    activeConversationByBot.set(responder.id, conversation.id)
+    // 复刻 Grok：群聊上下文对所有成员可见（注入最近对话历史）；
+    // 上下文由 chatTurn 在互斥段内管理（#3 A1），群回合只写群 transcript
     // 复刻 Grok：群聊上下文对所有成员可见（注入最近对话历史）
     const recentMsgs = await readRoomMsgs(conversation.id, 10)
     const historyLines = recentMsgs
@@ -1161,12 +1177,7 @@ export function apply(ctx, config = {}) {
       '\n你现在在群聊中应答。你能看到上方队友的最近发言和交接——可以接着他们的进度干活（共享电脑里的文件直接读），不要重复已完成的步骤。',
       '若你认为某条工作应由其他成员处理，在回复的最后一行单独写「@成员名 交代内容」，系统会异步转交；不要除此行外提交接。',
     ].filter(Boolean).join('\n')
-    let outcome
-    try {
-      outcome = await chatTurn(responder, senderText, { preamble })
-    } finally {
-      activeConversationByBot.delete(responder.id)
-    }
+    const outcome = await chatTurn(responder, senderText, { preamble, conversationId: conversation.id, writeDm: false })
     const reply = outcome.text?.trim() || `[${responder.name} 未能给出文本回复：${outcome.error || outcome.stopReason}]`
     // 解析末尾交接行 → bot↔bot 异步交接
     const lines = reply.split('\n')
@@ -1180,7 +1191,6 @@ export function apply(ctx, config = {}) {
         await appendRoomMsg(conversation.id, { role: 'bot', botId: responder.id, text: cleanReply })
         await appendRoomMsg(conversation.id, { role: 'handoff', fromBotId: responder.id, toBotId: target.id, text: handoff[2] })
         void (async () => {
-          activeConversationByBot.set(target.id, conversation.id)
           try {
             const relayPreamble = [
               `【群聊 ${conversation.name}】你收到队友 ${responder.name} 的转交任务。`,
@@ -1188,14 +1198,12 @@ export function apply(ctx, config = {}) {
               historyText,
               '\n你可以看到群里之前的进展。接着干，不要重复已完成的步骤。',
             ].filter(Boolean).join('\n')
-            const relay = await chatTurn(target, handoff[2], { preamble: relayPreamble })
+            const relay = await chatTurn(target, handoff[2], { preamble: relayPreamble, conversationId: conversation.id, writeDm: false })
             await appendRoomMsg(conversation.id, { role: 'bot', botId: target.id, text: relay.text?.trim() || '[转交处理失败]' })
             // 转交交付同样唤醒幕僚长协调（与 inbox 任务回流同语义）
             if (target.id !== 'chief') wakeChiefForGroup(conversation.id)
           } catch (error) {
             await appendRoomMsg(conversation.id, { role: 'system', text: `转交失败：${safeError(error)}` })
-          } finally {
-            activeConversationByBot.delete(target.id)
           }
         })()
         return { responder, reply: cleanReply, handoffTo: target.id }
@@ -1245,7 +1253,6 @@ export function apply(ctx, config = {}) {
       .join('\n')
     if (!digest) return
     state.status = 'working'
-    activeConversationByBot.set(chief.id, conversationId)
     try {
       const outcome = await chatTurn(chief, [
         `【群「${conv.name}」有新动态，幕僚长请协调】`,
@@ -1255,7 +1262,7 @@ export function apply(ctx, config = {}) {
         '2. 若有成员在等待依赖，告知其已就绪或安排替代；',
         '3. 若全部完成，向群里做收尾总结（成果路径、测试结论、遗留事项）；',
         '4. 无需行动时简单确认进展即可。不要自己动手做成员的活。回复简明扼要。',
-      ].join('\n'))
+      ].join('\n'), { conversationId, writeDm: false })
       const reply = outcome.text?.trim()
       if (reply) {
         await appendRoomMsg(conversationId, { role: 'bot', botId: chief.id, text: reply }).catch(() => undefined)
@@ -1264,7 +1271,6 @@ export function apply(ctx, config = {}) {
     } catch (error) {
       ctx.logger?.warn?.(`grokbot chief 协调失败：${safeError(error)}`)
     } finally {
-      activeConversationByBot.delete(chief.id)
       state.status = 'idle'
       state.lastActivity = Date.now()
     }
@@ -1309,8 +1315,8 @@ export function apply(ctx, config = {}) {
       await claimJob(job, bot.id)
       // 保存取消句柄：stop 接口可中止后台任务（#1-5）
       runningJobs.set(job.jobId, { botId: bot.id, startedAt: Date.now(), get abort() { return session?.abort } })
-      // 工作成员在本任务中派发的子任务同样回流本群
-      if (job.conversationId) activeConversationByBot.set(bot.id, job.conversationId)
+      // 工作成员在本任务中派发的子任务同样回流本群（回合上下文，A1）
+      if (job.conversationId) turnContexts.set(bot.id, { conversationId: job.conversationId, convKey: `${job.conversationId}:${bot.id}`, taskId: null, botId: bot.id })
       const promptText = job.text?.trim()
         || `（无文字内容${job.images.length > 0 ? '，请查看同目录图片附件' : ''}）`
       session = await createBotAgent(bot)
@@ -1385,7 +1391,7 @@ export function apply(ctx, config = {}) {
     } finally {
       void session?.dispose()
       runningJobs.delete(job.jobId)
-      activeConversationByBot.delete(bot.id)
+      turnContexts.delete(bot.id)
       state.status = 'idle'
       state.currentJob = null
       state.lastActivity = Date.now()
@@ -1560,7 +1566,7 @@ export function apply(ctx, config = {}) {
               }
             }
             base.roleTemplate = roleTemplate
-            base.dshSessionId = chatSessionIds.get(bot.id) || null
+            base.dshSessionId = chatSessionIds.get(`${bot.id}:${bot.id}`) || null
             base.rating = ratingOf(await loadStats(bot.id))
             const dm = await readDm(bot.id, 1)
             const last = dm[dm.length - 1]
@@ -1695,7 +1701,7 @@ export function apply(ctx, config = {}) {
           // 失败不阻塞创建（客户端有 BotChatView 回退）
           try {
             const sessionId = randomUUID()
-            chatSessionIds.set(bot.id, sessionId)
+            chatSessionIds.set(`${bot.id}:${bot.id}`, sessionId)
             await persistChatSessions()
             const session = await createBotAgent(bot, { sessionId })
             void session.dispose()
@@ -1780,9 +1786,9 @@ export function apply(ctx, config = {}) {
           const scope = body?.scope === 'turn' ? 'turn' : 'bot'
           let cancelledRunning = 0
           let cancelledQueued = 0
-          // 1) 前台当前回合
-          const session = chatHandles.get(botId)
-          if (session) {
+          // 1) 前台回合：取消该 bot 全部会话句柄（DM+各群，复合键 `conv:bot`）
+          for (const [key, session] of chatHandles.entries()) {
+            if (!key.endsWith(`:${botId}`)) continue
             try { session.handle.agent.cancel({ kind: 'user' }, { keepInbox: true }); cancelledRunning += 1 } catch { /* best effort */ }
           }
           if (scope === 'bot') {
