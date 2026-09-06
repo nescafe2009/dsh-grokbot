@@ -601,7 +601,7 @@ export function apply(ctx, config = {}) {
           await rm(dir, { recursive: true, force: true }).catch(() => undefined)
           return `ERROR: 目标会话 ${conversationId} 在交付过程中被删除，已取消并清理快照：${name}`
         }
-        const card = { id, name, size: meta.size, mime: meta.mime, sha256, ...(turnCtx?.taskId ? { taskId: turnCtx.taskId } : {}) }
+        const card = { id, name, size: meta.size, mime: meta.mime, sha256: meta.sha256, ...(turnCtx?.taskId ? { taskId: turnCtx.taskId } : {}) }
         if (where2 === 'room') {
           await appendRoomMsg(conversationId, { role: 'bot', botId: bot.id, text: String(params?.note || `交付文件：${name}`), artifact: card })
         } else {
