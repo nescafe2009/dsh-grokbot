@@ -10,6 +10,7 @@ ExecStart=/home/bot/start-dsh.sh
 Restart=always
 RestartSec=5
 Environment=HOME=/home/bot
+WorkingDirectory=/home/bot/workspace
 # 日志走 journald；Web 端口固定 8800
 
 [Install]

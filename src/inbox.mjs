@@ -1,4 +1,5 @@
 import { mkdir, readFile, writeFile, rename, stat } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
@@ -55,7 +56,10 @@ export async function scanInbox(inboxRoot, { limit = 50 } = {}) {
     }
     const jobId = String(entry.jobId || entry.id || '').trim()
     if (!jobId) continue
-    const dir = String(entry.dir || join(inboxRoot, jobId))
+    // 目录归一化：entry.dir 指向不存在的路径（如迁移前的旧机器绝对路径）时回落
+    // 本地 inbox/<jobId>，避免 claimJob 在错误位置 mkdir"复活"僵尸任务
+    const rawDir = String(entry.dir || '')
+    const dir = rawDir && existsSync(rawDir) ? rawDir : join(inboxRoot, jobId)
     const statusPath = join(dir, 'status.json')
     const status = await readJsonIfPresent(statusPath)
     if (status && status.status !== 'queued') continue

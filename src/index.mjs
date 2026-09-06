@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { loadOrCreateCrew, routeJob, botWorkspace, serializeCrew, atomicWrite, parseCrew, createBot, updateBot, removeBot, duplicateBot, createConversation, renameConversation, addConversationMember, removeConversationMember, removeConversation, upsertRoutine, removeRoutine } from './crew.mjs'
 import { ensureInbox, scanInbox, claimJob, completeJob, failJob, cancelJob, enqueueJob } from './inbox.mjs'
+import { resolveDispatchTarget, WakeScheduler } from './dispatch.mjs'
 import { BOT_TEMPLATES, templateById } from './templates.mjs'
 
 const API_ROOT = '/api/plugins/grokbot'
@@ -322,10 +323,12 @@ export function apply(ctx, config = {}) {
   async function loadComputerConfig() {
     try { return JSON.parse(await readFile(computerConfigPath, 'utf8')) } catch { return null }
   }
-  function localExec(command, timeoutMs) {
+  function localExec(config, command, timeoutMs) {
     return new Promise((resolve) => {
       const { spawn } = require('node:child_process')
-      const child = spawn('/bin/bash', ['-c', command], { stdio: ['ignore', 'pipe', 'pipe'] })
+      // 权威工作区绑定（P2）：所有本地执行显式 cwd=config.workspace，
+      // 相对路径的读写/shell/git 与原生工具、预览指向同一目录
+      const child = spawn('/bin/bash', ['-c', command], { stdio: ['ignore', 'pipe', 'pipe'], cwd: config?.workspace || undefined })
       let out = '', err = ''
       const timer = setTimeout(() => { child.kill('SIGKILL'); resolve({ ok: false, text: 'exec timeout' }) }, timeoutMs || 30000)
       child.stdout.on('data', (d) => { out += d })
@@ -339,7 +342,7 @@ export function apply(ctx, config = {}) {
   }
   function sshExec(config, command, timeoutMs = 30000) {
     // A3 本地模式：harness 跑在共享电脑上时免 SSH 直执（毫秒级）
-    if (config?.local) return localExec(command, timeoutMs)
+    if (config?.local) return localExec(config, command, timeoutMs)
     return new Promise((resolve) => {
       const { spawn } = require('node:child_process')
       const keyPath = config.sshKey.replace(/^~/, process.env.HOME || '')
@@ -471,7 +474,7 @@ export function apply(ctx, config = {}) {
           const path = `screenshots/${Date.now()}.png`
           const r = await sshExec(c, [
             'command -v scrot >/dev/null 2>&1 || { echo NO_SCROT; exit 3; }',
-            `mkdir -p /home/bot/workspace/screenshots && DISPLAY=:99 scrot /home/bot/workspace/${path}`,
+            `mkdir -p ${config.workspace || '/home/bot/workspace'}/screenshots && DISPLAY=:99 scrot ${config.workspace || '/home/bot/workspace'}/${path}`,
             `[ -s /home/bot/workspace/${path} ] && echo SHOT_OK || echo SHOT_EMPTY`,
           ].join('\n'), 25000)
           if (r.ok && r.text.includes('SHOT_OK')) {
@@ -482,9 +485,9 @@ export function apply(ctx, config = {}) {
           return JSON.stringify({ error: `截图失败: ${r.text.slice(0, 200)}` })
         } },
       { name: 'computer_write_file', description: 'Write a file on the team computer workspace.', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] }, output,
-        async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); const r = await sshExec(c, 'mkdir -p /home/bot/workspace && cat > /home/bot/workspace/' + params.path + " <<'EOF'\n" + params.content + '\nEOF'); return r.ok ? 'File written: ' + params.path : 'Write failed: ' + r.text } },
+        async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); const ws = c.workspace || '/home/bot/workspace'; const r = await sshExec(c, `mkdir -p ${ws} && cat > ${ws}/` + params.path + " <<'EOF'\n" + params.content + '\nEOF'); return r.ok ? 'File written: ' + params.path : 'Write failed: ' + r.text } },
       { name: 'computer_read_file', description: 'Read a file from the team computer workspace.', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, output,
-        async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); const r = await sshExec(c, 'cat /home/bot/workspace/' + params.path); return r.ok ? r.text : 'ERROR: ' + r.text } },
+        async execute(params) { const c = await loadComputerConfig(); if (!c?.enabled) return JSON.stringify({ error: 'not configured' }); const ws = c.workspace || '/home/bot/workspace'; const r = await sshExec(c, `cat ${ws}/` + params.path); return r.ok ? r.text : 'ERROR: ' + r.text } },
       { name: 'computer_preview', description: 'Deliver a playable/viewable artifact (HTML game/page etc.) the Grok way: open it in the team computer\'s own browser, and tell the user to watch or take over via the 电脑 (Agent Computer) view. path is relative to the shared workspace.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Workspace-relative path, e.g. agents/zhaogongcheng/index.html' } }, required: ['path'] }, output,
         async execute(params) {
           const c = await loadComputerConfig()
@@ -505,11 +508,15 @@ export function apply(ctx, config = {}) {
     ]
   }
 
-  function teamManagementTools(bot) {
+  function teamManagementTools(bot, { conversationId = null } = {}) {
+    // 上下文闭包绑定（P1-1）：本会话内派发的任务回流此群；群上下文同时是派发授权范围
     const output = {
       schema: { type: 'string' },
       render: (_args, value) => [{ type: 'text', text: String(value) }],
     }
+    const conversation = conversationId
+      ? crewState.crew.conversations?.find((c) => c.id === conversationId) ?? null
+      : null
     return [
       {
         name: 'team_list_members',
@@ -574,24 +581,25 @@ export function apply(ctx, config = {}) {
       },
       {
         name: 'team_send_task',
-        description: 'Send a task to a specific team member (async, they start immediately).',
+        description: 'Send a task to a specific team member (async, they start immediately). In a group chat the target MUST be a member of that group (authorization scope); prefer member_id for precision.',
         parameters: {
           type: 'object',
           properties: {
-            member_name: { type: 'string', description: 'Member name' },
+            member_id: { type: 'string', description: 'Exact member bot id (preferred)' },
+            member_name: { type: 'string', description: 'Member name; must match exactly one member within the authorized scope, ambiguous names are rejected' },
             task: { type: 'string', description: 'Task description' },
           },
-          required: ['member_name', 'task'],
+          required: ['task'],
         },
         output,
         async execute(params) {
           try {
-            const target = crewState.crew.bots.find((b) => b.name.includes(params.member_name) || params.member_name.includes(b.name))
-            if (!target) throw new Error('Member not found: ' + params.member_name)
-            const conversationId = turnContexts.get(bot.id)?.conversationId || undefined
+            const resolved = resolveDispatchTarget(crewState.crew.bots, conversation, params)
+            if (!resolved.ok) return JSON.stringify({ ok: false, error: resolved.error })
+            const target = resolved.bot
             const job = await enqueueJob(inboxRoot, {
               toBot: target.id,
-              text: conversationId ? `[${crewState.crew.conversations?.find((c) => c.id === conversationId)?.name || '群聊'}] ${params.task}` : params.task,
+              text: conversationId ? `[${conversation.name}] ${params.task}` : params.task,
               fromBotId: bot.id,
               ...(conversationId ? { conversationId } : {}),
             })
@@ -834,7 +842,7 @@ export function apply(ctx, config = {}) {
   const approvalBotByAgent = new Map()
   const pendingApprovals = new Map()
 
-  async function createBotAgent(bot, { sessionId, resume = false } = {}) {
+  async function createBotAgent(bot, { sessionId, resume = false, conversationId = null } = {}) {
     const abort = new AbortController()
     // 模型优先级：bot.model > crew.defaultModel > DSH 全局默认
     // 首次创建时必须传 agentOptions（否则 agent 不知道用什么模型）
@@ -861,7 +869,7 @@ export function apply(ctx, config = {}) {
         })
         await memorySections(bot, agentCtx)
         if (agentCtx.tools?.register) {
-          for (const tool of [...teamManagementTools(bot), ...computerTools(bot)]) {
+          for (const tool of [...teamManagementTools(bot, { conversationId }), ...computerTools(bot)]) {
             try {
             agentCtx.tools.register(tool)
 
@@ -941,19 +949,25 @@ export function apply(ctx, config = {}) {
   }), 'grokbot: global persona injection')
 
   // 原生会话工具注入：DSH 原生输入框创建的 agent（非我们 createBotAgent 驱动）
-  // 也挂上团队/电脑工具。agent/created 在 setup 完成后触发，我们自己的 agent
-  // 已由 setup 注册过，重复注册抛错直接跳过。
+  // 也挂上团队/电脑工具。从复合键解析 (conversationId, botId)——上下文闭包绑定（P1-1），
+  // 不再查询任何 bot 级全局槽。重复注册抛错跳过（setup 已注册）。
   ctx.effect(() => ctx.on('agent/created', (ev) => {
     const agent = ev?.agent ?? ev
     if (!agent?.ctx?.tools?.register || !agent?.session?.id) return
+    let convId = null
     let botId = null
     for (const [key, sid] of chatSessionIds.entries()) {
-      if (sid === agent.session.id) { botId = key.split(':')[1]; break }
+      if (sid === agent.session.id) {
+        const [c, b] = key.split(':')
+        convId = c === b ? null : c // DM 复合键两段相同
+        botId = b
+        break
+      }
     }
     if (!botId) return
     const bot = crewState.crew.bots.find((b) => b.id === botId)
     if (!bot) return
-    for (const tool of [...teamManagementTools(bot), ...computerTools(bot)]) {
+    for (const tool of [...teamManagementTools(bot, { conversationId: convId }), ...computerTools(bot)]) {
       try { agent.ctx.tools.register(tool) } catch { /* setup 已注册 */ }
     }
   }), 'grokbot: native session tool injection')
@@ -1090,28 +1104,23 @@ export function apply(ctx, config = {}) {
     return next
   }
 
-  // 回合执行上下文（#3 A1）：在互斥段内设置/清除，工具（team_send_task 等）
-  // 从这里取当前会话归属，取代此前可被排队请求覆盖的 activeConversationByBot 单值槽
-  const turnContexts = new Map()
-  const dmConvKey = (botId) => `${botId}:${botId}`
 
   async function chatTurn(bot, text, { preamble = '', conversationId = null, writeDm = true, taskId = null } = {}) {
     // 会话按 (conversationId, botId) 隔离：群/私聊临时上下文互不串扰，
     // 人格与长期记忆仍按 bot 共享（#3 A1）。DM 无显式 conversationId 时回落 DM 键。
-    const convKey = conversationId ? `${conversationId}:${bot.id}` : dmConvKey(bot.id)
+    const convKey = conversationId ? `${conversationId}:${bot.id}` : `${bot.id}:${bot.id}`
     return serializeBotTurn(bot.id, async () => {
-      turnContexts.set(bot.id, { conversationId, convKey, taskId, botId: bot.id })
-      try {
+      {
         let session = chatHandles.get(convKey)
         if (!session) {
           const known = chatSessionIds.get(convKey)
           if (known) {
-            session = await createBotAgent(bot, { sessionId: known, resume: true })
+            session = await createBotAgent(bot, { sessionId: known, resume: true, conversationId })
           } else {
             const sessionId = randomUUID()
             chatSessionIds.set(convKey, sessionId)
             await persistChatSessions()
-            session = await createBotAgent(bot, { sessionId })
+            session = await createBotAgent(bot, { sessionId, conversationId })
           }
           const actualId = session.handle.agent?.session?.id
           if (actualId && actualId !== chatSessionIds.get(convKey)) {
@@ -1136,8 +1145,6 @@ export function apply(ctx, config = {}) {
           await appendDm(bot.id, { role: 'bot', text: turnText, activity: outcome.activity }).catch(() => undefined)
         }
         return outcome
-      } finally {
-        turnContexts.delete(bot.id)
       }
     })
   }
@@ -1248,23 +1255,19 @@ export function apply(ctx, config = {}) {
 
   // ---------- 幕僚长协调：成员交付回流群后自动唤醒 ----------
 
-  const chiefWakeTimers = new Map()
-  const chiefWakeLast = new Map()
+  // 协调唤醒（修补批 P1-3）：严格 fromBotId === 'chief' 才触发；
+  // 限频用 WakeScheduler 合并延后——窗口内事件挂 pending 不丢弃，
+  // 当前协调回合结束后统一消费，依赖链不会因限频断掉
+  const chiefWake = new WakeScheduler({
+    intervalMs: 60_000,
+    fire: (conversationId) => { void chiefCoordinationTurn(conversationId) },
+  })
   function wakeChiefForGroup(conversationId, fromBotId = null) {
     try {
       const conv = crewState.crew.conversations?.find((c) => c.id === conversationId)
       if (!conv || conv.memberBotIds?.length < 2 || !conv.memberBotIds.includes('chief')) return
-      // A2 收窄：仅 chief 派发的交付触发协调回合（其他交付只落群 transcript）；
-      // 同群 60s 限频，避免交付风暴把幕僚长刷成轮询机
-      if (fromBotId && fromBotId !== 'chief') return
-      if (Date.now() - (chiefWakeLast.get(conversationId) || 0) < 60_000) return
-      // 防抖：短时间多条交付合并为一次协调
-      if (chiefWakeTimers.has(conversationId)) clearTimeout(chiefWakeTimers.get(conversationId))
-      chiefWakeTimers.set(conversationId, setTimeout(() => {
-        chiefWakeTimers.delete(conversationId)
-        chiefWakeLast.set(conversationId, Date.now())
-        void chiefCoordinationTurn(conversationId)
-      }, 6000))
+      if (fromBotId !== 'chief') return
+      chiefWake.request(conversationId)
     } catch { /* 会话已删除等 */ }
   }
 
@@ -1312,6 +1315,7 @@ export function apply(ctx, config = {}) {
     } finally {
       state.status = 'idle'
       state.lastActivity = Date.now()
+      chiefWake.onFired(conversationId)
     }
   }
 
@@ -1327,7 +1331,20 @@ export function apply(ctx, config = {}) {
         const jobId = String(entry.jobId || entry.id || '').trim()
         const dir = String(entry.dir || join(inboxRoot, jobId))
         let status = null
-        try { status = JSON.parse(await readFile(join(dir, 'status.json'), 'utf8')) } catch { continue }
+        try { status = JSON.parse(await readFile(join(dir, 'status.json'), 'utf8')) } catch {
+          // 无 status 的 queued 条目：超过 24h 判过期取消——防止历史僵尸占满
+          // scanInbox 的 limit 窗口导致新任务饿死（VM 迁移实测踩坑）
+          const created = Number(entry.createdAt) || 0
+          if (created && Date.now() - created > 86_400_000) {
+            const botId = String(entry.toBot || '').trim()
+            if (botId) {
+              await cancelJob({ jobId, dir }, botId, 'queued 超过 24h 未执行，清扫器过期取消')
+                .catch(() => undefined)
+              recordRecent({ jobId, botId, status: 'cancelled', endedAt: Date.now() })
+            }
+          }
+          continue
+        }
         if (status?.status !== 'claimed') continue
         // 跳过正在运行的任务（runInboxJob 可能即将完成）
         if (runningJobs.has(jobId)) continue
@@ -1354,11 +1371,10 @@ export function apply(ctx, config = {}) {
       await claimJob(job, bot.id)
       // 保存取消句柄：stop 接口可中止后台任务（#1-5）
       runningJobs.set(job.jobId, { botId: bot.id, startedAt: Date.now(), get abort() { return session?.abort } })
-      // 工作成员在本任务中派发的子任务同样回流本群（回合上下文，A1）
-      if (job.conversationId) turnContexts.set(bot.id, { conversationId: job.conversationId, convKey: `${job.conversationId}:${bot.id}`, taskId: null, botId: bot.id })
+      // 上下文随 session 闭包绑定（P1-1）：inbox 任务派发的子任务回流 job.conversationId
       const promptText = job.text?.trim()
         || `（无文字内容${job.images.length > 0 ? '，请查看同目录图片附件' : ''}）`
-      session = await createBotAgent(bot)
+      session = await createBotAgent(bot, { conversationId: job.conversationId || null })
       const timeout = setTimeout(() => session.abort.abort(new Error(`job timeout after ${jobTimeoutMs}ms`)), jobTimeoutMs)
       // 长任务群内心跳：让群里知道成员还活着在干活（不触发幕僚长唤醒）
       const startedAt = Date.now()
@@ -1430,7 +1446,6 @@ export function apply(ctx, config = {}) {
     } finally {
       void session?.dispose()
       runningJobs.delete(job.jobId)
-      turnContexts.delete(bot.id)
       state.status = 'idle'
       state.currentJob = null
       state.lastActivity = Date.now()

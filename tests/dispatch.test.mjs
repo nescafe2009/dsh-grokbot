@@ -1,0 +1,117 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { resolveDispatchTarget, WakeScheduler } from '../src/dispatch.mjs'
+
+// —— P1-2 回归：派发目标解析（授权范围 / 精确 id / 歧义拒绝）——
+
+const bots = [
+  { id: 'chief', name: '幕僚长' },
+  { id: 'w1', name: '王美琳' },
+  { id: 'w2', name: '王美术' },
+  { id: 'e1', name: '顾远航' },
+]
+const group = { id: 'g1', memberBotIds: ['w1', 'e1', 'chief'] } // 群内无 w2
+
+test('群上下文：成员精确 id 命中', () => {
+  const r = resolveDispatchTarget(bots, group, { member_id: 'w1' })
+  assert.equal(r.ok, true)
+  assert.equal(r.bot.id, 'w1')
+})
+
+test('群上下文：群外成员被拒绝（含群成员清单）', () => {
+  const r = resolveDispatchTarget(bots, group, { member_id: 'w2' })
+  assert.equal(r.ok, false)
+  assert.match(r.error, /不在授权范围/)
+  assert.match(r.error, /王美琳/)
+})
+
+test('群上下文：名字唯一命中兼容', () => {
+  const r = resolveDispatchTarget(bots, group, { member_name: '顾远航' })
+  assert.equal(r.ok, true)
+  assert.equal(r.bot.id, 'e1')
+})
+
+test('群上下文：名字歧义拒绝并列出候选 id', () => {
+  // 群内只有王美琳（w2 王美术不在群），无歧义；换用 DM 上下文制造双王歧义
+  const r = resolveDispatchTarget(bots, null, { member_name: '王美' })
+  assert.equal(r.ok, false)
+  assert.match(r.error, /歧义/)
+  assert.deepEqual(r.candidates.sort(), ['w1', 'w2'])
+})
+
+test('群上下文：群外名字不参与匹配（不因模糊而误派）', () => {
+  const r = resolveDispatchTarget(bots, group, { member_name: '王美术' })
+  assert.equal(r.ok, false)
+  assert.match(r.error, /未找到/)
+})
+
+test('DM 上下文（无会话）：全员可选', () => {
+  const r = resolveDispatchTarget(bots, null, { member_id: 'w2' })
+  assert.equal(r.ok, true)
+  assert.equal(r.bot.id, 'w2')
+})
+
+test('缺引用报错', () => {
+  const r = resolveDispatchTarget(bots, group, {})
+  assert.equal(r.ok, false)
+  assert.match(r.error, /缺少/)
+})
+
+// —— P1-3 回归：唤醒限频合并延后（不丢事件）——
+
+function makeScheduler() {
+  let now = 0
+  const fired = []
+  const timers = []
+  const wake = new WakeScheduler({
+    intervalMs: 60_000,
+    now: () => now,
+    fire: (k) => fired.push({ at: now, key: k }),
+    delay: (ms, fn) => timers.push({ at: now + ms, fn }),
+  })
+  const advance = (ms) => {
+    now += ms
+    for (let i = timers.length - 1; i >= 0; i--) {
+      if (timers[i].at <= now) { timers.splice(i, 1)[0].fn() }
+    }
+  }
+  return { wake, fired, advance, setNow: (t) => { now = t } }
+}
+
+test('窗口外事件立即触发', () => {
+  const { wake, fired } = makeScheduler()
+  assert.equal(wake.request('g1'), 'fired')
+  assert.equal(fired.length, 1)
+})
+
+test('Codex 复现场景：首次触发后 10s 的第二次事件不被丢弃', () => {
+  const { wake, fired, advance } = makeScheduler()
+  wake.request('g1')            // t=0 触发
+  wake.onFired('g1')            // 回合完成，lastFiredAt=0
+  advance(10_000)               // 10s 后新交付
+  assert.equal(wake.request('g1'), 'pending')  // 挂起而非丢弃
+  advance(50_000)               // 到达 60s 窗口尾
+  assert.equal(fired.length, 2, 'pending 事件在窗口结束后被消费')
+})
+
+test('pending 期间的新事件合并为一次', () => {
+  const { wake, fired, advance } = makeScheduler()
+  wake.request('g1')
+  wake.onFired('g1')
+  advance(10_000)
+  wake.request('g1')   // pending
+  advance(5_000)
+  wake.request('g1')   // 仍 pending（合并）
+  advance(45_000)
+  assert.equal(fired.length, 2, '两次 pending 合并为一次触发')
+})
+
+test('协调回合完成时若无 pending 不再触发', () => {
+  const { wake, fired, advance } = makeScheduler()
+  wake.request('g1')
+  wake.onFired('g1')
+  advance(120_000)
+  assert.equal(fired.length, 1)
+  wake.onFired('g1') // 无 pending 的 onFired 无副作用
+  assert.equal(fired.length, 1)
+})
