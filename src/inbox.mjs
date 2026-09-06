@@ -149,7 +149,7 @@ export async function atomicWriteFile(path, text) {
   await rename(tmp, path)
 }
 
-export async function enqueueJob(inboxRoot, { jobId, toBot, text, images = [], fromBotId, conversationId }) {
+export async function enqueueJob(inboxRoot, { jobId, toBot, text, images = [], fromBotId, conversationId, handoff = null, taskId = null }) {
   const id = String(jobId || `job_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`)
   const dir = join(inboxRoot, id)
   await mkdir(dir, { recursive: true })
@@ -157,6 +157,8 @@ export async function enqueueJob(inboxRoot, { jobId, toBot, text, images = [], f
     jobId: id, id, text, dir, toBot: String(toBot || ''), images, createdAt: Date.now(),
     ...(fromBotId ? { fromBotId: String(fromBotId) } : {}),
     ...(conversationId ? { conversationId: String(conversationId) } : {}),
+    ...(taskId ? { taskId: String(taskId) } : {}),
+    ...(handoff ? { handoff } : {}),
   }
   await atomicWriteFile(join(dir, 'job.json'), `${JSON.stringify(payload, null, 2)}\n`)
   await atomicWriteFile(join(dir, 'prompt.md'), `${String(text || '').trim()}\n`)
