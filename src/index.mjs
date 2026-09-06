@@ -564,6 +564,7 @@ export function apply(ctx, config = {}) {
         properties: {
           path: { type: 'string', description: '工作区相对路径，如 agents/xxx/index.html、report.md' },
           note: { type: 'string', description: '一句话说明这份成果（卡片标题）' },
+          task_id: { type: 'string', description: '所属任务 id（task_begin 返回的；持续任务请务必带上，卡片将提供继续修改入口）' },
         },
         required: ['path'],
       },
@@ -583,8 +584,18 @@ export function apply(ctx, config = {}) {
         if (where === 'rejected') {
           return `ERROR: 目标会话 ${conversationId} 已不存在（可能已被删除），已取消交付：${basename(real)}。请告知用户重新建会话后重新交付。`
         }
-        // R2-A：快照落盘走 delivery-core（文件层可测）；关联当前回合的 task/run
-        const turnCtx = activeTurnCtx.get(bot.id) || null
+        // R2-A：任务关联——显式 task_id 优先（校验通过后并入回合上下文），否则用回合现有上下文
+        let turnCtx = activeTurnCtx.get(bot.id) || null
+        const explicitTaskId = /^[a-z0-9-]+$/i.test(String(params?.task_id || '')) ? String(params.task_id) : ''
+        if (explicitTaskId) {
+          const task = await getTask(stateDir, explicitTaskId).catch(() => null)
+          if (!task) return `ERROR: 任务不存在：${explicitTaskId}`
+          const taskConv = task.conversationId
+          const inScope = !conversationId ? true : taskConv === conversationId
+          if (!inScope) return `ERROR: 任务 ${explicitTaskId} 不属于当前会话，拒绝关联`
+          turnCtx = { ...(turnCtx || {}), taskId: task.id, conversationId: conversationId || null }
+          setTurnCtx(bot.id, turnCtx)
+        }
         const { meta } = await createArtifactSnapshot({
           artifactsRoot: join(stateDir, 'artifacts'),
           sourceReal: real,
