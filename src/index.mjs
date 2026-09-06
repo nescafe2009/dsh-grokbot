@@ -1,11 +1,12 @@
 import { existsSync, watch } from 'node:fs'
-import { appendFile, mkdir, readFile, writeFile, copyFile, stat, realpath } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, writeFile, copyFile, stat, realpath, rm } from 'node:fs/promises'
 import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { loadOrCreateCrew, routeJob, botWorkspace, serializeCrew, atomicWrite, parseCrew, createBot, updateBot, removeBot, duplicateBot, createConversation, renameConversation, addConversationMember, removeConversationMember, removeConversation, upsertRoutine, removeRoutine } from './crew.mjs'
 import { ensureInbox, scanInbox, claimJob, completeJob, failJob, cancelJob, enqueueJob } from './inbox.mjs'
 import { resolveDispatchTarget, WakeScheduler } from './dispatch.mjs'
+import { isInsideRoot, classifyDeliveryTarget } from './delivery-core.mjs'
 import { BOT_TEMPLATES, templateById } from './templates.mjs'
 
 const API_ROOT = '/api/plugins/grokbot'
@@ -483,11 +484,14 @@ export function apply(ctx, config = {}) {
         const rootReal = await realpath(botWorkspace(stateDir, bot)).catch(() => null)
         if (!rootReal) return 'ERROR: 工作区不可用'
         const real = await realpath(resolve(rootReal, rel)).catch(() => null)
-        const relToRoot = real ? relative(rootReal, real) : null
-        const contained = relToRoot !== null && relToRoot !== '' && !relToRoot.startsWith('..') && !isAbsolute(relToRoot)
-        if (!real || !contained) return `ERROR: 文件不存在或不在工作区内：${rel}`
+        if (!real || !isInsideRoot(rootReal, real)) return `ERROR: 文件不存在或不在工作区内：${rel}`
         const st = await stat(real)
         if (!st.isFile()) return 'ERROR: 不是常规文件'
+        // 交付前校验会话目标：群已删除等场景直接拒绝，不产生孤立快照
+        const where = classifyDeliveryTarget({ conversationId, botId: bot.id, conversations: crewState.crew.conversations })
+        if (where === 'rejected') {
+          return `ERROR: 目标会话 ${conversationId} 已不存在（可能已被删除），已取消交付：${basename(real)}。请告知用户重新建会话后重新交付。`
+        }
         const id = `art-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`
         const name = basename(real)
         const dir = join(stateDir, 'artifacts', id)
@@ -503,16 +507,15 @@ export function apply(ctx, config = {}) {
           sha256, sourcePath: real, workspaceRoot: rootReal, createdAt: Date.now(),
         }
         await writeFile(join(dir, 'meta.json'), JSON.stringify(meta, null, 1))
-        const card = { id, name, size: meta.size, mime: meta.mime, sha256 }
-        // 会话身份固定（v3）：DM 是统一实体（会话 id === botId），其余会话（含单成员群）一律写该会话 transcript
-        // 会话身份固定（v3）：DM（统一实体 conversationId === botId 或无上下文）写 DM；
-        // 群（含单成员群）写该会话；群已被删除时拒绝交付——绝不静默落入成员私聊
-        const conv = (crewState.crew.conversations ?? []).find((c) => c.id === conversationId)
-        if (conversationId && conversationId !== bot.id && !conv) {
-          return `ERROR: 目标会话 ${conversationId} 已不存在（可能已被删除），已取消交付：${name}。请告知用户重新建会话后重新交付。`
+        // 写消息前最终校验：期间目标失效则清理本次快照，不留无卡片的孤立产物
+        const where2 = classifyDeliveryTarget({ conversationId, botId: bot.id, conversations: crewState.crew.conversations })
+        if (where2 === 'rejected') {
+          await rm(dir, { recursive: true, force: true }).catch(() => undefined)
+          return `ERROR: 目标会话 ${conversationId} 在交付过程中被删除，已取消并清理快照：${name}`
         }
-        if (conv && conversationId !== bot.id) {
-          await appendRoomMsg(conv.id, { role: 'bot', botId: bot.id, text: String(params?.note || `交付文件：${name}`), artifact: card })
+        const card = { id, name, size: meta.size, mime: meta.mime, sha256 }
+        if (where2 === 'room') {
+          await appendRoomMsg(conversationId, { role: 'bot', botId: bot.id, text: String(params?.note || `交付文件：${name}`), artifact: card })
         } else {
           await appendDm(bot.id, { role: 'bot', text: String(params?.note || `交付文件：${name}`), artifact: card })
         }
@@ -1772,9 +1775,7 @@ export function apply(ctx, config = {}) {
             // Finder 定位源文件：根用交付记录绑定的实际 workspace（含 bot 自定义），真实路径 + 路径段包含
             const rootReal = await realpath(meta.workspaceRoot || join(stateDir, 'workspace')).catch(() => null)
             const real = await realpath(meta.sourcePath).catch(() => null)
-            const relToRoot = rootReal && real ? relative(rootReal, real) : null
-            const contained = relToRoot !== null && relToRoot !== '' && !relToRoot.startsWith('..') && !isAbsolute(relToRoot)
-            if (!real || !contained) throw new HttpError(409, '源文件已不在交付时的工作区')
+            if (!real || !isInsideRoot(rootReal, real)) throw new HttpError(409, '源文件已不在交付时的工作区')
             await new Promise((ok, err) => spawn('open', ['-R', real], { stdio: 'ignore' }).on('exit', (code) => code === 0 ? ok() : err(new Error(`open exited ${code}`))))
             respond(res, 200, { ok: true, path: real }); return
           }
