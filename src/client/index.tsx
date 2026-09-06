@@ -1365,6 +1365,16 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
               )
             })}
         {sending ? <div className="grokbot-empty">成员思考中…</div> : null}
+        {bots.filter((b) => b.status === 'working' && room.memberBotIds.includes(b.id)).map((b) => (
+          <TaskCard
+            key={b.id}
+            title={`${b.name} 正在执行任务`}
+            status="running"
+            members={[{ name: b.name, glyph: b.avatar, desc: b.title || '使用本机工具执行', state: 'running' }]}
+            executor="本机"
+            actions={[{ label: '停止', onClick: () => { void api(`/bots/${encodeURIComponent(b.id)}/stop`, { method: 'POST' }).catch(() => undefined) } }]}
+          />
+        ))}
       </div>
       </div>
       {draftTask
