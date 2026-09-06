@@ -16,6 +16,7 @@ export const TOKENS = {
     bubbleUserText: '#ffffff',
     bubbleBot: '#eeeeee',     // AI 消息气泡 (238,238,238)
     bubbleBotText: '#1d1d1f',
+    noticeCard: '#eeeeee',    // 系统通知卡（原"实测"已撤销——系弹窗误读；取浅灰中性色，与 AI 气泡同族）,
     taskCard: '#eeeeee',      // 任务卡体（完成态实测 61% #EEE 系）
     taskCardPanel: '#ffffff', // 卡内白色子面板（按钮/代码区 32% 白）
     badgeDone: '#409050',     // 完成标记·绿 (64,144,80)
@@ -118,6 +119,8 @@ export const GKF_CSS = `
 .gkf-task__badge--done i { background:${TOKENS.color.badgeDone}; }
 .gkf-task__badge--running i { background:${TOKENS.color.badgeRunning}; animation:grokbot-pulse 1.3s ease-in-out infinite; }
 .gkf-task__badge--info i { background:${TOKENS.color.badgeInfo}; }
+.gkf-task__badge--failed i { background:${TOKENS.color.dotFail}; }
+.gkf-task__badge--interrupted i { background:${TOKENS.color.text3}; }
 .gkf-task__spacer { flex:1; }
 .gkf-task__btn { border:1px solid rgba(29,29,31,.22); border-radius:99px; padding:5px 13px; font-size:12px; font-weight:600; cursor:pointer; background:${TOKENS.color.taskCardPanel}; color:${TOKENS.color.text1}; transition:filter .12s; }
 .gkf-task__btn:hover { filter:brightness(.96); }

@@ -207,6 +207,14 @@ export function SidebarRow(props: SidebarRowProps): ReactNode {
 
 /* ---------------- MessageView ---------------- */
 
+export interface ArtifactInfo {
+  id: string
+  name: string
+  size?: number | null
+  mime?: string | null
+  sha256?: string | null
+}
+
 export interface MessageViewProps {
   role: 'user' | 'bot' | 'notice' | 'activity' | 'error'
   text: string
@@ -214,6 +222,7 @@ export interface MessageViewProps {
   senderName?: string
   senderGlyph?: string
   markdown?: boolean
+  artifact?: ArtifactInfo | null
   children?: ReactNode
 }
 
@@ -240,6 +249,20 @@ export function MessageView(props: MessageViewProps): ReactNode {
           ? <div className="gkf-msg__sender">{props.senderGlyph ? `${props.senderGlyph} ` : ''}{props.senderName}{time ? <span style={{ fontWeight: 400, color: TOKENS.color.text3, fontSize: TOKENS.font.time, marginLeft: 8 }}>{time}</span> : null}</div>
           : time ? <div className="gkf-msg__meta gkf-msg__meta--left">{time}</div> : null}
         <div className="gkf-msg__bubble">{props.markdown === false ? props.text : <MarkdownView text={props.text} />}</div>
+        {props.artifact
+          ? (
+            <ArtifactCard
+              name={props.artifact.name}
+              size={props.artifact.size ?? null}
+              mime={props.artifact.mime ?? null}
+              actions={[
+                { label: '预览', onClick: () => window.open(`/api/plugins/grokbot/artifacts/${props.artifact!.id}`, '_blank') },
+                { label: '保存副本', onClick: () => window.open(`/api/plugins/grokbot/artifacts/${props.artifact!.id}?download=1`, '_blank') },
+                { label: '在本机打开', onClick: () => { void fetch(`/api/plugins/grokbot/artifacts/${props.artifact!.id}?action=reveal`, { method: 'POST' }).catch(() => undefined) } },
+              ]}
+            />
+          )
+          : null}
         {props.children}
       </div>
     )
@@ -329,8 +352,8 @@ const STATUS_LABEL: Record<TaskStatus, { label: string; cls: string }> = {
   'waiting-you': { label: '等待你', cls: 'gkf-task__badge--running' },
   'confirm-stop': { label: '停止确认中', cls: 'gkf-task__badge--running' },
   done: { label: '已完成', cls: 'gkf-task__badge--done' },
-  failed: { label: '失败', cls: 'gkf-task__badge--done' },
-  interrupted: { label: '已中断', cls: 'gkf-task__badge--done' },
+  failed: { label: '失败', cls: 'gkf-task__badge--failed' },
+  interrupted: { label: '已中断', cls: 'gkf-task__badge--interrupted' },
 }
 
 export function TaskCard(props: TaskCardProps): ReactNode {

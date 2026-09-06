@@ -23,6 +23,20 @@ interface BotInfo {
   setupStage?: 'await-role' | 'await-name'
   model?: { provider: string; model: string } | null
   dshSessionId?: string | null
+  roleTemplate?: string | null
+  rating?: BotRating | null
+}
+
+interface BotRating {
+  level: number
+  title: string
+  stars?: number
+  exp: number
+  nextAt?: number | null
+  tasksDone: number
+  tasksFailed: number
+  thumbsUp: number
+  thumbsDown: number
 }
 
 interface ConversationInfo {
@@ -59,6 +73,15 @@ interface RoomMessage {
   toBotId?: string
   text: string
   activity?: string[]
+  artifact?: ArtifactInfo | null
+}
+
+interface ArtifactInfo {
+  id: string
+  name: string
+  size?: number | null
+  mime?: string | null
+  sha256?: string | null
 }
 
 interface ChatMessage {
@@ -66,6 +89,7 @@ interface ChatMessage {
   role: 'user' | 'bot' | 'error' | 'activity'
   text: string
   at: number
+  artifact?: ArtifactInfo | null
 }
 
 interface GrokbotState {
@@ -134,6 +158,16 @@ const GROKBOT_CSS = `
 .grokbot-sidebar__computer:hover { background:rgba(29,29,31,.06); }
 .grokbot-sidebar__computer-status { width:8px; height:8px; border-radius:50%; background:var(--gk-green); }
 .grokbot-sidebar__foot { border-top:1px solid var(--gk-line); padding:10px 14px; display:flex; align-items:center; gap:8px; }
+/* 窄窗 rail 模式：宿主折叠侧栏列（~79px）时只保留头像/图标列 */
+.grokbot-sidebar.gk-rail { overflow:hidden; }
+.gk-rail .grokbot-sidebar__search, .gk-rail .grokbot-sidebar__section, .gk-rail .gkf-row__main,
+.gk-rail .grokbot-newmenu, .gk-rail .grokbot-form, .gk-rail .grokbot-sidebar__user, .gk-rail .grokbot-avatar__dot { display:none !important; }
+.gk-rail .grokbot-sidebar__top { justify-content:center; padding:14px 4px 8px; }
+.gk-rail .grokbot-sidebar__list { padding:0 4px 8px; }
+.gk-rail .gkf-row { justify-content:center; padding:10px 2px; min-height:52px; }
+.gk-rail .grokbot-sidebar__foot { flex-direction:column; padding:8px 0; gap:10px; }
+.gk-rail .grokbot-sidebar__computer { padding:6px; font-size:0; }
+.gk-rail .grokbot-sidebar__computer-status { display:none; }
 .grokbot-sidebar__user { display:flex; align-items:center; gap:8px; flex:1; min-width:0; font-size:12.5px; font-weight:600; color:var(--gk-text-2); }
 .grokbot-sidebar__user .uavatar { width:26px; height:26px; border-radius:50%; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:#fff; display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; }
 @keyframes grokbot-pulse { 0%,100% { opacity:1; transform:scale(1) } 50% { opacity:.4; transform:scale(.85) } }
@@ -262,7 +296,7 @@ const GROKBOT_CSS = `
 
 
 
-let openTarget: { kind: 'conversation'; id: string } | null = null
+let openTarget: { kind: 'conversation' | 'computer'; id: string } | null = null
 let creatingUi = false
 let nativeSidebarVisible = false
 const listeners = new Set<() => void>()
@@ -307,7 +341,7 @@ function openConversation(conversationId: string): void {
 }
 
 function openComputer(): void {
-  openTarget = { kind: 'computer' as never, id: 'computer' } as never
+  openTarget = { kind: 'computer', id: 'computer' }
   notify()
 }
 
@@ -333,7 +367,7 @@ function toggleNativeSidebar(): void {
   notify()
 }
 
-function useOpenTarget(): { kind: 'conversation'; id: string } | null {
+function useOpenTarget(): { kind: 'conversation' | 'computer'; id: string } | null {
   const [, force] = useState(0)
   useEffect(() => {
     const listener = (): void => force((n) => n + 1)
@@ -639,6 +673,18 @@ export function GrokbotSidebarCrew(): ReactNode {
         setCreatingUi(false)
       })
   }, [creatingBot])
+  // 窄窗 rail 模式：宿主把侧栏列折叠成 ~79px 图标栏时，我们也只显示头像列（明确折叠，不压成竖排残片）
+  useEffect(() => {
+    const root = rootRef.current
+    if (!root) return
+    const apply = (): void => {
+      root.classList.toggle('gk-rail', root.getBoundingClientRect().width < 170)
+    }
+    apply()
+    const ro = new ResizeObserver(apply)
+    ro.observe(root)
+    return () => ro.disconnect()
+  }, [])
   useEffect(() => {
     if (nativeVisible) return
     const root = rootRef.current
@@ -804,7 +850,7 @@ function SetupWizard(props: { bot: BotInfo; onAdvance: () => void }): ReactNode 
 
   useEffect(() => {
     if (props.bot.setupStage !== 'await-role' || templates.length > 0) return
-    void api('/bot-templates').then((outcome) => setTemplates((outcome?.templates ?? []).filter((t: { blank?: boolean }) => !t.blank && t.id !== 'chief'))).catch(() => undefined)
+    void api('/bot-templates').then((outcome) => setTemplates((outcome?.templates ?? []).filter((t: { blank?: boolean; id?: string }) => !t.blank && t.id !== 'chief'))).catch(() => undefined)
   }, [props.bot.setupStage, templates.length])
 
   const send = useCallback(async (text: string): Promise<void> => {
@@ -1077,7 +1123,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
             if (message.role === 'bot') {
               const { body, chips } = splitChips(message.text)
               return (
-                <MessageView key={message.id} role="bot" text={body} at={message.at}>
+                <MessageView key={message.id} role="bot" text={body} at={message.at} artifact={message.artifact}>
                   {chips.length > 0
                     ? (
                       <div className="grokbot-chips">
@@ -1140,11 +1186,13 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
               {bot.rating ? (
                 <div className="grokbot-rating">
                   <div className="grokbot-rating__head">
-                    <img src={`/api/plugins/grokbot/assets/rating/badge-lv${bot.rating.level}`} width={18} height={18} alt="Lv" className="grokbot-rating__level" />
+                    <img src={`/api/plugins/grokbot/assets/rating/badge-lv${bot.rating?.level ?? 1}`} width={18} height={18} alt="Lv" className="grokbot-rating__level" />
                     <span className="grokbot-rating__title">{bot.rating.title}</span>
-                    {bot.rating.stars ? (
-                      <span className="grokbot-rating__stars">{Array.from({length:5},(_,i) => <img key={i} src={`/api/plugins/grokbot/assets/rating/star-${i < bot.rating.stars! ? 'filled' : 'empty'}`} width={12} height={12} alt="" />)}</span>
-                    ) : null}
+                    {bot.rating.stars
+                      ? (
+                        <span className="grokbot-rating__stars">{Array.from({ length: 5 }, (_, i) => <img key={i} src={`/api/plugins/grokbot/assets/rating/star-${i < (bot.rating?.stars ?? 0) ? 'filled' : 'empty'}`} width={12} height={12} alt="" />)}</span>
+                      )
+                      : null}
                   </div>
                   <div className="grokbot-rating__bar">
                     <div className="grokbot-rating__fill" style={{ width: `${bot.rating.nextAt ? Math.min(100, Math.round(100 * bot.rating.exp / bot.rating.nextAt)) : 100}%` }} />
@@ -1274,6 +1322,7 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
                   at={message.ts}
                   senderName={bot?.name ?? message.botId}
                   senderGlyph={bot?.avatar}
+                  artifact={message.artifact}
                 />
               )
             })}

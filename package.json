@@ -29,7 +29,8 @@
   "scripts": {
     "build": "tsdown --config ./tsdown.config.ts --outDir lib.tmp && rm -rf lib.old && mv lib lib.old 2>/dev/null; mv lib.tmp lib && rm -rf lib.old && echo deployed",
     "check": "node --check src/index.mjs && node --check src/crew.mjs && node --check src/inbox.mjs && node --test tests/*.test.mjs",
-    "prepublishOnly": "npm run build && npm run check"
+    "prepublishOnly": "npm run build && npm run check",
+    "typecheck": "tsc --noEmit"
   },
   "dsh": {
     "bundle": {
@@ -92,7 +93,8 @@
     }
   },
   "devDependencies": {
-    "tsdown": "0.22.2"
+    "tsdown": "0.22.2",
+    "typescript": "^5.5.0"
   },
   "engines": {
     "node": ">=22"
