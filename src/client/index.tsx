@@ -1366,6 +1366,7 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
             })}
         {sending ? <div className="grokbot-empty">成员思考中…</div> : null}
       </div>
+      </div>
       {draftTask
         ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 22px 0' }}>
@@ -1383,7 +1384,6 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
         sending={sending}
         placeholder={draftTask ? `继续修改 ${draftTask.name}（同一任务）…` : `发到 ${room.name}…（@成员名 定向）`}
       />
-      </div>
       {detailsOpen
         ? (
           <div className="grokbot-details">

@@ -5,7 +5,7 @@
  * 存储：stateDir/tasks/<taskId>.json（原子写）；同 taskId 的 run 串行（最小排队）。
  * 纯逻辑与存储，可单测；不新建执行引擎——执行仍走既有 chatTurn/inbox。
  */
-import { mkdir, readFile, writeFile, readdir } from 'node:fs/promises'
+import { mkdir, readFile, writeFile, readdir, rename } from 'node:fs/promises'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
@@ -33,7 +33,7 @@ export async function createTask(stateDir, { conversationId, ownerBotId, workspa
     artifacts: [],
   }
   await ensureTasks(stateDir)
-  await writeFile(join(tasksDir(stateDir), `${task.id}.json`), JSON.stringify(task, null, 1))
+  await atomicWriteJson(join(tasksDir(stateDir), `${task.id}.json`), task)
   return task
 }
 
@@ -64,13 +64,30 @@ export async function listTasks(stateDir, { conversationId } = {}) {
   return out.sort((a, b) => b.createdAt - a.createdAt)
 }
 
+async function atomicWriteJson(path, data) {
+  const tmp = `${path}.${randomUUID().slice(0, 8)}.tmp`
+  await writeFile(tmp, JSON.stringify(data, null, 1))
+  await rename(tmp, path)
+}
+
 async function saveTask(stateDir, task) {
   task.updatedAt = Date.now()
-  await writeFile(join(tasksDir(stateDir), `${task.id}.json`), JSON.stringify(task, null, 1))
+  await atomicWriteJson(join(tasksDir(stateDir), `${task.id}.json`), task)
   return task
 }
 
+const taskMutations = new Map()
+
+/** 同一 task 的存储变更串行（read-modify-write 不互踩）；与运行锁（withTaskLock）职责分离 */
+async function withTaskMutation(taskId, fn) {
+  const prev = taskMutations.get(taskId) ?? Promise.resolve()
+  const next = prev.then(fn, fn)
+  taskMutations.set(taskId, next.catch(() => undefined))
+  return next
+}
+
 export async function startRun(stateDir, taskId, { botId, origin, note }) {
+  return withTaskMutation(taskId, async () => {
   const task = await getTask(stateDir, taskId)
   if (!task) return null
   const run = {
@@ -86,26 +103,31 @@ export async function startRun(stateDir, taskId, { botId, origin, note }) {
   if (task.status === 'done') task.status = 'open' // 续改重开
   await saveTask(stateDir, task)
   return { task, run }
+  })
 }
 
 export async function endRun(stateDir, taskId, runId, status = 'done') {
+  return withTaskMutation(taskId, async () => {
   const task = await getTask(stateDir, taskId)
   if (!task) return null
   const run = task.runs.find((r) => r.id === runId)
   if (!run) return null
   run.endedAt = Date.now()
   run.status = ['done', 'failed', 'cancelled'].includes(status) ? status : 'done'
-  if (status === 'done' && task.runs.every((r) => r.status !== 'running')) task.status = 'done'
+  if (task.runs.every((r) => r.status !== 'running')) task.status = run.status === 'done' ? 'done' : 'open'
   await saveTask(stateDir, task)
   return { task, run }
+  })
 }
 
 export async function attachArtifact(stateDir, taskId, artifactId) {
+  return withTaskMutation(taskId, async () => {
   const task = await getTask(stateDir, taskId)
   if (!task) return null
   if (!task.artifacts.includes(artifactId)) task.artifacts.push(artifactId)
   await saveTask(stateDir, task)
   return task
+  })
 }
 
 /** 最近交付（供续改/交接注入版本引用） */
@@ -133,4 +155,28 @@ export async function withTaskLock(taskId, fn) {
   } finally {
     release()
   }
+}
+
+
+/**
+ * 执行前任务校验（所有入口共用：续改/交付/后台接力）。
+ * 规则：taskId 合法且任务存在；归属=任务会话===当前会话；
+ * 无会话上下文（DM）时仅接受无会话任务或 owner 即该 bot 的任务。
+ * getTask 注入以便测试；conversations 为 crew 会话数组（校验 DM 规范化身份）。
+ */
+export function validateTaskForContext(taskId, { conversationId, botId, getTask: loadTask }) {
+  return (async () => {
+    if (!taskId) return { ok: true, task: null }
+    if (!/^[a-z0-9-]+$/i.test(String(taskId))) return { ok: false, error: 'taskId 非法' }
+    const task = await loadTask(String(taskId)).catch(() => null)
+    if (!task) return { ok: false, error: `任务不存在：${taskId}` }
+    if (conversationId) {
+      if (task.conversationId !== conversationId) return { ok: false, error: `任务 ${taskId} 不属于当前会话（属 ${task.conversationId || 'DM/无会话'}）` }
+    } else {
+      // 无会话上下文（DM）：仅接受无会话任务且 owner 即该 bot（他人 DM 任务不放行）
+      const dmOwned = !task.conversationId && task.ownerBotId === botId
+      if (!dmOwned) return { ok: false, error: `任务 ${taskId} 不能在当前私聊上下文执行（属 ${task.conversationId || '其他成员的 DM'}）` }
+    }
+    return { ok: true, task }
+  })()
 }

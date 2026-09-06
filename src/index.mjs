@@ -7,7 +7,7 @@ import { loadOrCreateCrew, routeJob, botWorkspace, serializeCrew, atomicWrite, p
 import { ensureInbox, scanInbox, claimJob, completeJob, failJob, cancelJob, enqueueJob } from './inbox.mjs'
 import { resolveDispatchTarget, WakeScheduler } from './dispatch.mjs'
 import { isInsideRoot, classifyDeliveryTarget, createArtifactSnapshot, artifactMime } from './delivery-core.mjs'
-import { createTask, getTask, listTasks, startRun, endRun, attachArtifact, withTaskLock } from './tasks.mjs'
+import { createTask, getTask, listTasks, startRun, endRun, attachArtifact, withTaskLock, validateTaskForContext } from './tasks.mjs'
 import { BOT_TEMPLATES, templateById } from './templates.mjs'
 
 const API_ROOT = '/api/plugins/grokbot'
@@ -472,15 +472,18 @@ export function apply(ctx, config = {}) {
         },
         output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: String(value) }] },
         async execute(params) {
+          const taskConvKey = `${conversationId || bot.id}:${bot.id}`
           const task = await createTask(stateDir, {
             conversationId: conversationId || null,
             ownerBotId: bot.id,
             workspace: botWorkspace(stateDir, bot),
             title: params?.title,
           })
-          const ctx = activeTurnCtx.get(bot.id) || { conversationId }
-          setTurnCtx(bot.id, { ...ctx, taskId: task.id, conversationId: conversationId || null })
-          return JSON.stringify({ ok: true, taskId: task.id, note: '本回合及后续 deliver_file 会自动关联此任务；续改请在完成后告知用户可在卡片上「继续修改」' })
+          // 首做即建 user run（此前只在续改回合建 run，首回合产物无 run 归属）
+          const started = await startRun(stateDir, task.id, { botId: bot.id, origin: 'user', note: String(params?.title || '') }).catch(() => null)
+          const ctx = activeTurnCtx.get(taskConvKey) || { conversationId }
+          setTurnCtx(taskConvKey, { ...ctx, taskId: task.id, runId: started?.run?.id ?? null, conversationId: conversationId || null, taskWorkspace: task.workspace })
+          return JSON.stringify({ ok: true, taskId: task.id, note: '本回合及后续 deliver_file 会自动关联此任务；续改入口在成果卡片「继续修改」' })
         },
       },
       {
@@ -501,7 +504,8 @@ export function apply(ctx, config = {}) {
           const resolved = resolveDispatchTarget(crewState.crew.bots, conversation, { member_id: params?.member_id })
           if (!resolved.ok) return JSON.stringify({ ok: false, error: resolved.error })
           const target = resolved.bot
-          const turnCtx = activeTurnCtx.get(bot.id) || null
+          const hoConvKey = `${conversationId || bot.id}:${bot.id}`
+          const turnCtx = activeTurnCtx.get(hoConvKey) || null
           const taskId = String(params?.task_id || turnCtx?.taskId || '')
           let task = taskId ? await getTask(stateDir, taskId) : null
           if (taskId && !task) return JSON.stringify({ ok: false, error: `任务不存在：${taskId}` })
@@ -518,7 +522,14 @@ export function apply(ctx, config = {}) {
             let artMeta = null
             try { artMeta = JSON.parse(await readFile(metaPath, 'utf8')) } catch { /* 不存在 */ }
             if (!artMeta) return JSON.stringify({ ok: false, error: `成果不存在：${artifactId}` })
-            if (task && !task.artifacts.includes(artifactId)) return JSON.stringify({ ok: false, error: `成果 ${artifactId} 不属于任务 ${taskId}` })
+            if (task) {
+              if (!task.artifacts.includes(artifactId)) return JSON.stringify({ ok: false, error: `成果 ${artifactId} 不属于任务 ${taskId}` })
+            } else {
+              // 无任务的独立成果：校验其来源会话（新 meta 记录 conversationId；旧记录无字段则无法验证，拒绝）
+              const artConv = artMeta.conversationId || null
+              const inScope = conversationId ? String(artConv) === String(conversationId) : (!artConv || artConv === bot.id)
+              if (!inScope) return JSON.stringify({ ok: false, error: `成果 ${artifactId} 来源会话不符（无归属信息或非本会话），拒绝交接` })
+            }
           } else if (task?.artifacts?.length) {
             artifactId = task.artifacts[task.artifacts.length - 1]
           }
@@ -572,8 +583,11 @@ export function apply(ctx, config = {}) {
       async execute(params) {
         const rel = String(params?.path || '').trim().replace(/^\/+/, '')
         if (!rel || rel.split('/').includes('..')) return 'ERROR: 非法路径'
-        // 边界校验：根与目标都取真实路径，再按路径段判断包含（startsWith 会放行相邻目录）
-        const rootReal = await realpath(botWorkspace(stateDir, bot)).catch(() => null)
+        const deliverConvKey = `${conversationId || bot.id}:${bot.id}`
+        // 边界校验：根与目标都取真实路径，再按路径段判断（根=当前任务工作区，无任务回落 bot 工作区）
+        const ctxNow = activeTurnCtx.get(deliverConvKey) || null
+        const rootRaw = ctxNow?.taskWorkspace || botWorkspace(stateDir, bot)
+        const rootReal = await realpath(rootRaw).catch(() => null)
         if (!rootReal) return 'ERROR: 工作区不可用'
         const real = await realpath(resolve(rootReal, rel)).catch(() => null)
         if (!real || !isInsideRoot(rootReal, real)) return `ERROR: 文件不存在或不在工作区内：${rel}`
@@ -584,25 +598,29 @@ export function apply(ctx, config = {}) {
         if (where === 'rejected') {
           return `ERROR: 目标会话 ${conversationId} 已不存在（可能已被删除），已取消交付：${basename(real)}。请告知用户重新建会话后重新交付。`
         }
-        // R2-A：任务关联——显式 task_id 优先（校验通过后并入回合上下文），否则用回合现有上下文
-        let turnCtx = activeTurnCtx.get(bot.id) || null
-        const explicitTaskId = /^[a-z0-9-]+$/i.test(String(params?.task_id || '')) ? String(params.task_id) : ''
+        // R2-A：任务关联——显式 task_id 走共享校验（DM 上下文同样不放行任意任务），通过后并入回合上下文
+        let turnCtx = activeTurnCtx.get(deliverConvKey) || null
+        const explicitTaskId = /^[a-z0-9-]+$/i.test(String(params?.task_id || '')) ? String(params.task_id) : (turnCtx?.taskId || '')
         if (explicitTaskId) {
-          const task = await getTask(stateDir, explicitTaskId).catch(() => null)
-          if (!task) return `ERROR: 任务不存在：${explicitTaskId}`
-          const taskConv = task.conversationId
-          const inScope = !conversationId ? true : taskConv === conversationId
-          if (!inScope) return `ERROR: 任务 ${explicitTaskId} 不属于当前会话，拒绝关联`
-          turnCtx = { ...(turnCtx || {}), taskId: task.id, conversationId: conversationId || null }
-          setTurnCtx(bot.id, turnCtx)
+          const chk = await validateTaskForContext(explicitTaskId, {
+            conversationId: conversationId || null,
+            botId: bot.id,
+            getTask: (id) => getTask(stateDir, id),
+          })
+          if (!chk.ok) return `ERROR: ${chk.error}`
+          // 显式换任务时重置 runId（run 归属由 taskId 保证，避免沿用另一任务的旧 runId）
+          turnCtx = { ...(turnCtx || {}), taskId: chk.task.id, runId: chk.task.id === (turnCtx?.taskId || null) ? (turnCtx?.runId ?? null) : null, conversationId: conversationId || null, taskWorkspace: chk.task.workspace || null }
+          setTurnCtx(deliverConvKey, turnCtx)
         }
         const { meta } = await createArtifactSnapshot({
           artifactsRoot: join(stateDir, 'artifacts'),
           sourceReal: real,
           workspaceRoot: rootReal,
-          extra: turnCtx ? { taskId: turnCtx.taskId, runId: turnCtx.runId } : {},
+          extra: {
+            conversationId: conversationId || bot.id,
+            ...(turnCtx ? { taskId: turnCtx.taskId, runId: turnCtx.runId } : {}),
+          },
         })
-        if (turnCtx?.taskId) await attachArtifact(stateDir, turnCtx.taskId, meta.id).catch(() => null)
         const name = meta.name
         const id = meta.id
         const dir = join(stateDir, 'artifacts', id)
@@ -612,6 +630,7 @@ export function apply(ctx, config = {}) {
           await rm(dir, { recursive: true, force: true }).catch(() => undefined)
           return `ERROR: 目标会话 ${conversationId} 在交付过程中被删除，已取消并清理快照：${name}`
         }
+        if (turnCtx?.taskId) await attachArtifact(stateDir, turnCtx.taskId, meta.id).catch(() => null)
         const card = { id, name, size: meta.size, mime: meta.mime, sha256: meta.sha256, ...(turnCtx?.taskId ? { taskId: turnCtx.taskId } : {}) }
         if (where2 === 'room') {
           await appendRoomMsg(conversationId, { role: 'bot', botId: bot.id, text: String(params?.note || `交付文件：${name}`), artifact: card })
@@ -1024,7 +1043,7 @@ export function apply(ctx, config = {}) {
   const approvalBotByAgent = new Map()
   const pendingApprovals = new Map()
 
-  async function createBotAgent(bot, { sessionId, resume = false, conversationId = null } = {}) {
+  async function createBotAgent(bot, { sessionId, resume = false, conversationId = null, cwd = null } = {}) {
     const abort = new AbortController()
     // 模型优先级：bot.model > crew.defaultModel > DSH 全局默认
     // 首次创建时必须传 agentOptions（否则 agent 不知道用什么模型）
@@ -1039,7 +1058,7 @@ export function apply(ctx, config = {}) {
           : (fallback?.provider && fallback?.model ? fallback : null))
     const base = {
       sessionId: sessionId || randomUUID(),
-      meta: { cwd: botWorkspace(stateDir, bot) },
+      meta: { cwd: cwd || botWorkspace(stateDir, bot) },
       // DSH persona 模板需要 {{model}} 变量，必须始终传 agentOptions
       ...(selection ? { agentOptions: selection } : {}),
       signal: abort.signal,
@@ -1288,10 +1307,24 @@ export function apply(ctx, config = {}) {
 
 
   async function chatTurn(bot, text, { preamble = '', conversationId = null, writeDm = true, taskId = null, taskOrigin = 'continue', taskNote = '', existingRunId = null } = {}) {
-    // 会话按 (conversationId, botId) 隔离：群/私聊临时上下文互不串扰，
-    // 人格与长期记忆仍按 bot 共享（#3 A1）。DM 无显式 conversationId 时回落 DM 键。
+    // 会话按 (conversationId, botId) 隔离；人格与长期记忆按 bot 共享（#3 A1）
     const convKey = conversationId ? `${conversationId}:${bot.id}` : `${bot.id}:${bot.id}`
-    // R2-A：同任务串行（最小排队），跨任务并行；无任务不排队
+    // R2-A 执行前共享校验：任务存在 + 会话归属（失败不启动 run/模型/文件动作）
+    const check = await validateTaskForContext(taskId, {
+      conversationId: conversationId || null,
+      botId: bot.id,
+      getTask: (id) => getTask(stateDir, id),
+    })
+    if (!check.ok) {
+      return { text: `[任务校验失败] ${check.error}`, activity: [], error: check.error }
+    }
+    const task = check.task
+    // 任务 workspace 作为本次执行根（与默认不同则用独立 session，避免旧 session cwd 不符）
+    const defaultWs = botWorkspace(stateDir, bot)
+    const taskWs = task?.workspace || null
+    const wsKey = taskWs && taskWs !== defaultWs ? `|ws:${taskWs}` : ''
+    const sessionKey = `${convKey}${wsKey}`
+    // 锁序统一：任务锁（外）→ bot 锁（内），与 runInboxJob 一致
     return withTaskLock(taskId, () => serializeBotTurn(bot.id, async () => {
       let runRef = null
       if (taskId && existingRunId) {
@@ -1300,26 +1333,32 @@ export function apply(ctx, config = {}) {
         const started = await startRun(stateDir, taskId, { botId: bot.id, origin: taskOrigin, note: taskNote || String(text).slice(0, 120) }).catch(() => null)
         runRef = started?.run ?? null
       }
-      setTurnCtx(bot.id, { taskId: taskId || null, runId: runRef?.id || null, conversationId: conversationId || null })
+      // 上下文按 (会话,bot) 槽隔离（闭包工具读同一 convKey；同 bot 回合被串行化）
+      setTurnCtx(convKey, { taskId: taskId || null, runId: runRef?.id || null, conversationId: conversationId || null, taskWorkspace: taskWs })
+      const state = botState(bot.id)
+      const prevStatus = state.status
+      const prevJob = state.currentJob
+      state.status = 'working'
+      state.currentJob = taskId || 'chat'
+      let failed = false
       try {
-      {
-        let session = chatHandles.get(convKey)
+        let session = chatHandles.get(sessionKey)
         if (!session) {
-          const known = chatSessionIds.get(convKey)
+          const known = chatSessionIds.get(sessionKey)
           if (known) {
-            session = await createBotAgent(bot, { sessionId: known, resume: true, conversationId })
+            session = await createBotAgent(bot, { sessionId: known, resume: true, conversationId, cwd: taskWs || undefined })
           } else {
             const sessionId = randomUUID()
-            chatSessionIds.set(convKey, sessionId)
+            chatSessionIds.set(sessionKey, sessionId)
             await persistChatSessions()
-            session = await createBotAgent(bot, { sessionId, conversationId })
+            session = await createBotAgent(bot, { sessionId, conversationId, cwd: taskWs || undefined })
           }
           const actualId = session.handle.agent?.session?.id
-          if (actualId && actualId !== chatSessionIds.get(convKey)) {
-            chatSessionIds.set(convKey, String(actualId))
+          if (actualId && actualId !== chatSessionIds.get(sessionKey)) {
+            chatSessionIds.set(sessionKey, String(actualId))
             await persistChatSessions()
           }
-          chatHandles.set(convKey, session)
+          chatHandles.set(sessionKey, session)
         }
         await session.handle.agent.whenIdle()
         const firstSeq = session.handle.agent.session.seq
@@ -1333,14 +1372,19 @@ export function apply(ctx, config = {}) {
           activity: activityOf(session.handle.agent.session.events, firstSeq),
         }
         const turnText = outcome.text?.trim()
+        failed = Boolean(outcome.error) || !turnText
         if (turnText && writeDm) {
           await appendDm(bot.id, { role: 'bot', text: turnText, activity: outcome.activity }).catch(() => undefined)
         }
         return outcome
-      }
+      } catch (error) {
+        failed = true
+        throw error
       } finally {
-        if (taskId && runRef) await endRun(stateDir, taskId, runRef.id, 'done').catch(() => null)
-        setTurnCtx(bot.id, null)
+        state.status = prevStatus === 'working' ? 'idle' : prevStatus
+        state.currentJob = prevJob ?? null
+        if (taskId && runRef) await endRun(stateDir, taskId, runRef.id, failed ? 'failed' : 'done').catch(() => null)
+        setTurnCtx(convKey, null)
       }
     }))
   }
@@ -1420,38 +1464,13 @@ export function apply(ctx, config = {}) {
     const lastLine = lines[lines.length - 1]?.trim() ?? ''
     const handoff = HANDOFF_LINE_RE.exec(lastLine)
     if (handoff) {
-      // R2-A 收敛：@文本交接与结构化 handoff 走同一校验（成员资格/精确/歧义拒绝）
+      // R2-A 收敛：@文本交接仅作触发提示，一律不直接执行——统一走结构化 handoff（精确 member_id）
       const resolvedHandoff = resolveDispatchTarget(crewState.crew.bots, conversation, { member_name: handoff[1] })
-      let target = resolvedHandoff.ok ? resolvedHandoff.bot : null
+      const target = resolvedHandoff.ok ? resolvedHandoff.bot : null
       if (!target) {
-        const exact = eligibleBots(conversation).find((b) => b.id === handoff[1] || b.name === handoff[1])
-        target = exact ?? null
-      }
-      if (!target) {
-        appendRoomMsg(conversation.id, { role: 'system', text: `「@${handoff[1]}」交接未执行：${resolvedHandoff.error || '目标不在本群成员内'}。请使用 handoff 工具（精确 member_id）。` }).catch(() => undefined)
-      }
-      if (target && target.id !== responder.id) {
-        lines.pop()
-        const cleanReply = lines.join('\n').trim() || '（已转交）'
-        await appendRoomMsg(conversation.id, { role: 'bot', botId: responder.id, text: cleanReply })
-        await appendRoomMsg(conversation.id, { role: 'handoff', fromBotId: responder.id, toBotId: target.id, text: handoff[2] })
-        void (async () => {
-          try {
-            const relayPreamble = [
-              `【群聊 ${conversation.name}】你收到队友 ${responder.name} 的转交任务。`,
-              `【转交内容】${handoff[2]}`,
-              historyText,
-              '\n你可以看到群里之前的进展。接着干，不要重复已完成的步骤。',
-            ].filter(Boolean).join('\n')
-            const relay = await chatTurn(target, handoff[2], { preamble: relayPreamble, conversationId: conversation.id, writeDm: false })
-            await appendRoomMsg(conversation.id, { role: 'bot', botId: target.id, text: relay.text?.trim() || '[转交处理失败]' })
-            // 转交交付同样唤醒幕僚长协调（与 inbox 任务回流同语义）
-            if (target.id !== 'chief') wakeChiefForGroup(conversation.id, responder.id)
-          } catch (error) {
-            await appendRoomMsg(conversation.id, { role: 'system', text: `转交失败：${safeError(error)}` })
-          }
-        })()
-        return { responder, reply: cleanReply, handoffTo: target.id }
+        appendRoomMsg(conversation.id, { role: 'system', text: `「@${handoff[1]}」文本交接已停用：${resolvedHandoff.error || '目标不在本群成员内'}。请改用 handoff 工具（精确 member_id + 指定版本）。` }).catch(() => undefined)
+      } else if (target.id !== responder.id) {
+        appendRoomMsg(conversation.id, { role: 'system', text: `检测到文本交接意图（@${handoff[1]}）。请改用 handoff 工具执行以携带任务与指定版本校验；本次未自动转交。` }).catch(() => undefined)
       }
     }
     await appendRoomMsg(conversation.id, { role: 'bot', botId: responder.id, text: reply })
@@ -1568,6 +1587,35 @@ export function apply(ctx, config = {}) {
 
   async function runInboxJob(job) {
     const bot = routeJob(crewState.crew, job)
+    const convKey4Job = `${job.conversationId || bot.id}:${bot.id}`
+    const hoPre = job.handoff || null
+    const jobTaskIdPre = hoPre?.taskId || job.taskId || null
+    // R2-A 执行前共享校验（排队期间成员/任务可能变化）：目标仍是会话成员 + 任务归属本会话
+    if (job.conversationId) {
+      const convNow = (crewState.crew.conversations ?? []).find((c) => c.id === job.conversationId)
+      if (!convNow) {
+        await failJob(job, bot.id, `会话 ${job.conversationId} 已不存在，任务取消（不降级投递）`).catch(() => undefined)
+        recordRecent({ jobId: job.jobId, botId: bot.id, status: 'failed', error: 'conversation-gone', endedAt: Date.now() })
+        return
+      }
+      if (!convNow.memberBotIds.includes(bot.id)) {
+        await failJob(job, bot.id, `${bot.name} 已被移出会话 ${job.conversationId}，任务取消`).catch(() => undefined)
+        recordRecent({ jobId: job.jobId, botId: bot.id, status: 'failed', error: 'member-removed', endedAt: Date.now() })
+        return
+      }
+    }
+    if (jobTaskIdPre) {
+      const chk = await validateTaskForContext(jobTaskIdPre, {
+        conversationId: job.conversationId || null,
+        botId: bot.id,
+        getTask: (id) => getTask(stateDir, id),
+      })
+      if (!chk.ok) {
+        await failJob(job, bot.id, `任务校验失败：${chk.error}`).catch(() => undefined)
+        recordRecent({ jobId: job.jobId, botId: bot.id, status: 'failed', error: 'task-scope', endedAt: Date.now() })
+        return
+      }
+    }
     const state = botState(bot.id)
     state.status = 'working'
     state.currentJob = job.jobId
@@ -1597,10 +1645,12 @@ export function apply(ctx, config = {}) {
           const started = await startRun(stateDir, task.id, { botId: bot.id, origin: 'handoff', note: String(promptText).slice(0, 200) }).catch(() => null)
           hoRunId = started?.run?.id ?? null
         }
-        handoffPreamble = `【接力交接】${ho.fromBotName || '队友'} 把这项工作交给你继续。${artBlock}${task ? `\n【任务】${task.title}（taskId=${task.id}，注意沿用任务工作区）` : ''}\n交接摘要：${promptText}`
+        handoffPreamble = `【接力交接】${ho.fromBotName || '队友'} 把这项工作交给你继续。${artBlock}${task ? `\n【任务】${task.title}（taskId=${task.id}；任务工作区根目录：${task.workspace || botWorkspace(stateDir, bot)}——读写与交付都以它为根）` : ''}\n交接摘要：${promptText}`
       }
-      setTurnCtx(bot.id, { taskId: jobTaskId, runId: hoRunId, conversationId: job.conversationId || null })
-      session = await createBotAgent(bot, { conversationId: job.conversationId || null })
+      const jobTask = jobTaskId ? await getTask(stateDir, jobTaskId).catch(() => null) : null
+      const jobTaskWs = jobTask?.workspace || null
+      setTurnCtx(convKey4Job, { taskId: jobTaskId, runId: hoRunId, conversationId: job.conversationId || null, taskWorkspace: jobTaskWs })
+      session = await createBotAgent(bot, { conversationId: job.conversationId || null, cwd: jobTaskWs || undefined })
       const timeout = setTimeout(() => session.abort.abort(new Error(`job timeout after ${jobTimeoutMs}ms`)), jobTimeoutMs)
       // 长任务群内心跳：让群里知道成员还活着在干活（不触发幕僚长唤醒）
       const startedAt = Date.now()
@@ -1626,7 +1676,7 @@ export function apply(ctx, config = {}) {
         if (heartbeat) clearInterval(heartbeat)
         const replyProbe = outcome?.text?.trim()
         if (jobTaskId && hoRunId) await endRun(stateDir, jobTaskId, hoRunId, replyProbe ? 'done' : 'failed').catch(() => null)
-        setTurnCtx(bot.id, null)
+        setTurnCtx(convKey4Job, null)
       }
       const reply = outcome.text?.trim()
       // 回复回流：群任务 → 发回群里（所有人可见）；无群上下文 → 记入该成员私聊

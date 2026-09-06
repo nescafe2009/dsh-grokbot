@@ -121,3 +121,41 @@ test('classifyDeliveryTarget：handoff 路由分类（R2-A 交接范围）', () 
 
 // 清理
 test.after?.(() => { rm(workdir, { recursive: true, force: true }).catch(() => undefined) })
+
+/* ---------------- 共享入口校验（R2-A P1-1：A/B/DM 错误 taskId） ---------------- */
+import { validateTaskForContext } from '../src/tasks.mjs'
+
+const memTasks = new Map()
+const fakeGetTask = async (id) => memTasks.get(id) ?? null
+memTasks.set('task-a', { id: 'task-a', conversationId: 'group-a', ownerBotId: 'a' })
+memTasks.set('task-b', { id: 'task-b', conversationId: 'group-b', ownerBotId: 'b' })
+memTasks.set('task-dm', { id: 'task-dm', conversationId: null, ownerBotId: 'a' })
+
+test('validateTaskForContext：群 A 任务在群 B 执行被拒', async () => {
+  const r = await validateTaskForContext('task-a', { conversationId: 'group-b', botId: 'b', getTask: fakeGetTask })
+  assert.equal(r.ok, false)
+  assert.match(r.error, /不属于当前会话/)
+})
+
+test('validateTaskForContext：群任务在 DM 上下文被拒（非 owner）', async () => {
+  const r = await validateTaskForContext('task-a', { conversationId: null, botId: 'b', getTask: fakeGetTask })
+  assert.equal(r.ok, false)
+  assert.match(r.error, /私聊上下文/)
+})
+
+test('validateTaskForContext：DM owner 可续改无会话任务；非 owner 被拒', async () => {
+  assert.equal((await validateTaskForContext('task-dm', { conversationId: null, botId: 'a', getTask: fakeGetTask })).ok, true)
+  assert.equal((await validateTaskForContext('task-dm', { conversationId: null, botId: 'b', getTask: fakeGetTask })).ok, false)
+})
+
+test('validateTaskForContext：错误 taskId（非法格式/不存在）被拒；空放行', async () => {
+  assert.equal((await validateTaskForContext('../etc', { conversationId: 'group-a', botId: 'a', getTask: fakeGetTask })).ok, false)
+  assert.equal((await validateTaskForContext('task-none', { conversationId: 'group-a', botId: 'a', getTask: fakeGetTask })).ok, false)
+  assert.equal((await validateTaskForContext(null, { conversationId: 'group-a', botId: 'a', getTask: fakeGetTask })).ok, true)
+})
+
+test('validateTaskForContext：本会话任务放行', async () => {
+  const r = await validateTaskForContext('task-a', { conversationId: 'group-a', botId: 'a', getTask: fakeGetTask })
+  assert.equal(r.ok, true)
+  assert.equal(r.task.id, 'task-a')
+})
