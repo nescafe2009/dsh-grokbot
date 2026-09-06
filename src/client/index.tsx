@@ -1024,6 +1024,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
   const { bot, state } = props
   const propsBots = state?.bots ?? []
   const [draft, setDraft] = useState('')
+  const [draftTask, setDraftTask] = useState<{ taskId: string; name: string } | null>(null)
   const [sending, setSending] = useState(false)
   const [editing, setEditing] = useState(false)
   const [detailsOpen, setDetailsOpen] = useState(false)
@@ -1079,7 +1080,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
     try {
       const outcome = await api(`/conversations/${encodeURIComponent(bot.id)}/chat`, {
         method: 'POST',
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, ...(draftTask ? { taskId: draftTask.taskId } : {}) }),
       })
       const activity = (outcome?.activity ?? []) as string[]
       if (activity.length > 0) {
@@ -1106,8 +1107,9 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
       })
     } finally {
       setSending(false)
+      setDraftTask(null)
     }
-  }, [draft, sending, bot.id, refetchHistory])
+  }, [draft, sending, bot.id, refetchHistory, draftTask])
 
   const routines = (state?.routines ?? []).filter((routine) => routine.botId === bot.id)
 
@@ -1146,7 +1148,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
             if (message.role === 'bot') {
               const { body, chips } = splitChips(message.text)
               return (
-                <MessageView key={message.id} role="bot" text={body} at={message.at} artifact={message.artifact}>
+                <MessageView key={message.id} role="bot" text={body} at={message.at} artifact={message.artifact} onContinueArtifact={(a) => { if (a.taskId) setDraftTask({ taskId: a.taskId, name: a.name }) }}>
                   {chips.length > 0
                     ? (
                       <div className="grokbot-chips">
@@ -1248,12 +1250,22 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
           )
           : null}
       </div>
+      {draftTask
+        ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 22px 0' }}>
+            <span style={{ fontSize: 12, background: 'rgba(37,99,235,.10)', color: '#2563eb', borderRadius: 99, padding: '3px 10px', fontWeight: 600 }}>
+              继续修改：{draftTask.name}
+            </span>
+            <button type="button" style={{ border: 'none', background: 'none', cursor: 'pointer', color: 'rgba(29,29,31,.4)', fontSize: 12 }} onClick={() => setDraftTask(null)}>✕</button>
+          </div>
+        )
+        : null}
       <Composer
         draft={draft}
         onDraft={setDraft}
         onSend={() => void send()}
         sending={sending}
-        placeholder={`发消息给 ${bot.name}`}
+        placeholder={draftTask ? `继续修改 ${draftTask.name}（同一任务）…` : `发消息给 ${bot.name}`}
       />
         </>
       )}
@@ -1269,6 +1281,7 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [messages, setMessages] = useState<RoomMessage[]>([])
   const [draft, setDraft] = useState('')
+  const [draftTask, setDraftTask] = useState<{ taskId: string; name: string } | null>(null)
   const [sending, setSending] = useState(false)
   const logRef = useRef<HTMLDivElement | null>(null)
 
@@ -1298,15 +1311,16 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
     try {
       const outcome = await api(`/conversations/${encodeURIComponent(room.id)}/chat`, {
         method: 'POST',
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, ...(draftTask ? { taskId: draftTask.taskId } : {}) }),
       })
       setMessages(((outcome?.messages ?? []) as RoomMessage[]).slice())
     } catch (error) {
       setMessages((prev) => [...prev, { ts: Date.now(), role: 'system', text: `发送失败：${String((error as Error)?.message ?? error)}` }])
     } finally {
       setSending(false)
+      setDraftTask(null)
     }
-  }, [draft, sending, room.id])
+  }, [draft, sending, room.id, draftTask])
 
   return (
     <div className="grokbot-chat" onKeyDown={(event) => { if (event.key === 'Escape' && !detailsOpen) closeTarget() }}>
@@ -1346,17 +1360,28 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
                   senderName={bot?.name ?? message.botId}
                   senderGlyph={bot?.avatar}
                   artifact={message.artifact}
+                  onContinueArtifact={(a) => { if (a.taskId) setDraftTask({ taskId: a.taskId, name: a.name }) }}
                 />
               )
             })}
         {sending ? <div className="grokbot-empty">成员思考中…</div> : null}
       </div>
+      {draftTask
+        ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 22px 0' }}>
+            <span style={{ fontSize: 12, background: 'rgba(37,99,235,.10)', color: '#2563eb', borderRadius: 99, padding: '3px 10px', fontWeight: 600 }}>
+              继续修改：{draftTask.name}
+            </span>
+            <button type="button" style={{ border: 'none', background: 'none', cursor: 'pointer', color: 'rgba(29,29,31,.4)', fontSize: 12 }} onClick={() => setDraftTask(null)}>✕</button>
+          </div>
+        )
+        : null}
       <Composer
         draft={draft}
         onDraft={setDraft}
         onSend={() => void send()}
         sending={sending}
-        placeholder={`发到 ${room.name}…（@成员名 定向）`}
+        placeholder={draftTask ? `继续修改 ${draftTask.name}（同一任务）…` : `发到 ${room.name}…（@成员名 定向）`}
       />
       </div>
       {detailsOpen

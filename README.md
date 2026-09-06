@@ -1,6 +1,6 @@
 ## 定位
 
-**dsh-grokbot 是一个纯 out-of-tree DSH 插件**：安装即得 Grok Bot 式的常驻团队（多专家/群聊/派发回流/幕僚长协调/任务闭环）。bots 用 DSH 原生工具在**宿主本机**毫秒级干活（本插件通过 profile patch 启用 web profile 默认禁用的 bash/fs 等执行工具，沙箱与审批沿用 DSH 原生体系）。
+**dsh-grokbot 是一个纯 out-of-tree DSH 插件**：安装即得 Grok Bot 式的常驻团队（多专家/群聊/派发回流/幕僚长协调/任务闭环）。bots 用 DSH 原生工具在**宿主本机**执行（本地调用、无 SSH 绕行；本插件通过 profile patch 启用 web profile 默认禁用的 bash/fs 等执行工具，沙箱与审批沿用 DSH 原生体系。不承诺固定耗时——同任务下插件路径与直连的额外回合/耗时如实计量，见效率验收）。
 
 可选配件：配置 computer.json 后获得一台团队共享电脑（Linux VM）——用于无头构建、长时任务、托管可试玩的 HTML（noVNC 观摩）。默认不启用，不影响插件本体。
 
@@ -15,7 +15,7 @@
 - **常驻 agent 团队**：在 `crew.json` 里定义若干具名 bot（头像、人格、专属工作区），DSH 启动即常驻
 - **首页原生存在**：bot 卡片直接出现在 DSH 首页输入区下方，显示实时状态（待命/工作中），点击即聊——不新开窗口
 - **todi-hub 兼容 inbox 协议**：`queue.jsonl` + `<jobId>/job.json` + `reply.md`，与 Grok Bot 的文件驱动方式同构，外部系统（手机、webhook、定时器）投文件即接活
-- **每 bot 一台"电脑"**：默认 `~/.dsh/grokbot/workspaces/<botId>` 专属工作区，后台任务在隔离会话中执行
+- **共享本机工作区**：默认使用插件状态目录下的共享 workspace（`<stateDir>/workspace`，个人子目录 `agents/<botId>`），bot 可覆盖为独立工作区；后台任务在按 (会话,bot) 隔离的 DSH 会话中执行
 
 ## 安装
 

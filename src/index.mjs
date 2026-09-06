@@ -1,12 +1,13 @@
 import { existsSync, watch } from 'node:fs'
-import { appendFile, mkdir, readFile, writeFile, copyFile, stat, realpath, rm } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, writeFile, stat, realpath, rm } from 'node:fs/promises'
 import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { loadOrCreateCrew, routeJob, botWorkspace, serializeCrew, atomicWrite, parseCrew, createBot, updateBot, removeBot, duplicateBot, createConversation, renameConversation, addConversationMember, removeConversationMember, removeConversation, upsertRoutine, removeRoutine } from './crew.mjs'
 import { ensureInbox, scanInbox, claimJob, completeJob, failJob, cancelJob, enqueueJob } from './inbox.mjs'
 import { resolveDispatchTarget, WakeScheduler } from './dispatch.mjs'
-import { isInsideRoot, classifyDeliveryTarget } from './delivery-core.mjs'
+import { isInsideRoot, classifyDeliveryTarget, createArtifactSnapshot, artifactMime } from './delivery-core.mjs'
+import { createTask, getTask, listTasks, startRun, endRun, attachArtifact, withTaskLock } from './tasks.mjs'
 import { BOT_TEMPLATES, templateById } from './templates.mjs'
 
 const API_ROOT = '/api/plugins/grokbot'
@@ -454,15 +455,105 @@ export function apply(ctx, config = {}) {
     return { ok: false, error: '启动命令已执行但未检测到浏览器进程' }
   }
 
-  /* ---------------- 本机成果交付（R1 主链：文件 → 快照卡片 → 保存原件） ---------------- */
+  /* ---------------- R2-A：持续任务与定向接力 ---------------- */
 
-  const ARTIFACT_MIME = {
-    '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8',
-    '.md': 'text/markdown; charset=utf-8', '.txt': 'text/plain; charset=utf-8',
-    '.json': 'application/json', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
-    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.svg': 'image/svg+xml', '.webp': 'image/webp',
-    '.pdf': 'application/pdf', '.zip': 'application/zip', '.bin': 'application/octet-stream',
+  function taskTools(bot, { conversationId = null } = {}) {
+    const conversation = conversationId
+      ? crewState.crew.conversations?.find((c) => c.id === conversationId) ?? null
+      : null
+    return [
+      {
+        name: 'task_begin',
+        description: '为一项需要持续迭代/多步交付的工作建立任务（返回稳定 taskId）。后续同任务的续改与交接都引用它。简单一次性问答不要建任务。',
+        parameters: {
+          type: 'object',
+          properties: { title: { type: 'string', description: '任务标题（用户可读）' } },
+          required: ['title'],
+        },
+        output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: String(value) }] },
+        async execute(params) {
+          const task = await createTask(stateDir, {
+            conversationId: conversationId || null,
+            ownerBotId: bot.id,
+            workspace: botWorkspace(stateDir, bot),
+            title: params?.title,
+          })
+          const ctx = activeTurnCtx.get(bot.id) || { conversationId }
+          setTurnCtx(bot.id, { ...ctx, taskId: task.id, conversationId: conversationId || null })
+          return JSON.stringify({ ok: true, taskId: task.id, note: '本回合及后续 deliver_file 会自动关联此任务；续改请在完成后告知用户可在卡片上「继续修改」' })
+        },
+      },
+      {
+        name: 'handoff',
+        description: '把当前任务（或指定成果版本）定向交给另一位成员继续：对方只获得摘要与指定版本文件，不继承你的私聊历史。目标必须是当前会话成员（精确 member_id）。',
+        parameters: {
+          type: 'object',
+          properties: {
+            member_id: { type: 'string', description: '目标成员精确 bot id（必填）' },
+            task_id: { type: 'string', description: '要交接的任务 id（通常是你当前任务）' },
+            artifact_id: { type: 'string', description: '指定交接的成果版本（固定快照）；不填则交接任务最新成果' },
+            brief: { type: 'string', description: '给接手成员的必要摘要：已完成什么、要求做什么' },
+          },
+          required: ['member_id', 'brief'],
+        },
+        output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: String(value) }] },
+        async execute(params) {
+          const resolved = resolveDispatchTarget(crewState.crew.bots, conversation, { member_id: params?.member_id })
+          if (!resolved.ok) return JSON.stringify({ ok: false, error: resolved.error })
+          const target = resolved.bot
+          const turnCtx = activeTurnCtx.get(bot.id) || null
+          const taskId = String(params?.task_id || turnCtx?.taskId || '')
+          let task = taskId ? await getTask(stateDir, taskId) : null
+          if (taskId && !task) return JSON.stringify({ ok: false, error: `任务不存在：${taskId}` })
+          if (task) {
+            // 来源绑定：仅允许交接当前会话（或无会话上下文的 DM 归属）的任务；跨群需用户重建
+            const taskConv = task.conversationId
+            const sameScope = !conversationId ? taskConv === null || task.ownerBotId === bot.id : taskConv === conversationId
+            if (!sameScope) return JSON.stringify({ ok: false, error: `任务 ${taskId} 不属于当前会话，拒绝跨会话交接` })
+          }
+          // 指定成果版本：必须是该任务的交付（或独立存在但需同会话）
+          let artifactId = String(params?.artifact_id || '')
+          if (artifactId) {
+            const metaPath = join(stateDir, 'artifacts', artifactId, 'meta.json')
+            let artMeta = null
+            try { artMeta = JSON.parse(await readFile(metaPath, 'utf8')) } catch { /* 不存在 */ }
+            if (!artMeta) return JSON.stringify({ ok: false, error: `成果不存在：${artifactId}` })
+            if (task && !task.artifacts.includes(artifactId)) return JSON.stringify({ ok: false, error: `成果 ${artifactId} 不属于任务 ${taskId}` })
+          } else if (task?.artifacts?.length) {
+            artifactId = task.artifacts[task.artifacts.length - 1]
+          }
+          // 会话目标校验：群已删除/无实体则拒绝（不降级）
+          const where = classifyDeliveryTarget({ conversationId, botId: bot.id, conversations: crewState.crew.conversations })
+          if (where === 'rejected') return JSON.stringify({ ok: false, error: `当前会话 ${conversationId} 已不存在，交接取消` })
+          const job = await enqueueJob(inboxRoot, {
+            toBot: target.id,
+            text: String(params?.brief || ''),
+            fromBotId: bot.id,
+            ...(conversationId ? { conversationId } : {}),
+            handoff: {
+              taskId: task?.id || null,
+              artifactId: artifactId || null,
+              fromBotName: bot.name,
+            },
+          })
+          void scan()
+          return JSON.stringify({ ok: true, jobId: job.jobId, handedTo: target.name, taskId: task?.id || null, artifactId: artifactId || null, note: '接手成员将收到摘要与指定版本文件（含 SHA 校验）；其成果会回到本会话' })
+        },
+      },
+    ]
   }
+
+  /* ---------------- R2-A：活动回合上下文（per-bot，串行保证唯一） ---------------- */
+  // 同一 bot 的回合被 serializeBotTurn 串行化，故 botId → 当前回合的 task/run 绑定是安全的：
+  // 群 A / 群 B / DM 交错时各自回合先后进入，互不读到对方上下文。
+  const activeTurnCtx = new Map() // botId -> { taskId, runId, conversationId }
+
+  function setTurnCtx(botId, ctx) {
+    if (ctx) activeTurnCtx.set(botId, ctx)
+    else activeTurnCtx.delete(botId)
+  }
+
+  /* ---------------- 本机成果交付（R1 主链：文件 → 快照卡片 → 保存原件） ---------------- */
 
   function deliveryTools(bot, { conversationId }) {
     return [{
@@ -492,34 +583,31 @@ export function apply(ctx, config = {}) {
         if (where === 'rejected') {
           return `ERROR: 目标会话 ${conversationId} 已不存在（可能已被删除），已取消交付：${basename(real)}。请告知用户重新建会话后重新交付。`
         }
-        const id = `art-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`
-        const name = basename(real)
+        // R2-A：快照落盘走 delivery-core（文件层可测）；关联当前回合的 task/run
+        const turnCtx = activeTurnCtx.get(bot.id) || null
+        const { meta } = await createArtifactSnapshot({
+          artifactsRoot: join(stateDir, 'artifacts'),
+          sourceReal: real,
+          workspaceRoot: rootReal,
+          extra: turnCtx ? { taskId: turnCtx.taskId, runId: turnCtx.runId } : {},
+        })
+        if (turnCtx?.taskId) await attachArtifact(stateDir, turnCtx.taskId, meta.id).catch(() => null)
+        const name = meta.name
+        const id = meta.id
         const dir = join(stateDir, 'artifacts', id)
-        await mkdir(join(dir, 'data'), { recursive: true })
-        // payload 固定名，与 meta.json 分离：原名 meta.json 不再覆盖元数据；size 以快照字节为准
-        const payloadPath = join(dir, 'data', 'payload')
-        await copyFile(real, payloadPath)
-        const buf = await readFile(payloadPath)
-        const sha256 = createHash('sha256').update(buf).digest('hex')
-        const meta = {
-          id, name, size: buf.length,
-          mime: ARTIFACT_MIME[extname(name).toLowerCase()] || 'application/octet-stream',
-          sha256, sourcePath: real, workspaceRoot: rootReal, createdAt: Date.now(),
-        }
-        await writeFile(join(dir, 'meta.json'), JSON.stringify(meta, null, 1))
         // 写消息前最终校验：期间目标失效则清理本次快照，不留无卡片的孤立产物
         const where2 = classifyDeliveryTarget({ conversationId, botId: bot.id, conversations: crewState.crew.conversations })
         if (where2 === 'rejected') {
           await rm(dir, { recursive: true, force: true }).catch(() => undefined)
           return `ERROR: 目标会话 ${conversationId} 在交付过程中被删除，已取消并清理快照：${name}`
         }
-        const card = { id, name, size: meta.size, mime: meta.mime, sha256 }
+        const card = { id, name, size: meta.size, mime: meta.mime, sha256, ...(turnCtx?.taskId ? { taskId: turnCtx.taskId } : {}) }
         if (where2 === 'room') {
           await appendRoomMsg(conversationId, { role: 'bot', botId: bot.id, text: String(params?.note || `交付文件：${name}`), artifact: card })
         } else {
           await appendDm(bot.id, { role: 'bot', text: String(params?.note || `交付文件：${name}`), artifact: card })
         }
-        return `已交付 ${name}（${meta.size} 字节，SHA256 ${sha256.slice(0, 16)}…）为会话内原件卡片`
+        return `已交付 ${name}（${meta.size} 字节，SHA256 ${meta.sha256.slice(0, 16)}…）为会话内原件卡片${turnCtx?.taskId ? `（任务 ${turnCtx.taskId}）` : ''}`
       },
     }]
   }
@@ -952,7 +1040,7 @@ export function apply(ctx, config = {}) {
         })
         await memorySections(bot, agentCtx)
         if (agentCtx.tools?.register) {
-          for (const tool of [...teamManagementTools(bot, { conversationId }), ...deliveryTools(bot, { conversationId }), ...computerTools(bot)]) {
+          for (const tool of [...teamManagementTools(bot, { conversationId }), ...taskTools(bot, { conversationId }), ...deliveryTools(bot, { conversationId }), ...computerTools(bot)]) {
             try {
             agentCtx.tools.register(tool)
 
@@ -1050,7 +1138,7 @@ export function apply(ctx, config = {}) {
     if (!botId) return
     const bot = crewState.crew.bots.find((b) => b.id === botId)
     if (!bot) return
-    for (const tool of [...teamManagementTools(bot, { conversationId: convId }), ...deliveryTools(bot, { conversationId: convId }), ...computerTools(bot)]) {
+    for (const tool of [...teamManagementTools(bot, { conversationId: convId }), ...taskTools(bot, { conversationId: convId }), ...deliveryTools(bot, { conversationId: convId }), ...computerTools(bot)]) {
       try { agent.ctx.tools.register(tool) } catch { /* setup 已注册 */ }
     }
   }), 'grokbot: native session tool injection')
@@ -1188,11 +1276,21 @@ export function apply(ctx, config = {}) {
   }
 
 
-  async function chatTurn(bot, text, { preamble = '', conversationId = null, writeDm = true, taskId = null } = {}) {
+  async function chatTurn(bot, text, { preamble = '', conversationId = null, writeDm = true, taskId = null, taskOrigin = 'continue', taskNote = '', existingRunId = null } = {}) {
     // 会话按 (conversationId, botId) 隔离：群/私聊临时上下文互不串扰，
     // 人格与长期记忆仍按 bot 共享（#3 A1）。DM 无显式 conversationId 时回落 DM 键。
     const convKey = conversationId ? `${conversationId}:${bot.id}` : `${bot.id}:${bot.id}`
-    return serializeBotTurn(bot.id, async () => {
+    // R2-A：同任务串行（最小排队），跨任务并行；无任务不排队
+    return withTaskLock(taskId, () => serializeBotTurn(bot.id, async () => {
+      let runRef = null
+      if (taskId && existingRunId) {
+        runRef = { id: existingRunId } // handoff 已建 run，本回合复用
+      } else if (taskId) {
+        const started = await startRun(stateDir, taskId, { botId: bot.id, origin: taskOrigin, note: taskNote || String(text).slice(0, 120) }).catch(() => null)
+        runRef = started?.run ?? null
+      }
+      setTurnCtx(bot.id, { taskId: taskId || null, runId: runRef?.id || null, conversationId: conversationId || null })
+      try {
       {
         let session = chatHandles.get(convKey)
         if (!session) {
@@ -1229,7 +1327,11 @@ export function apply(ctx, config = {}) {
         }
         return outcome
       }
-    })
+      } finally {
+        if (taskId && runRef) await endRun(stateDir, taskId, runRef.id, 'done').catch(() => null)
+        setTurnCtx(bot.id, null)
+      }
+    }))
   }
 
   function eligibleBots(conversation) {
@@ -1256,11 +1358,11 @@ export function apply(ctx, config = {}) {
 
   const HANDOFF_LINE_RE = /^@([\w\u4e00-\u9fa5]+)[：:\s]+(.+)$/
 
-  async function conversationTurn(conversation, senderText, { mentionTarget } = {}) {
+  async function conversationTurn(conversation, senderText, { mentionTarget, taskId = null } = {}) {
     if (conversation.memberBotIds.length === 1) {
       const bot = crewState.crew.bots.find((entry) => entry.id === conversation.memberBotIds[0])
       if (!bot) throw new Error('会话成员不存在')
-      const outcome = await chatTurn(bot, senderText, { conversationId: conversation.id, writeDm: true })
+      const outcome = await chatTurn(bot, senderText, { conversationId: conversation.id, writeDm: true, taskId, taskOrigin: taskId ? 'continue' : 'user' })
       return { responder: bot, reply: outcome.text?.trim() || `[${bot.name} 未能给出文本回复]`, handoffTo: null, outcome }
     }
     const members = conversation.memberBotIds
@@ -1300,14 +1402,23 @@ export function apply(ctx, config = {}) {
       '\n你现在在群聊中应答。你能看到上方队友的最近发言和交接——可以接着他们的进度干活（共享电脑里的文件直接读），不要重复已完成的步骤。',
       '若你认为某条工作应由其他成员处理，在回复的最后一行单独写「@成员名 交代内容」，系统会异步转交；不要除此行外提交接。',
     ].filter(Boolean).join('\n')
-    const outcome = await chatTurn(responder, senderText, { preamble, conversationId: conversation.id, writeDm: false })
+    const outcome = await chatTurn(responder, senderText, { preamble, conversationId: conversation.id, writeDm: false, taskId, taskOrigin: taskId ? 'continue' : 'user' })
     const reply = outcome.text?.trim() || `[${responder.name} 未能给出文本回复：${outcome.error || outcome.stopReason}]`
     // 解析末尾交接行 → bot↔bot 异步交接
     const lines = reply.split('\n')
     const lastLine = lines[lines.length - 1]?.trim() ?? ''
     const handoff = HANDOFF_LINE_RE.exec(lastLine)
     if (handoff) {
-      const target = eligibleBots(conversation).find((bot) => bot.name.includes(handoff[1]) || bot.id.includes(handoff[1]))
+      // R2-A 收敛：@文本交接与结构化 handoff 走同一校验（成员资格/精确/歧义拒绝）
+      const resolvedHandoff = resolveDispatchTarget(crewState.crew.bots, conversation, { member_name: handoff[1] })
+      let target = resolvedHandoff.ok ? resolvedHandoff.bot : null
+      if (!target) {
+        const exact = eligibleBots(conversation).find((b) => b.id === handoff[1] || b.name === handoff[1])
+        target = exact ?? null
+      }
+      if (!target) {
+        appendRoomMsg(conversation.id, { role: 'system', text: `「@${handoff[1]}」交接未执行：${resolvedHandoff.error || '目标不在本群成员内'}。请使用 handoff 工具（精确 member_id）。` }).catch(() => undefined)
+      }
       if (target && target.id !== responder.id) {
         lines.pop()
         const cleanReply = lines.join('\n').trim() || '（已转交）'
@@ -1457,6 +1568,27 @@ export function apply(ctx, config = {}) {
       // 上下文随 session 闭包绑定（P1-1）：inbox 任务派发的子任务回流 job.conversationId
       const promptText = job.text?.trim()
         || `（无文字内容${job.images.length > 0 ? '，请查看同目录图片附件' : ''}）`
+      // R2-A：handoff 交接上下文（指定版本注入 + SHA 校验要求）；taskId 贯穿 deliver_file
+      let handoffPreamble = ''
+      const ho = job.handoff || null
+      const jobTaskId = ho?.taskId || job.taskId || null
+      let hoRunId = null
+      if (ho) {
+        let artBlock = ''
+        if (ho.artifactId) {
+          try {
+            const am = JSON.parse(await readFile(join(stateDir, 'artifacts', ho.artifactId, 'meta.json'), 'utf8'))
+            artBlock = `\n【指定成果版本】${am.name}（任务固定版本）\n- 快照路径：${join(stateDir, 'artifacts', ho.artifactId, 'data', 'payload')}\n- SHA256：${am.sha256}\n- 要求：先读取该文件并用 sha256sum 校验一致后再基于它工作；这是交接基准版本。`
+          } catch { artBlock = `\n【指定成果版本】${ho.artifactId}（快照读取失败，请回报交接人）` }
+        }
+        const task = jobTaskId ? await getTask(stateDir, jobTaskId).catch(() => null) : null
+        if (task) {
+          const started = await startRun(stateDir, task.id, { botId: bot.id, origin: 'handoff', note: String(promptText).slice(0, 200) }).catch(() => null)
+          hoRunId = started?.run?.id ?? null
+        }
+        handoffPreamble = `【接力交接】${ho.fromBotName || '队友'} 把这项工作交给你继续。${artBlock}${task ? `\n【任务】${task.title}（taskId=${task.id}，注意沿用任务工作区）` : ''}\n交接摘要：${promptText}`
+      }
+      setTurnCtx(bot.id, { taskId: jobTaskId, runId: hoRunId, conversationId: job.conversationId || null })
       session = await createBotAgent(bot, { conversationId: job.conversationId || null })
       const timeout = setTimeout(() => session.abort.abort(new Error(`job timeout after ${jobTimeoutMs}ms`)), jobTimeoutMs)
       // 长任务群内心跳：让群里知道成员还活着在干活（不触发幕僚长唤醒）
@@ -1471,15 +1603,19 @@ export function apply(ctx, config = {}) {
       try {
         await session.handle.agent.whenIdle()
         const firstSeq = session.handle.agent.session.seq
+        const basePrompt = handoffPreamble || promptText
         const withImages = job.images.length > 0
-          ? `${promptText}\n\n【图片】请阅读：\n${job.images.join('\n')}`
-          : promptText
+          ? `${basePrompt}\n\n【图片】请阅读：\n${job.images.join('\n')}`
+          : basePrompt
         session.handle.agent.followup(userMessage(withImages))
         await session.handle.agent.whenIdle()
         outcome = summarizeTurn(session.handle.agent.session.events, firstSeq)
       } finally {
         clearTimeout(timeout)
         if (heartbeat) clearInterval(heartbeat)
+        const replyProbe = outcome?.text?.trim()
+        if (jobTaskId && hoRunId) await endRun(stateDir, jobTaskId, hoRunId, replyProbe ? 'done' : 'failed').catch(() => null)
+        setTurnCtx(bot.id, null)
       }
       const reply = outcome.text?.trim()
       // 回复回流：群任务 → 发回群里（所有人可见）；无群上下文 → 记入该成员私聊
@@ -2078,6 +2214,7 @@ export function apply(ctx, config = {}) {
             const body = await readJsonBody(req)
             const text = String(body?.text || '').trim()
             if (!text) throw new HttpError(400, 'text 不能为空')
+            const bodyTaskId = /^[a-z0-9-]+$/i.test(String(body?.taskId || '')) ? String(body.taskId) : null
             await appendConversationMsg(conversation, { role: 'user', text })
             if (conversation.memberBotIds.length === 1) {
               const memberBot = crewState.crew.bots.find((entry) => entry.id === conversation.memberBotIds[0])
@@ -2099,7 +2236,7 @@ export function apply(ctx, config = {}) {
               const wanted = String(body.mentions[0])
               mentionTarget = eligibleBots(conversation).find((bot) => bot.id === wanted) ?? null
             }
-            const result = await conversationTurn(conversation, text, { mentionTarget })
+            const result = await conversationTurn(conversation, text, { mentionTarget, taskId: bodyTaskId })
             respond(res, 200, {
               responder: publicBot(result.responder),
               reply: result.reply,

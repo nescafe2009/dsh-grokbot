@@ -2,7 +2,7 @@
  * 交付链纯逻辑（可单测）：路径包含判定 + 会话路由分类。
  * index.mjs 的 deliver_file 工具与 reveal 路由共用，保证两处判定一致。
  */
-import { isAbsolute, relative, sep } from 'node:path'
+import { basename, extname, isAbsolute, join, relative, sep } from 'node:path'
 
 /**
  * targetReal 是否严格位于 rootReal 内（两者须为真实路径）。
@@ -27,4 +27,49 @@ export function classifyDeliveryTarget({ conversationId, botId, conversations })
   if (!conversationId || conversationId === botId) return 'dm'
   const conv = (conversations ?? []).find((c) => c.id === conversationId)
   return conv ? 'room' : 'rejected'
+}
+
+/* ---------------- 快照落盘（fs 层，文件级可测） ---------------- */
+
+const ARTIFACT_MIME = {
+  '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8',
+  '.md': 'text/markdown; charset=utf-8', '.txt': 'text/plain; charset=utf-8',
+  '.json': 'application/json', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.svg': 'image/svg+xml', '.webp': 'image/webp',
+  '.pdf': 'application/pdf', '.zip': 'application/zip', '.bin': 'application/octet-stream',
+}
+
+/**
+ * 创建成果快照：payload 固定 data/payload（与 meta.json 分离，原名可为 meta.json）；
+ * size 以快照字节为准。extra（taskId/runId 等）并入 meta。
+ * 前置条件：sourceReal 已通过 isInsideRoot 校验且为常规文件。
+ */
+export async function createArtifactSnapshot({ artifactsRoot, sourceReal, workspaceRoot, extra = {} }) {
+  const { mkdir, writeFile, copyFile, readFile } = await import('node:fs/promises')
+  const { createHash, randomUUID } = await import('node:crypto')
+  const id = `art-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`
+  const dir = join(artifactsRoot, id)
+  await mkdir(join(dir, 'data'), { recursive: true })
+  const payloadPath = join(dir, 'data', 'payload')
+  await copyFile(sourceReal, payloadPath)
+  const buf = await readFile(payloadPath)
+  const sha256 = createHash('sha256').update(buf).digest('hex')
+  const name = basename(sourceReal)
+  const meta = {
+    id,
+    name,
+    size: buf.length,
+    mime: ARTIFACT_MIME[extname(name).toLowerCase()] || 'application/octet-stream',
+    sha256,
+    sourcePath: sourceReal,
+    workspaceRoot,
+    createdAt: Date.now(),
+    ...extra,
+  }
+  await writeFile(join(dir, 'meta.json'), JSON.stringify(meta, null, 1))
+  return { meta, payloadPath }
+}
+
+export function artifactMime(name) {
+  return ARTIFACT_MIME[extname(String(name)).toLowerCase()] || 'application/octet-stream'
 }

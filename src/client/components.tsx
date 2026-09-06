@@ -213,6 +213,7 @@ export interface ArtifactInfo {
   size?: number | null
   mime?: string | null
   sha256?: string | null
+  taskId?: string | null
 }
 
 export interface MessageViewProps {
@@ -223,6 +224,7 @@ export interface MessageViewProps {
   senderGlyph?: string
   markdown?: boolean
   artifact?: ArtifactInfo | null
+  onContinueArtifact?: (artifact: ArtifactInfo) => void
   children?: ReactNode
 }
 
@@ -256,6 +258,9 @@ export function MessageView(props: MessageViewProps): ReactNode {
               size={props.artifact.size ?? null}
               mime={props.artifact.mime ?? null}
               actions={[
+                ...(props.artifact.taskId && props.onContinueArtifact
+                  ? [{ label: '继续修改', primary: true, onClick: () => props.onContinueArtifact!(props.artifact!) }]
+                  : []),
                 { label: '预览', onClick: () => window.open(`/api/plugins/grokbot/artifacts/${props.artifact!.id}`, '_blank') },
                 { label: '保存副本', onClick: () => window.open(`/api/plugins/grokbot/artifacts/${props.artifact!.id}?download=1`, '_blank') },
                 { label: '在 Finder 显示工作文件', onClick: () => {
