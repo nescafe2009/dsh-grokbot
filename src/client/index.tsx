@@ -265,7 +265,18 @@ const GROKBOT_CSS = `
 .grokbot-chips__item { border:1px solid rgba(37,99,235,.35); background:var(--gk-accent-soft); color:var(--gk-accent); border-radius:16px; padding:5px 16px; font-size:12.5px; cursor:pointer; font-weight:600; transition:all .14s; }
 .grokbot-chips__item:hover { background:rgba(37,99,235,.18); transform:translateY(-1px); }
 .grokbot-chips__item:disabled { opacity:.45; cursor:default; transform:none; }
-.grokbot-blank { flex:1; background:radial-gradient(1200px 500px at 50% 30%, #f8f9fc 0%, var(--gk-bg) 60%); }
+.grokbot-blank { flex:1; }
+.grokbot-home { flex:1; overflow-y:auto; display:flex; flex-direction:column; align-items:center; gap:34px; padding:72px 32px; background:radial-gradient(1200px 500px at 50% 20%, #f8f9fc 0%, var(--gk-bg) 60%); }
+.grokbot-home__hero { text-align:center; display:flex; flex-direction:column; align-items:center; gap:10px; }
+.grokbot-home__title { font-size:26px; font-weight:750; letter-spacing:-.02em; }
+.grokbot-home__sub { font-size:13.5px; color:var(--gk-text-2); }
+.grokbot-home__new { margin-top:10px; border:none; border-radius:99px; padding:11px 26px; font:inherit; font-size:14px; font-weight:650; cursor:pointer; background:#111; color:#fff; transition:transform .14s, filter .14s; }
+.grokbot-home__new:hover { transform:translateY(-1px); filter:brightness(1.15); }
+.grokbot-home__grid { display:flex; flex-wrap:wrap; gap:14px; justify-content:center; max-width:720px; }
+.grokbot-home__card { width:158px; display:flex; flex-direction:column; align-items:center; gap:6px; padding:20px 12px 14px; border:1px solid var(--gk-line); border-radius:16px; background:#fff; cursor:pointer; font:inherit; color:inherit; transition:all .16s cubic-bezier(.4,0,.2,1); box-shadow:var(--gk-shadow-sm); }
+.grokbot-home__card:hover { border-color:rgba(29,29,31,.22); transform:translateY(-2px); box-shadow:0 8px 22px rgba(29,29,31,.10); }
+.grokbot-home__name { font-size:13.5px; font-weight:650; }
+.grokbot-home__desc { font-size:11px; color:var(--gk-text-3); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:130px; }
 .grokbot-creating { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; font-size:13.5px; color:var(--gk-text-2); font-weight:500; }
 .grokbot-creating__spinner { width:28px; height:28px; border-radius:50%; border:3px solid var(--gk-accent-soft); border-top-color:var(--gk-accent); animation:grokbot-spin .75s linear infinite; }
 @keyframes grokbot-spin { to { transform:rotate(360deg) } }
@@ -1361,6 +1372,51 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
 
 /* ---------------- 主区接管 ---------------- */
 
+let creatingBotBusy = false
+function startCreatingBot(): void {
+  if (creatingBotBusy) return
+  openTarget = null
+  setCreatingUi(true)
+  creatingBotBusy = true
+  void api('/bots', { method: 'POST', body: JSON.stringify({}) })
+    .then((outcome) => {
+      const id = String(outcome?.bot?.id || '')
+      if (id) openBot(id)
+    })
+    .catch(() => undefined)
+    .finally(() => {
+      creatingBotBusy = false
+      setCreatingUi(false)
+    })
+}
+
+/* 空态欢迎页：可见的新建/选助手入口（Codex R1 收尾：不把空白当欢迎页） */
+function HomeBlank(props: { bots: BotInfo[] }): ReactNode {
+  const bots = props.bots.filter((bot) => !bot.hidden).slice(0, 6)
+  return (
+    <div className="grokbot-home">
+      <div className="grokbot-home__hero">
+        <div className="grokbot-home__title">今天想做点什么？</div>
+        <div className="grokbot-home__sub">从左侧选择一位助手开始，或新建一个</div>
+        <button type="button" className="grokbot-home__new" onClick={() => startCreatingBot()}>＋ 召唤新助手</button>
+      </div>
+      {bots.length > 0
+        ? (
+          <div className="grokbot-home__grid">
+            {bots.map((bot) => (
+              <button key={bot.id} type="button" className="grokbot-home__card" onClick={() => openConversation(bot.id)}>
+                <AvatarView seed={bot.id} name={bot.name} glyph={bot.roleTemplate || undefined} size={44} level={bot.rating?.level} />
+                <span className="grokbot-home__name">{bot.name}</span>
+                <span className="grokbot-home__desc">{bot.title || '常驻待命'}</span>
+              </button>
+            ))}
+          </div>
+        )
+        : null}
+    </div>
+  )
+}
+
 export function GrokbotMainView(): ReactNode {
   const target = useOpenTarget()
   const state = useGrokbotState()
@@ -1460,7 +1516,7 @@ export function GrokbotMainView(): ReactNode {
             </div>
           )
         }
-        return <div className="grokbot-blank" />
+        return <HomeBlank bots={state?.bots ?? []} />
       })()}
     </div>
   )
