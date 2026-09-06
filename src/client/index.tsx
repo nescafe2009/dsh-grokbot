@@ -1023,18 +1023,28 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
   const messages = useMemo(() => historyOf(bot.id), [bot.id, sending, historyRefresh])
   const pending = (state?.approvals ?? []).filter((approval) => approval.botId === bot.id)
 
+  // 服务端 DM 历史拉取：保留 artifact 等透传字段（原件卡片不能在历史加载时丢失）
+  const refetchHistory = useCallback(async (): Promise<void> => {
+    try {
+      const outcome = await api(`/conversations/${encodeURIComponent(bot.id)}`)
+      const list = (outcome?.messages ?? []) as { ts: number; role: string; text: string; artifact?: ArtifactInfo | null }[]
+      if (list.length === 0) return
+      histories.set(bot.id, list.map((message, index) => ({
+        id: `h${index}`,
+        role: message.role === 'user' ? ('user' as const) : ('bot' as const),
+        text: message.text,
+        at: message.ts,
+        artifact: message.artifact ?? null,
+      })))
+      forceRefresh((n) => n + 1)
+    } catch { /* 轮询兜底 */ }
+  }, [bot.id])
+
   useEffect(() => {
     if (loadedHistoryFor.has(bot.id) || histories.get(bot.id)?.length) return
     loadedHistoryFor.add(bot.id)
-    void api(`/conversations/${encodeURIComponent(bot.id)}`).then((outcome) => {
-      const list = (outcome?.messages ?? []) as { ts: number; role: string; text: string }[]
-      if (list.length === 0 || histories.get(bot.id)?.length) return
-      histories.set(bot.id, list.map((message, index) => message.role === 'user'
-        ? { id: `h${index}`, role: 'user' as const, text: message.text, at: message.ts }
-        : { id: `h${index}`, role: 'bot' as const, text: message.text, at: message.ts }))
-      forceRefresh((n) => n + 1)
-    }).catch(() => undefined)
-  }, [bot.id])
+    void refetchHistory()
+  }, [bot.id, refetchHistory])
 
   useEffect(() => {
     if (catalog.length > 0) return
@@ -1074,6 +1084,8 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
         })
       }
       appendLocal(bot.id, { id: `${Date.now()}-b`, role: 'bot', text: String(outcome?.reply ?? ''), at: Date.now() })
+      // 本回合可能有 deliver_file 交付的卡片：以服务端历史为准刷新（立即可见）
+      await refetchHistory()
     } catch (error) {
       appendLocal(bot.id, {
         id: `${Date.now()}-e`,
@@ -1084,7 +1096,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
     } finally {
       setSending(false)
     }
-  }, [draft, sending, bot.id])
+  }, [draft, sending, bot.id, refetchHistory])
 
   const routines = (state?.routines ?? []).filter((routine) => routine.botId === bot.id)
 

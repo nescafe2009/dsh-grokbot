@@ -1,6 +1,6 @@
-import { watch } from 'node:fs'
+import { existsSync, watch } from 'node:fs'
 import { appendFile, mkdir, readFile, writeFile, copyFile, stat, realpath } from 'node:fs/promises'
-import { basename, extname, join, resolve } from 'node:path'
+import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { loadOrCreateCrew, routeJob, botWorkspace, serializeCrew, atomicWrite, parseCrew, createBot, updateBot, removeBot, duplicateBot, createConversation, renameConversation, addConversationMember, removeConversationMember, removeConversation, upsertRoutine, removeRoutine } from './crew.mjs'
@@ -479,31 +479,39 @@ export function apply(ctx, config = {}) {
       async execute(params) {
         const rel = String(params?.path || '').trim().replace(/^\/+/, '')
         if (!rel || rel.split('/').includes('..')) return 'ERROR: 非法路径'
-        const root = botWorkspace(stateDir, bot)
-        const src = resolve(root, rel)
-        const real = await realpath(src).catch(() => null)
-        if (!real || (!real.startsWith(root) )) return `ERROR: 文件不存在：${rel}`
+        // 边界校验：根与目标都取真实路径，再按路径段判断包含（startsWith 会放行相邻目录）
+        const rootReal = await realpath(botWorkspace(stateDir, bot)).catch(() => null)
+        if (!rootReal) return 'ERROR: 工作区不可用'
+        const real = await realpath(resolve(rootReal, rel)).catch(() => null)
+        const relToRoot = real ? relative(rootReal, real) : null
+        const contained = relToRoot !== null && relToRoot !== '' && !relToRoot.startsWith('..') && !isAbsolute(relToRoot)
+        if (!real || !contained) return `ERROR: 文件不存在或不在工作区内：${rel}`
         const st = await stat(real)
         if (!st.isFile()) return 'ERROR: 不是常规文件'
         const id = `art-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`
         const name = basename(real)
         const dir = join(stateDir, 'artifacts', id)
-        await mkdir(dir, { recursive: true })
-        await copyFile(real, join(dir, name))
-        const buf = await readFile(join(dir, name))
+        await mkdir(join(dir, 'data'), { recursive: true })
+        // payload 固定名，与 meta.json 分离：原名 meta.json 不再覆盖元数据；size 以快照字节为准
+        const payloadPath = join(dir, 'data', 'payload')
+        await copyFile(real, payloadPath)
+        const buf = await readFile(payloadPath)
         const sha256 = createHash('sha256').update(buf).digest('hex')
-        const meta = { id, name, size: st.size, mime: ARTIFACT_MIME[extname(name).toLowerCase()] || 'application/octet-stream', sha256, sourcePath: real, createdAt: Date.now() }
+        const meta = {
+          id, name, size: buf.length,
+          mime: ARTIFACT_MIME[extname(name).toLowerCase()] || 'application/octet-stream',
+          sha256, sourcePath: real, workspaceRoot: rootReal, createdAt: Date.now(),
+        }
         await writeFile(join(dir, 'meta.json'), JSON.stringify(meta, null, 1))
-        const card = { id, name, size: st.size, mime: meta.mime, sha256 }
-        // 只有真实群会话才写房间；DM（conversationId 为空或即 bot 自身）写 DM transcript
+        const card = { id, name, size: meta.size, mime: meta.mime, sha256 }
+        // 会话身份固定（v3）：DM 是统一实体（会话 id === botId），其余会话（含单成员群）一律写该会话 transcript
         const conv = (crewState.crew.conversations ?? []).find((c) => c.id === conversationId)
-        const isGroupConversation = Boolean(conv && Array.isArray(conv.memberBotIds) && conv.memberBotIds.length > 1)
-        if (conversationId && isGroupConversation) {
-          await appendRoomMsg(conversationId, { role: 'bot', botId: bot.id, text: String(params?.note || `交付文件：${name}`), artifact: card })
+        if (conv && conversationId !== bot.id) {
+          await appendRoomMsg(conv.id, { role: 'bot', botId: bot.id, text: String(params?.note || `交付文件：${name}`), artifact: card })
         } else {
           await appendDm(bot.id, { role: 'bot', text: String(params?.note || `交付文件：${name}`), artifact: card })
         }
-        return `已交付 ${name}（${st.size} 字节，SHA256 ${sha256.slice(0, 16)}…）为会话内原件卡片`
+        return `已交付 ${name}（${meta.size} 字节，SHA256 ${sha256.slice(0, 16)}…）为会话内原件卡片`
       },
     }]
   }
@@ -1731,22 +1739,37 @@ export function apply(ctx, config = {}) {
           let meta
           try { meta = JSON.parse(await readFile(join(dir, 'meta.json'), 'utf8')) } catch { throw new HttpError(404, '成果不存在') }
           if (!meta?.name || /[\\/]/.test(meta.name)) throw new HttpError(400, '非法文件名')
+          // 旧结构快照（payload 在目录根部）兼容；新结构为 data/payload
+          const payloadPath = existsSync(join(dir, 'data', 'payload'))
+            ? join(dir, 'data', 'payload')
+            : join(dir, meta.name)
           if (method === 'GET') {
-            const buf = await readFile(join(dir, meta.name))
+            const buf = await readFile(payloadPath)
             const headers = {
               'content-type': meta.mime || 'application/octet-stream',
               'content-length': buf.length,
               'cache-control': 'private, max-age=60',
               'x-artifact-sha256': meta.sha256 || '',
             }
-            if (url.searchParams.get('download') === '1') headers['content-disposition'] = `attachment; filename*=UTF-8''${encodeURIComponent(meta.name)}`
+            if (url.searchParams.get('download') === '1') {
+              // 保存副本：原字节 + attachment（不执行）
+              headers['content-disposition'] = `attachment; filename*=UTF-8''${encodeURIComponent(meta.name)}`
+            } else if (/^(text\/html|image\/svg)/.test(meta.mime || '')) {
+              // 主动内容预览：CSP sandbox（无 allow-same-origin）——可运行脚本但为 opaque origin，
+              // 不能读宿主存储/调用宿主同源 API；不支持隔离的格式按附件保存
+              headers['content-security-policy'] = 'sandbox allow-scripts allow-popups allow-forms'
+              headers['x-content-type-options'] = 'nosniff'
+            }
             res.writeHead(200, headers)
             res.end(buf); return
           }
           if (method === 'POST' && url.searchParams.get('action') === 'reveal') {
-            const root = resolve(stateDir, 'workspace')
+            // Finder 定位源文件：根用交付记录绑定的实际 workspace（含 bot 自定义），真实路径 + 路径段包含
+            const rootReal = await realpath(meta.workspaceRoot || join(stateDir, 'workspace')).catch(() => null)
             const real = await realpath(meta.sourcePath).catch(() => null)
-            if (!real || !real.startsWith(root)) throw new HttpError(409, '源文件已不在共享工作区')
+            const relToRoot = rootReal && real ? relative(rootReal, real) : null
+            const contained = relToRoot !== null && relToRoot !== '' && !relToRoot.startsWith('..') && !isAbsolute(relToRoot)
+            if (!real || !contained) throw new HttpError(409, '源文件已不在交付时的工作区')
             await new Promise((ok, err) => spawn('open', ['-R', real], { stdio: 'ignore' }).on('exit', (code) => code === 0 ? ok() : err(new Error(`open exited ${code}`))))
             respond(res, 200, { ok: true, path: real }); return
           }

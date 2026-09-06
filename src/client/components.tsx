@@ -258,7 +258,11 @@ export function MessageView(props: MessageViewProps): ReactNode {
               actions={[
                 { label: '预览', onClick: () => window.open(`/api/plugins/grokbot/artifacts/${props.artifact!.id}`, '_blank') },
                 { label: '保存副本', onClick: () => window.open(`/api/plugins/grokbot/artifacts/${props.artifact!.id}?download=1`, '_blank') },
-                { label: '在本机打开', onClick: () => { void fetch(`/api/plugins/grokbot/artifacts/${props.artifact!.id}?action=reveal`, { method: 'POST' }).catch(() => undefined) } },
+                { label: '在 Finder 显示工作文件', onClick: () => {
+                  void fetch(`/api/plugins/grokbot/artifacts/${props.artifact!.id}?action=reveal`, { method: 'POST' })
+                    .then(async (r) => { if (!r.ok) window.alert(`无法显示工作文件：${await r.text().catch(() => r.status)}`) })
+                    .catch((e) => window.alert(`无法显示工作文件：${String(e)}`))
+                } },
               ]}
             />
           )
