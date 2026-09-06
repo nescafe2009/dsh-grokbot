@@ -75,6 +75,8 @@ export async function scanInbox(inboxRoot, { limit = 50 } = {}) {
       createdAt: Number(entry.createdAt) || null,
       ...(entry.fromBotId || jobJson?.fromBotId ? { fromBotId: String(entry.fromBotId || jobJson.fromBotId) } : {}),
       ...(entry.conversationId || jobJson?.conversationId ? { conversationId: String(entry.conversationId || jobJson.conversationId) } : {}),
+      ...(entry.taskId || jobJson?.taskId ? { taskId: String(entry.taskId || jobJson.taskId) } : {}),
+      ...(entry.handoff || jobJson?.handoff ? { handoff: entry.handoff || jobJson.handoff } : {}),
     })
     if (jobs.length >= limit) break
   }
