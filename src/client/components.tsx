@@ -171,13 +171,28 @@ export interface SidebarRowProps {
   active?: boolean
   working?: boolean
   level?: number
+  stack?: { seed: string; name?: string; glyph?: string }[]
   onClick?: () => void
 }
 
 export function SidebarRow(props: SidebarRowProps): ReactNode {
+  const size = TOKENS.size.avatarRow
+  const avatar = props.stack && props.stack.length > 1
+    ? (
+      // 群聊：前两位成员头像堆叠（参照 Grok 多成员堆叠样式）
+      <span style={{ position: 'relative', width: size + 5, height: size, flex: 'none', display: 'inline-block' }}>
+        <span style={{ position: 'absolute', left: 5, top: 0, zIndex: 1, borderRadius: '50%', background: '#fff', boxShadow: '0 0 0 1.5px #fff' }}>
+          <AvatarView seed={props.stack[1].seed} name={props.stack[1].name} glyph={props.stack[1].glyph} size={size - 3} />
+        </span>
+        <span style={{ position: 'absolute', left: 0, top: 0, zIndex: 2, borderRadius: '50%', background: '#fff', boxShadow: '0 0 0 1.5px #fff' }}>
+          <AvatarView seed={props.stack[0].seed} name={props.stack[0].name} glyph={props.stack[0].glyph} size={size - 3} />
+        </span>
+      </span>
+    )
+    : <AvatarView seed={props.seed} name={props.name} glyph={props.glyph} size={size} level={props.working ? undefined : props.level} />
   return (
     <button type="button" className={`gkf-row${props.active ? ' active' : ''}`} onClick={props.onClick}>
-      <AvatarView seed={props.seed} name={props.name} glyph={props.glyph} size={TOKENS.size.avatarRow} level={props.working ? undefined : props.level} />
+      {avatar}
       <span className="gkf-row__main">
         <span className="gkf-row__line1">
           <span className="gkf-row__name">{props.name}</span>
@@ -224,7 +239,7 @@ export function MessageView(props: MessageViewProps): ReactNode {
         {props.senderName
           ? <div className="gkf-msg__sender">{props.senderGlyph ? `${props.senderGlyph} ` : ''}{props.senderName}{time ? <span style={{ fontWeight: 400, color: TOKENS.color.text3, fontSize: TOKENS.font.time, marginLeft: 8 }}>{time}</span> : null}</div>
           : time ? <div className="gkf-msg__meta gkf-msg__meta--left">{time}</div> : null}
-        <div className="gkf-msg__body">{props.markdown === false ? props.text : <MarkdownView text={props.text} />}</div>
+        <div className="gkf-msg__bubble">{props.markdown === false ? props.text : <MarkdownView text={props.text} />}</div>
         {props.children}
       </div>
     )
@@ -320,7 +335,7 @@ const STATUS_LABEL: Record<TaskStatus, { label: string; cls: string }> = {
 
 export function TaskCard(props: TaskCardProps): ReactNode {
   const badge = STATUS_LABEL[props.status]
-  const dotColor = (state: TaskMember['state']) => state === 'done' ? TOKENS.color.dotDone : state === 'running' ? TOKENS.color.badgeRunning : state === 'failed' ? TOKENS.color.dotFail : 'rgba(255,255,255,.3)'
+  const dotColor = (state: TaskMember['state']) => state === 'done' ? TOKENS.color.dotDone : state === 'running' ? TOKENS.color.badgeRunning : state === 'failed' ? TOKENS.color.dotFail : TOKENS.color.text3
   return (
     <div className="gkf-task">
       <div className="gkf-task__head">
@@ -338,15 +353,15 @@ export function TaskCard(props: TaskCardProps): ReactNode {
                 <span className="gkf-task__member-desc">{member.desc}</span>
               </div>
             ))}
-            {props.executor ? <div style={{ fontSize: TOKENS.font.time, color: 'rgba(255,255,255,.4)' }}>执行机：{props.executor}</div> : null}
+            {props.executor ? <div style={{ fontSize: TOKENS.font.time, color: TOKENS.color.text3 }}>执行机：{props.executor}</div> : null}
           </div>
         )
         : null}
       <div className="gkf-task__foot">
-        <span className={`gkf-task__badge ${badge.cls}`}>{badge.label}</span>
+        <span className={`gkf-task__badge ${badge.cls}`}><i />{badge.label}</span>
         <span className="gkf-task__spacer" />
         {(props.actions ?? []).map((action) => (
-          <button key={action.label} type="button" className={`gkf-task__btn${action.primary ? '' : ' gkf-task__btn--ghost'}`} disabled={action.disabled} onClick={action.onClick}>{action.label}</button>
+          <button key={action.label} type="button" className={`gkf-task__btn${action.primary ? ' gkf-task__btn--primary' : ''}`} disabled={action.disabled} onClick={action.onClick}>{action.label}</button>
         ))}
       </div>
     </div>

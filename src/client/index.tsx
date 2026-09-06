@@ -754,12 +754,19 @@ export function GrokbotSidebarCrew(): ReactNode {
           const isGroup = conversation.memberBotIds.length > 1
           const bot = isGroup ? undefined : botOf(conversation.memberBotIds[0])
           const working = !isGroup && bot?.status === 'working'
+          const stack = isGroup
+            ? conversation.memberBotIds.slice(0, 2).map((botId) => {
+                const member = botOf(botId)
+                return { seed: botId, name: member?.name, glyph: member?.roleTemplate || undefined }
+              })
+            : undefined
           return (
             <SidebarRow
               key={conversation.id}
               seed={isGroup ? conversation.id : (bot?.id ?? conversation.id)}
               name={rowTitle(conversation)}
               glyph={isGroup ? 'group' : (bot?.roleTemplate || undefined)}
+              stack={stack && stack.length > 1 ? stack : undefined}
               preview={rowPreview(conversation)}
               time={timeLabel(conversation.lastAt)}
               working={working}
@@ -1051,25 +1058,6 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
         <button type="button" className="grokbot-iconbtn" title="编辑资料" onClick={() => setEditing((v) => !v)}>⚙</button>
         <button type="button" className="grokbot-chat__close" onClick={closeTarget} aria-label="关闭">✕</button>
       </div>
-      <div className="gk-modelbar">
-        <span className="gk-modelbar__label">MODEL</span>
-        <select
-          className="gk-modelbar__select"
-          value={bot.model ? `${bot.model.provider}/${bot.model.model}` : ''}
-          onChange={(e) => {
-            const val = e.target.value
-            if (!val) { void api(`/bots/${encodeURIComponent(bot.id)}`, { method: 'PATCH', body: JSON.stringify({ model: null }) }).then(() => refreshState?.()).catch(() => undefined); return }
-            const [provider, model] = val.split('/')
-            void api(`/bots/${encodeURIComponent(bot.id)}`, { method: 'PATCH', body: JSON.stringify({ model: { provider, model } }) }).then(() => refreshState?.()).catch(() => undefined)
-          }}
-        >
-          <option value="">跟随团队默认</option>
-          {catalog.map((p) => p.models.map((m) => (
-            <option key={`${p.id}/${m.id}`} value={`${p.id}/${m.id}`}>{p.name} / {m.name}</option>
-          )))}
-        </select>
-        {bot.model ? <span className="gk-modelbar__custom">自定义</span> : <span className="gk-modelbar__default">默认</span>}
-      </div>
       {editing ? <div style={{ padding: '0 20px' }}><BotForm initial={bot} onCancel={() => setEditing(false)} onSaved={() => setEditing(false)} /></div> : null}
       {bot.setupStage
         ? (
@@ -1129,6 +1117,26 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
         {detailsOpen
           ? (
             <div className="grokbot-details">
+              <div>
+                <div className="grokbot-details__title">模型（高级设置）</div>
+                <select
+                  className="gk-modelbar__select"
+                  style={{ width: '100%', marginTop: 6, boxSizing: 'border-box' }}
+                  value={bot.model ? `${bot.model.provider}/${bot.model.model}` : ''}
+                  onChange={(e) => {
+                    const val = e.target.value
+                    if (!val) { void api(`/bots/${encodeURIComponent(bot.id)}`, { method: 'PATCH', body: JSON.stringify({ model: null }) }).then(() => refreshState?.()).catch(() => undefined); return }
+                    const [provider, model] = val.split('/')
+                    void api(`/bots/${encodeURIComponent(bot.id)}`, { method: 'PATCH', body: JSON.stringify({ model: { provider, model } }) }).then(() => refreshState?.()).catch(() => undefined)
+                  }}
+                >
+                  <option value="">跟随团队默认</option>
+                  {catalog.map((p) => p.models.map((m) => (
+                    <option key={`${p.id}/${m.id}`} value={`${p.id}/${m.id}`}>{p.name} / {m.name}</option>
+                  )))}
+                </select>
+                <div className="grokbot-details__hint">{bot.model ? `自定义：${bot.model.provider}/${bot.model.model}` : '未覆盖时沿用宿主默认模型'}</div>
+              </div>
               {bot.rating ? (
                 <div className="grokbot-rating">
                   <div className="grokbot-rating__head">

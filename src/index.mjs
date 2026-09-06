@@ -452,7 +452,14 @@ export function apply(ctx, config = {}) {
     return { ok: false, error: '启动命令已执行但未检测到浏览器进程' }
   }
 
+  let computerEnabled = false
+  async function refreshComputerFlag() {
+    computerEnabled = (await loadComputerConfig())?.enabled === true
+  }
+
   function computerTools(bot) {
+    // 配件默认关闭：未启用时不注册任何 computer_* 工具（v3「可选配件默认不启用」）
+    if (!computerEnabled) return []
     // render(args, value)：value 才是 execute 返回值；必须返回 ContentBlock[]
     const output = { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: String(value) }] }
     return [
@@ -692,10 +699,13 @@ export function apply(ctx, config = {}) {
   }
 
   function personaPrompt(bot) {
+    const computerOn = computerEnabled
     return [
       bot.persona || '你是常驻桌面 agent 团队的一员，用简体中文直接处理用户投递的任务。',
       '你的工作环境是宿主本机（用户的 Mac）：bash/文件等本地工具毫秒级可用，工作目录即你的 workspace（个人子目录 agents/' + bot.id + '），团队产物直接写在本地 workspace。',
-      'computer_* 工具指向可选的团队共享电脑（Linux VM 配件）：用于无头构建、长时任务、托管可试玩的 HTML（computer_preview 会在配件浏览器打开，用户经「电脑」视图观看/接管）。日常编码优先用本地工具，不要绕道配件。',
+      ...(computerOn
+        ? ['computer_* 工具指向可选的团队共享电脑（Linux VM 配件）：用于无头构建、长时任务、托管可试玩的 HTML（computer_preview 会在配件浏览器打开，用户经「电脑」视图观看/接管）。日常编码优先用本地工具，不要绕道配件。']
+        : []),
       ...(bot.id === 'chief'
         ? ['你是幕僚长：团队协调者而非执行者。成员交付后你会被自动唤醒——届时派发下游工作（带上游产物路径）、催办等待者、全部完成后向群里做收尾总结。尽量把活分给成员，不要自己代做。']
         : []),
@@ -769,6 +779,7 @@ export function apply(ctx, config = {}) {
     const loaded = await loadOrCreateCrew(stateDir)
     crewState.path = loaded.path
     crewState.crew = loaded.crew
+    await refreshComputerFlag()
     await loadChatSessions()
     await loadUiState()
     for (const bot of crewState.crew.bots) {
