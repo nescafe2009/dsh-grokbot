@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { renderAvatarSVG, renderLevelRing, ROLE_DEFS } from './avatars'
 import type { ReactNode } from 'react'
+import { AvatarView, MarkdownView, splitChips, SidebarRow, MessageView, Composer, TaskCard } from './components'
+import { GKF_CSS } from './tokens'
 
 const API_ROOT = '/api/plugins/grokbot'
 const POLL_MS = 2000
@@ -86,8 +87,8 @@ interface CatalogProvider {
 
 const GROKBOT_CSS = `
 :root {
-  --gk-bg-side: #f5f5f7;
-  --gk-bg: #ffffff;
+  --gk-bg-side: #f7f7f7;
+  --gk-bg: #fcfcfc;
   --gk-bg-soft: #f2f2f7;
   --gk-text: #1d1d1f;
   --gk-text-2: rgba(29,29,31,.55);
@@ -165,14 +166,10 @@ const GROKBOT_CSS = `
 .grokbot-chat__close { border:none; background:none; cursor:pointer; color:var(--gk-text-2); font-size:15px; width:30px; height:30px; display:inline-flex; align-items:center; justify-content:center; border-radius:9px; transition:all .14s; }
 .grokbot-chat__close:hover { color:var(--gk-text); background:rgba(29,29,31,.07); }
 .grokbot-body { flex:1; display:flex; min-height:0; }
-.grokbot-log { flex:1; overflow-y:auto; padding:26px 30px; display:flex; flex-direction:column; gap:13px; scrollbar-width:thin; }
+.grokbot-log { flex:1; overflow-y:auto; padding:26px 20px; display:flex; flex-direction:column; gap:13px; scrollbar-width:thin; }
 .grokbot-log::-webkit-scrollbar { width:5px; }
 .grokbot-log::-webkit-scrollbar-thumb { background:rgba(29,29,31,.15); border-radius:5px; }
-.grokbot-msg { max-width:72%; border-radius:16px; padding:10px 15px; font-size:14px; line-height:1.6; white-space:pre-wrap; word-break:break-word; letter-spacing:-.005em; }
-.grokbot-msg.user { align-self:flex-end; background:var(--gk-bg-soft); color:var(--gk-text); border-bottom-right-radius:6px; }
-.grokbot-msg.bot { align-self:flex-start; background:linear-gradient(180deg,#ffffff,#fcfdff); border:1px solid var(--gk-line); border-bottom-left-radius:6px; box-shadow:var(--gk-shadow-sm); }
-.grokbot-msg.error { align-self:center; background:rgba(239,68,68,.08); color:var(--gk-red); font-size:12.5px; border:1px solid rgba(239,68,68,.2); }
-.grokbot-msg.activity { align-self:center; background:transparent; font-size:11px; color:var(--gk-text-3); padding:2px 12px; font-variant-numeric:tabular-nums; }
+.grokbot-msg { max-width:72%; }
 .grokbot-msg.approval { align-self:flex-start; border:1px solid rgba(245,158,11,.4); background:linear-gradient(180deg,#fffbeb,#fff8e6); border-radius:14px; padding:11px 15px; box-shadow:var(--gk-shadow-sm); }
 .grokbot-approval__title { font-size:13px; font-weight:650; margin-bottom:4px; }
 .grokbot-approval__reason { font-size:12.5px; color:var(--gk-text-2); margin-bottom:10px; white-space:pre-wrap; }
@@ -181,7 +178,6 @@ const GROKBOT_CSS = `
 .grokbot-approval__ok { background:linear-gradient(135deg,#34d399,#22c55e); color:#fff; box-shadow:0 2px 8px rgba(34,197,94,.3); }
 .grokbot-approval__ok:hover { filter:brightness(1.05); }
 .grokbot-approval__no { background:var(--gk-bg-soft); color:var(--gk-text); }
-.grokbot-msg .grokbot-msg__time { display:block; font-size:10px; color:var(--gk-text-3); margin-top:5px; text-align:inherit; font-variant-numeric:tabular-nums; }
 .grokbot-empty { margin:auto; text-align:center; color:var(--gk-text-3); font-size:13px; line-height:1.7; }
 .grokbot-details { width:272px; flex:none; border-left:1px solid var(--gk-line); overflow-y:auto; padding:16px 16px 24px; display:flex; flex-direction:column; gap:18px; background:#fafafc; }
 .grokbot-rating { border:1px solid var(--gk-line); border-radius:12px; padding:11px 13px; background:#fff; }
@@ -205,77 +201,12 @@ const GROKBOT_CSS = `
 .grokbot-routine__sched { font-size:11px; color:var(--gk-text-3); margin-top:3px; }
 .grokbot-details__new { border:1px dashed rgba(37,99,235,.4); border-radius:11px; background:rgba(37,99,235,.04); color:var(--gk-accent); padding:8px; font-size:12.5px; font-weight:600; cursor:pointer; width:100%; transition:all .14s; }
 .grokbot-details__new:hover { background:var(--gk-accent-soft); border-color:var(--gk-accent-2); }
-/* ══════════ ZCode 风格单聊视图 ══════════ */
-.gk-dm { width:100%; height:100%; display:flex; flex-direction:column; background:var(--gk-bg); font-family:var(--gk-font); color:var(--gk-text); }
-.gk-dm__header { display:flex; align-items:center; justify-content:space-between; padding:10px 16px; border-bottom:1px solid var(--gk-line); background:#fafafc; }
-.gk-dm__header-left { display:flex; align-items:center; gap:10px; }
-.gk-dm__header-info { display:flex; flex-direction:column; gap:1px; }
-.gk-dm__name { font-size:14.5px; font-weight:700; letter-spacing:-.01em; }
-.gk-dm__role { font-size:11px; color:var(--gk-text-2); }
-.gk-dm__header-right { display:flex; align-items:center; gap:8px; }
-.gk-dm__status { display:flex; align-items:center; gap:5px; font-size:10px; font-weight:700; letter-spacing:.08em; color:var(--gk-green); font-family:ui-monospace,Menlo,monospace; }
-.gk-dm__status-dot { width:7px; height:7px; border-radius:50%; background:var(--gk-green); }
-.gk-dm__status.working { color:var(--gk-amber); }
-.gk-dm__status.working .gk-dm__status-dot { background:var(--gk-amber); animation:grokbot-pulse 1.2s infinite; }
-.gk-dm__model { border:1px solid var(--gk-line); border-radius:6px; padding:3px 8px; font:inherit; font-size:11px; background:#fff; color:var(--gk-text); outline:none; cursor:pointer; font-family:ui-monospace,Menlo,monospace; max-width:220px; }
-.gk-dm__model:focus { border-color:var(--gk-accent-2); }
-.gk-dm__rating { font-size:10px; font-weight:700; color:var(--gk-accent); background:var(--gk-accent-soft); border-radius:5px; padding:2px 7px; font-family:ui-monospace,Menlo,monospace; }
-.gk-dm__stop { border:1px solid rgba(239,68,68,.4); background:rgba(239,68,68,.06); color:var(--gk-red); border-radius:6px; padding:3px 10px; font-size:10px; font-weight:700; cursor:pointer; font-family:ui-monospace,Menlo,monospace; letter-spacing:.05em; }
-.gk-dm__stop:hover { background:rgba(239,68,68,.14); }
-.gk-dm__iconbtn { border:none; background:none; cursor:pointer; color:var(--gk-text-2); font-size:14px; width:28px; height:28px; display:inline-flex; align-items:center; justify-content:center; border-radius:7px; transition:all .12s; }
-.gk-dm__iconbtn:hover { color:var(--gk-text); background:rgba(29,29,31,.07); }
-.gk-dm__pathbar { display:flex; align-items:center; gap:8px; padding:4px 16px; border-bottom:1px solid var(--gk-line); background:#f5f6f8; font-family:ui-monospace,"SF Mono",Menlo,monospace; font-size:10.5px; color:var(--gk-text-2); }
-.gk-dm__path-icon { font-size:11px; }
-.gk-dm__path { color:var(--gk-text-3); }
-.gk-dm__model-inline { margin-left:auto; color:var(--gk-text-3); }
-.gk-dm__stars { color:#f5a623; letter-spacing:1px; }
-.gk-dm__body { flex:1; display:flex; min-height:0; }
-.gk-dm__log { flex:1; overflow-y:auto; padding:20px 20px 12px; display:flex; flex-direction:column; gap:2px; scrollbar-width:thin; }
-.gk-dm__log::-webkit-scrollbar { width:5px; }
-.gk-dm__log::-webkit-scrollbar-thumb { background:rgba(29,29,31,.15); border-radius:5px; }
-.gk-dm__empty { margin:auto; text-align:center; color:var(--gk-text-3); display:flex; flex-direction:column; align-items:center; gap:10px; }
-.gk-dm__empty-icon { font-size:28px; opacity:.3; }
-.gk-dm__empty-hint { font-size:11px; font-family:ui-monospace,Menlo,monospace; opacity:.5; }
-.gk-dm__msg-user { display:flex; gap:8px; padding:8px 0; border-left:3px solid var(--gk-accent-2); padding-left:12px; margin-bottom:8px; }
-.gk-dm__msg-label { color:var(--gk-accent); font-weight:700; font-size:13px; flex:none; }
-.gk-dm__msg-content { font-size:13.5px; line-height:1.55; white-space:pre-wrap; word-break:break-word; }
-.gk-dm__msg-bot { padding:4px 0 10px; border-bottom:1px solid rgba(29,29,31,.04); margin-bottom:6px; }
-.gk-dm__msg-bot-head { display:flex; align-items:center; gap:8px; margin-bottom:4px; }
-.gk-dm__msg-bot-name { font-size:11px; font-weight:700; color:var(--gk-accent); font-family:ui-monospace,Menlo,monospace; }
-.gk-dm__msg-time { font-size:10px; color:var(--gk-text-3); font-variant-numeric:tabular-nums; }
-.gk-dm__msg-bot-body { font-size:14px; line-height:1.6; }
-.gk-dm__msg-bot-body .grokbot-msg { max-width:100%; padding:0; border:none; background:none; box-shadow:none; }
-.gk-dm__msg-bot-body > .grokbot-md__p { font-size:14px; }
-.gk-dm__fb { display:inline-flex; gap:4px; margin-left:12px; opacity:.35; }
-.gk-dm__fb button { border:none; background:none; cursor:pointer; font-size:11px; padding:0 2px; }
-.gk-dm__fb button:hover { opacity:1; transform:scale(1.2); }
-.gk-dm__msg-tool { font-family:ui-monospace,Menlo,monospace; font-size:11px; color:var(--gk-text-3); padding:2px 0 2px 15px; border-left:2px solid rgba(245,158,11,.4); margin:2px 0; }
-.gk-dm__msg-err { font-family:ui-monospace,Menlo,monospace; font-size:11.5px; color:var(--gk-red); padding:4px 0 4px 15px; border-left:2px solid rgba(239,68,68,.4); margin:4px 0; }
-.gk-dm__thinking { display:flex; align-items:center; gap:4px; padding:10px 15px; }
-.gk-dm__thinking-dots { display:flex; gap:4px; }
-.gk-dm__thinking-dots i { width:6px; height:6px; border-radius:50%; background:var(--gk-accent); animation:grokbot-pulse 1.2s infinite; }
-.gk-dm__thinking-dots i:nth-child(2) { animation-delay:.2s; }
-.gk-dm__thinking-dots i:nth-child(3) { animation-delay:.4s; }
-.gk-dm__side { width:260px; flex:none; border-left:1px solid var(--gk-line); overflow-y:auto; padding:14px; display:flex; flex-direction:column; gap:16px; background:#fafafc; }
-.gk-dm__input { display:flex; align-items:center; gap:0; padding:8px 16px 12px; border-top:1px solid var(--gk-line); background:#fafafc; }
-.gk-dm__input-prompt { color:var(--gk-accent); font-weight:700; font-size:15px; flex:none; width:24px; font-family:ui-monospace,Menlo,monospace; }
-.gk-dm__input-field { flex:1; resize:none; border:none; background:transparent; font:inherit; font-size:13.5px; line-height:1.5; min-height:36px; max-height:140px; color:var(--gk-text); outline:none; font-family:var(--gk-font); }
-.gk-dm__input-field::placeholder { color:var(--gk-text-3); font-family:ui-monospace,Menlo,monospace; font-size:12px; }
-.gk-dm__input-hint { font-size:10px; color:var(--gk-text-3); font-family:ui-monospace,Menlo,monospace; flex:none; border:1px solid var(--gk-line); border-radius:4px; padding:1px 5px; margin-left:8px; }
-
 .gk-modelbar { display:flex; align-items:center; gap:8px; padding:5px 20px; border-bottom:1px solid var(--gk-line); background:#fafafc; font-family:ui-monospace,"SF Mono",Menlo,monospace; }
 .gk-modelbar__label { font-size:9.5px; font-weight:700; color:var(--gk-text-3); letter-spacing:.1em; }
 .gk-modelbar__select { border:1px solid var(--gk-line); border-radius:6px; padding:2px 8px; font:inherit; font-size:11px; background:#fff; color:var(--gk-text); outline:none; cursor:pointer; max-width:280px; }
 .gk-modelbar__select:focus { border-color:var(--gk-accent-2); }
 .gk-modelbar__custom { font-size:9.5px; color:var(--gk-accent); font-weight:700; }
 .gk-modelbar__default { font-size:9.5px; color:var(--gk-text-3); }
-.grokbot-inputbar { display:flex; align-items:flex-end; gap:4px; padding:12px 18px 18px; }
-.grokbot-inputbar textarea { flex:1; resize:none; border:1px solid var(--gk-line); border-radius:14px; padding:11px 15px; font:inherit; font-size:13.5px; line-height:1.55; min-height:46px; max-height:150px; background:var(--gk-bg); color:var(--gk-text); transition:border-color .16s, box-shadow .16s; }
-.grokbot-inputbar textarea:focus { outline:none; border-color:var(--gk-accent-2); box-shadow:0 0 0 4px var(--gk-accent-soft); }
-.grokbot-inputbar textarea::placeholder { color:var(--gk-text-3); }
-.grokbot-inputbar .side { border:none; background:none; cursor:pointer; color:var(--gk-text-2); font-size:17px; width:36px; height:38px; display:inline-flex; align-items:center; justify-content:center; border-radius:11px; transition:all .14s; }
-.grokbot-inputbar .side:hover { color:var(--gk-accent); background:var(--gk-accent-soft); }
-.grokbot-inputbar .side:disabled { opacity:.3; cursor:default; }
 .grokbot-md__p { white-space:pre-wrap; }
 .grokbot-md__h1, .grokbot-md__h2, .grokbot-md__h3, .grokbot-md__h4 { font-weight:700; margin:8px 0 3px; letter-spacing:-.01em; }
 .grokbot-md__h1 { font-size:17px; } .grokbot-md__h2 { font-size:15.5px; } .grokbot-md__h3 { font-size:14.5px; } .grokbot-md__h4 { font-size:13.5px; }
@@ -331,39 +262,6 @@ const GROKBOT_CSS = `
 
 
 
-/** Grok 风头像：专家=名字首字白字；群/角色=单线条矢量图标；底=专属渐变 */
-function AvatarView(props: { seed: string; name?: string; glyph?: string; size: number; fontSize?: number; level?: number }): ReactNode {
-  const roleKey = props.glyph
-  const size = props.size
-  const isKnown = roleKey && ROLE_DEFS[roleKey] !== undefined
-  const ring = props.level !== undefined && props.level >= 4 ? renderLevelRing(props.level) : ''
-
-  // 已知角色/群/关键词族 → 直接加载 Codex 高保真 SVG
-  if (isKnown) {
-    return (
-      <span style={{ width: size, height: size, position: 'relative', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flex: 'none' }}>
-        <img
-          src={`/api/plugins/grokbot/assets/avatars/${roleKey}`}
-          width={size}
-          height={size}
-          style={{ borderRadius: '50%', display: 'block', objectFit: 'contain' }}
-          alt={props.name || roleKey}
-        />
-        {ring ? <span style={{ position: 'absolute', inset: -2, pointerEvents: 'none' }} dangerouslySetInnerHTML={{ __html: ring.replace('<svg ', `<svg width="${size + 4}" height="${size + 4}" `) }} /> : null}
-      </span>
-    )
-  }
-
-  // 自定义角色 → 哈希拼装（参数化引擎）
-  const svgHtml = renderAvatarSVG({ name: props.name, size })
-  return (
-    <span
-      style={{ width: size, height: size, position: 'relative', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flex: 'none' }}
-      dangerouslySetInnerHTML={{ __html: svgHtml }}
-    />
-  )
-}
-
 let openTarget: { kind: 'conversation'; id: string } | null = null
 let creatingUi = false
 let nativeSidebarVisible = false
@@ -385,14 +283,6 @@ function persistLastTarget(target: { kind: string; id: string }): void {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(target),
   }).catch(() => undefined)
-}
-
-// 原生会话视图是否已出现：centerCol 里渲染出输入框即视为会话已打开，
-// 否则是 DSH 默认首页（探索未知之境）或过渡态
-function nativeSessionVisible(): boolean {
-  const center = document.querySelector('[class*="centerCol"]')
-  if (!center) return false
-  return Boolean(center.querySelector('textarea, [contenteditable="true"]'))
 }
 
 // 统一实体：私聊会话 id === botId；群聊会话 id 独立
@@ -865,19 +755,18 @@ export function GrokbotSidebarCrew(): ReactNode {
           const bot = isGroup ? undefined : botOf(conversation.memberBotIds[0])
           const working = !isGroup && bot?.status === 'working'
           return (
-            <button key={conversation.id} type="button" className={`grokbot-chatrow${target?.id === conversation.id ? ' active' : ''}`} onClick={() => openConversation(conversation.id)}>
-              <span className="grokbot-avatar">
-                <AvatarView seed={isGroup ? conversation.id : (bot?.id ?? conversation.id)} name={bot?.name} glyph={isGroup ? 'group' : (bot?.roleTemplate || undefined)} size={36} level={!isGroup ? bot?.rating?.level : undefined} />
-                {!isGroup ? <span className={`grokbot-avatar__dot${working ? ' working' : ''}`} /> : null}
-              </span>
-              <span className="grokbot-chatrow__main">
-                <span className="grokbot-chatrow__line1">
-                  <span className="grokbot-chatrow__name">{rowTitle(conversation)}</span>
-                  <span className="grokbot-chatrow__time">{timeLabel(conversation.lastAt)}</span>
-                </span>
-                <span className="grokbot-chatrow__preview">{rowPreview(conversation)}</span>
-              </span>
-            </button>
+            <SidebarRow
+              key={conversation.id}
+              seed={isGroup ? conversation.id : (bot?.id ?? conversation.id)}
+              name={rowTitle(conversation)}
+              glyph={isGroup ? 'group' : (bot?.roleTemplate || undefined)}
+              preview={rowPreview(conversation)}
+              time={timeLabel(conversation.lastAt)}
+              working={working}
+              level={!isGroup ? bot?.rating?.level : undefined}
+              active={target?.id === conversation.id}
+              onClick={() => openConversation(conversation.id)}
+            />
           )
         })}
       </div>
@@ -897,122 +786,6 @@ export function GrokbotSidebarCrew(): ReactNode {
 
 
 /* ---------------- 消息内可视化组件 ---------------- */
-
-let mdKeySeed = 0
-function renderInline(text: string): ReactNode[] {
-  const parts: ReactNode[] = []
-  const re = /(\*\*[^*]+\*\*|`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\)|https?:\/\/[^\s)]+)/g
-  let last = 0
-  let match: RegExpExecArray | null
-  while ((match = re.exec(text))) {
-    if (match.index > last) parts.push(text.slice(last, match.index))
-    const token = match[0]
-    const key = `i${mdKeySeed++}`
-    if (token.startsWith('**')) {
-      parts.push(<strong key={key}>{token.slice(2, -2)}</strong>)
-    } else if (token.startsWith('`')) {
-      parts.push(<code key={key} className="grokbot-md__icode">{token.slice(1, -1)}</code>)
-    } else if (token.startsWith('[')) {
-      const link = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/.exec(token)
-      if (link) parts.push(<a key={key} href={link[2]} target="_blank" rel="noreferrer" className="grokbot-md__link">{link[1]}</a>)
-      else parts.push(token)
-    } else {
-      parts.push(<a key={key} href={token} target="_blank" rel="noreferrer" className="grokbot-md__link">{token.length > 48 ? `${token.slice(0, 45)}…` : token}</a>)
-    }
-    last = match.index + token.length
-  }
-  if (last < text.length) parts.push(text.slice(last))
-  return parts
-}
-
-function MarkdownText(props: { text: string }): ReactNode {
-  const lines = props.text.split('\n')
-  const out: ReactNode[] = []
-  let list: string[] = []
-  const flushList = (): void => {
-    if (list.length === 0) return
-    out.push(<ul key={`l${mdKeySeed++}`} className="grokbot-md__ul">{list.map((item, i) => <li key={i}>{renderInline(item)}</li>)}</ul>)
-    list = []
-  }
-  for (const raw of lines) {
-    const line = raw.trimEnd()
-    const heading = /^(#{1,4})\s+(.*)$/.exec(line)
-    const bullet = /^[-*•]\s+(.*)$/.exec(line)
-    const ordered = /^(\d+)[.、)]\s+(.*)$/.exec(line)
-    const quote = /^>\s?(.*)$/.exec(line)
-    if (bullet) { list.push(bullet[1]); continue }
-    if (ordered) { list.push(`${ordered[1]}. ${ordered[2]}`); continue }
-    flushList()
-    if (!line.trim()) { out.push(<div key={`s${mdKeySeed++}`} className="grokbot-md__spacer" />); continue }
-    if (heading) {
-      const level = heading[1].length
-      out.push(<div key={`h${mdKeySeed++}`} className={`grokbot-md__h${level}`}>{renderInline(heading[2])}</div>)
-    } else if (quote) {
-      out.push(<blockquote key={`q${mdKeySeed++}`} className="grokbot-md__quote">{renderInline(quote[1])}</blockquote>)
-    } else if (/^---+$/.test(line.trim())) {
-      out.push(<hr key={`r${mdKeySeed++}`} className="grokbot-md__hr" />)
-    } else {
-      out.push(<div key={`p${mdKeySeed++}`} className="grokbot-md__p">{renderInline(line)}</div>)
-    }
-  }
-  flushList()
-  return <>{out}</>
-}
-
-function CodeBlock(props: { code: string; lang: string }): ReactNode {
-  const lines = props.code.replace(/\n$/, '').split('\n')
-  const long = lines.length > 14
-  const [collapsed, setCollapsed] = useState(long)
-  const [copied, setCopied] = useState(false)
-  const copy = useCallback(async (): Promise<void> => {
-    try {
-      await navigator.clipboard.writeText(props.code)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    } catch { /* 无剪贴板权限 */ }
-  }, [props.code])
-  return (
-    <div className="grokbot-code">
-      <div className="grokbot-code__bar">
-        <span className="grokbot-code__lang">{props.lang || 'text'}</span>
-        <div className="grokbot-code__actions">
-          {long
-            ? <button type="button" onClick={() => setCollapsed((v) => !v)}>{collapsed ? `展开 ${lines.length} 行` : '折叠'}</button>
-            : null}
-          <button type="button" onClick={() => void copy()}>{copied ? '已复制 ✓' : '复制'}</button>
-        </div>
-      </div>
-      <pre className={`grokbot-code__pre${collapsed ? ' collapsed' : ''}`}>{collapsed ? '' : props.code.replace(/\n$/, '')}</pre>
-      {collapsed ? <button type="button" className="grokbot-code__peek" onClick={() => setCollapsed(false)}>{props.code.split('\n').slice(0, 3).join('\n').slice(0, 120)}…</button> : null}
-    </div>
-  )
-}
-
-function MarkdownView(props: { text: string }): ReactNode {
-  const segments = props.text.split(/```/)
-  return (
-    <>
-      {segments.map((segment, index) => {
-        if (index % 2 === 1) {
-          const body = segment.replace(/^\n/, '')
-          const lang = /^[a-zA-Z0-9_+-]*\n/.exec(body)?.[0]?.trim() || ''
-          const code = lang ? body.slice(lang.length) : body
-          return <CodeBlock key={`c${index}`} code={code} lang={lang} />
-        }
-        return <MarkdownText key={`t${index}`} text={segment} />
-      })}
-    </>
-  )
-}
-
-function splitChips(text: string): { body: string; chips: string[] } {
-  const match = /\n?\[\[([^\]\n]+)\]\]\s*$/.exec(text)
-  if (!match) return { body: text, chips: [] }
-  return {
-    body: text.slice(0, match.index),
-    chips: match[1].split('|').map((entry) => entry.trim()).filter(Boolean).slice(0, 6),
-  }
-}
 
 function SetupWizard(props: { bot: BotInfo; onAdvance: () => void }): ReactNode {
   const { bot } = props
@@ -1309,16 +1082,14 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
       <div className="grokbot-body">
         <div className="grokbot-log" ref={logRef}>
           {messages.length === 0 && pending.length === 0
-            ? <div className="grokbot-empty">和 {bot.name} 对话，或投递任务给它。<br />它会真实使用工具、在团队共享电脑里干活。</div>
+            ? <div className="grokbot-empty">和 {bot.name} 对话，或投递任务给它。<br />它会真实使用工具、在本机工作区里干活。</div>
             : null}
           {messages.map((message) => {
             const botIdForFb = bot.id
             if (message.role === 'bot') {
               const { body, chips } = splitChips(message.text)
               return (
-                <div key={message.id} className="grokbot-msg bot">
-                  <strong style={{ display: 'block', fontSize: 11.5, opacity: .55, marginBottom: 2 }}>{bot.avatar} {bot.name}</strong>
-                  <MarkdownView text={body} />
+                <MessageView key={message.id} role="bot" text={body} at={message.at}>
                   {chips.length > 0
                     ? (
                       <div className="grokbot-chips">
@@ -1328,23 +1099,28 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
                       </div>
                     )
                     : null}
-                  <span className="grokbot-msg__time">
-                    {new Date(message.at).toLocaleTimeString()}
-                    <span className="grokbot-fb">
-                      <button type="button" title="干得好 +5" onClick={() => void sendFeedback(botIdForFb, message.id, true)}><img src="/api/plugins/grokbot/assets/rating/thumb-up" width="12" height="12" alt="👍" /></button>
-                      <button type="button" title="不满意 -3" onClick={() => void sendFeedback(botIdForFb, message.id, false)}><img src="/api/plugins/grokbot/assets/rating/thumb-down" width="12" height="12" alt="👎" /></button>
-                    </span>
+                  <span className="grokbot-fb">
+                    <button type="button" title="干得好 +5" onClick={() => void sendFeedback(botIdForFb, message.id, true)}><img src="/api/plugins/grokbot/assets/rating/thumb-up" width="12" height="12" alt="👍" /></button>
+                    <button type="button" title="不满意 -3" onClick={() => void sendFeedback(botIdForFb, message.id, false)}><img src="/api/plugins/grokbot/assets/rating/thumb-down" width="12" height="12" alt="👎" /></button>
                   </span>
-                </div>
+                </MessageView>
               )
             }
-            return (
-              <div key={message.id} className={`grokbot-msg ${message.role}`}>
-                {message.text}
-                <span className="grokbot-msg__time">{new Date(message.at).toLocaleTimeString()}</span>
-              </div>
-            )
+            const role = message.role === 'user' ? 'user' : message.role === 'error' ? 'error' : 'activity'
+            return <MessageView key={message.id} role={role} text={message.text} at={message.at} markdown={false} />
           })}
+          {bot.status === 'working'
+            ? (
+              <TaskCard
+                title={bot.currentJob ? `任务 ${bot.currentJob.slice(0, 24)}` : `${bot.name} 正在执行`}
+                status="running"
+                members={[{ name: bot.name, glyph: bot.avatar, desc: bot.title || '正在使用本机工具执行任务', state: 'running' }]}
+                time={null}
+                executor="本机"
+                actions={sending ? [{ label: '停止', onClick: () => void stop() }] : []}
+              />
+            )
+            : null}
           {pending.map((approval) => (
             <ApprovalCard key={approval.id} approval={approval} />
           ))}
@@ -1393,22 +1169,13 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
           )
           : null}
       </div>
-      <div className="grokbot-inputbar">
-        <button type="button" className="side" title="附件（待实现）" disabled>＋</button>
-        <textarea
-          value={draft}
-          placeholder={`发消息给 ${bot.name}`}
-          rows={1}
-          onChange={(event) => setDraft(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter' && !event.shiftKey) {
-              event.preventDefault()
-              void send()
-            }
-          }}
-        />
-        <button type="button" className="side" title="语音输入（待实现）" disabled>🎤</button>
-      </div>
+      <Composer
+        draft={draft}
+        onDraft={setDraft}
+        onSend={() => void send()}
+        sending={sending}
+        placeholder={`发消息给 ${bot.name}`}
+      />
         </>
       )}
     </div>
@@ -1480,50 +1247,37 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
           ? <div className="grokbot-empty">群聊成员会自主决定谁应答；@成员名 可定向，bot 之间也会互相转交。</div>
           : messages.map((message, index) => {
               if (message.role === 'user') {
-                return (
-                  <div key={index} className="grokbot-msg user">
-                    {message.text}
-                    <span className="grokbot-msg__time">{new Date(message.ts).toLocaleTimeString()}</span>
-                  </div>
-                )
+                return <MessageView key={index} role="user" text={message.text} at={message.ts} markdown={false} />
               }
               if (message.role === 'handoff') {
                 return (
-                  <div key={index} className="grokbot-msg activity">
-                    ↪ {botOf(message.fromBotId)?.name ?? message.fromBotId} → {botOf(message.toBotId)?.name ?? message.toBotId}：{message.text}
-                  </div>
+                  <MessageView key={index} role="activity" text={`↪ ${botOf(message.fromBotId)?.name ?? message.fromBotId} → ${botOf(message.toBotId)?.name ?? message.toBotId}：${message.text}`} markdown={false} />
                 )
               }
               if (message.role === 'system') {
-                return <div key={index} className="grokbot-msg activity">{message.text}</div>
+                return <MessageView key={index} role="notice" text={message.text} markdown={false} />
               }
               const bot = botOf(message.botId)
               return (
-                <div key={index} className="grokbot-msg bot">
-                  <strong style={{ display: 'block', fontSize: 11.5, opacity: .55, marginBottom: 2 }}>{bot?.avatar ?? ''}{bot?.name ?? message.botId}</strong>
-                  <MarkdownView text={splitChips(message.text).body} />
-                  <span className="grokbot-msg__time">{new Date(message.ts).toLocaleTimeString()}</span>
-                </div>
+                <MessageView
+                  key={index}
+                  role="bot"
+                  text={splitChips(message.text).body}
+                  at={message.ts}
+                  senderName={bot?.name ?? message.botId}
+                  senderGlyph={bot?.avatar}
+                />
               )
             })}
         {sending ? <div className="grokbot-empty">成员思考中…</div> : null}
       </div>
-      <div className="grokbot-inputbar">
-        <button type="button" className="side" title="附件（待实现）" disabled>＋</button>
-        <textarea
-          value={draft}
-          placeholder={`发到 ${room.name}…（@成员名 定向）`}
-          rows={1}
-          onChange={(event) => setDraft(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter' && !event.shiftKey) {
-              event.preventDefault()
-              void send()
-            }
-          }}
-        />
-        <button type="button" className="side" title="语音输入（待实现）" disabled>🎤</button>
-      </div>
+      <Composer
+        draft={draft}
+        onDraft={setDraft}
+        onSend={() => void send()}
+        sending={sending}
+        placeholder={`发到 ${room.name}…（@成员名 定向）`}
+      />
       </div>
       {detailsOpen
         ? (
@@ -1571,44 +1325,9 @@ export function GrokbotMainView(): ReactNode {
     : null
   // 常驻接管：无会话时渲染自家空白页，DSH 默认首页（探索未知之境）任何情况下不再出现；
   // ⇆ 切回原生模式时释放接管。activeKey 只依赖 target，不因轮询未到位而卸载。
-  // 单聊：释放主区让 DSH 原生会话视图显示（用户熟悉的 ZCode 体验）
-  // 群聊：保持接管（Grok 风格覆盖层）
-  // 空态/创建中：保持接管（空白页/过渡页）
-  const isDmConversation = conversation && !isGroup
+  // R1：私聊默认也用 Grok 风格视图（统一私聊/群组件，v3 §3）；原生 DSH 视图经 ⇆ 显式切回
   const isComputer = target?.kind === 'computer'
-  // 单聊：等原生会话视图确认出现（nativeReady）才释放主区，避免
-  // sessionsService.open() 首屏竞态失败时露出 DSH 默认首页（探索未知之境）；
-  // 重试耗尽（openExhausted）则保持接管并回退到自家聊天视图。
-  const [nativeReady, setNativeReady] = useState(false)
-  const [openExhausted, setOpenExhausted] = useState(false)
-  useEffect(() => { setNativeReady(false); setOpenExhausted(false) }, [target?.id])
-  useEffect(() => {
-    if (!isDmConversation) return
-    const check = (): void => { if (nativeSessionVisible()) setNativeReady(true) }
-    check()
-    const mo = new MutationObserver(check)
-    mo.observe(document.documentElement, { childList: true, subtree: true })
-    const timer = window.setInterval(check, 1000)
-    return () => { mo.disconnect(); window.clearInterval(timer) }
-  }, [isDmConversation, target?.id])
-  useEffect(() => {
-    if (!isDmConversation || nativeReady) return
-    // 无 dshSessionId（服务端预建失败等）：短暂等待后回退自家聊天视图，
-    // 不再停在「正在打开会话」（#1-3）
-    if (!bot?.dshSessionId) {
-      const t = window.setTimeout(() => { if (!nativeSessionVisible()) setOpenExhausted(true) }, 4000)
-      return () => window.clearTimeout(t)
-    }
-    let attempts = 0
-    const timer = window.setInterval(() => {
-      if (nativeSessionVisible()) return
-      attempts += 1
-      if (attempts > 12) { setOpenExhausted(true); window.clearInterval(timer); return }
-      try { sessionsService?.open(bot.dshSessionId!) } catch { /* 会话未就绪，继续重试 */ }
-    }, 700)
-    return () => window.clearInterval(timer)
-  }, [isDmConversation, nativeReady, bot?.dshSessionId])
-  const activeKey = nativeVisible || (isDmConversation && nativeReady)
+  const activeKey = nativeVisible
     ? null
     : (target ? `conversation:${target.id}` : (creatingUi ? 'creating' : 'home'))
   const entering = Boolean(target) && !conversation
@@ -1662,13 +1381,13 @@ export function GrokbotMainView(): ReactNode {
     >
       {(() => {
         if (isComputer) return <iframe src="http://127.0.0.1:6080/vnc.html?autoconnect=true" style={{ width: '100%', height: '100%', border: 'none' }} />
-        if (bot && (!isDmConversation || openExhausted)) return <BotChatView bot={bot} state={state} />
+        if (bot) return <BotChatView bot={bot} state={state} />
         if (conversation && isGroup) return <GroupChatView conversation={conversation} bots={state?.bots ?? []} />
-        if (creatingUi || entering || (isDmConversation && !openExhausted)) {
+        if (creatingUi || entering) {
           return (
             <div className="grokbot-creating">
               <div className="grokbot-creating__spinner" />
-              <div>{entering ? '正在进入会话…' : (isDmConversation ? '正在打开会话…' : '正在召唤专家…')}</div>
+              <div>{entering ? '正在进入会话…' : '正在召唤专家…'}</div>
             </div>
           )
         }
@@ -1690,7 +1409,7 @@ export function apply(ctx: any): void {
     style.dataset.dshGrokbot = ''
     document.head.append(style)
     const update = (): void => {
-      style.textContent = GROKBOT_CSS + (nativeSidebarVisible ? '' : '\n.grokbot-takeover [class*="centerCol"] > * { display: none !important; }\n.grokbot-takeover [class*="detailsCol"] { display: none !important; }')
+      style.textContent = GROKBOT_CSS + GKF_CSS + (nativeSidebarVisible ? '' : '\n.grokbot-takeover [class*="centerCol"] > * { display: none !important; }\n.grokbot-takeover [class*="detailsCol"] { display: none !important; }')
     }
     update()
     listeners.add(update)
