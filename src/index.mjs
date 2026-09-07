@@ -1419,6 +1419,7 @@ export function apply(ctx, config = {}) {
       let failed = false
       let cancelled = false
       let outcome = null
+      const perfStart = Date.now()
       try {
         let session = chatHandles.get(sessionKey)
         if (!session) {
@@ -1456,6 +1457,7 @@ export function apply(ctx, config = {}) {
         if (turnText && writeDm) {
           await appendDm(bot.id, { role: 'bot', text: turnText, activity: outcome.activity }).catch(() => undefined)
         }
+        logPerf({ kind: 'chat-turn', botId: bot.id, conversationId: conversationId || bot.id, taskId: taskId || null, ms: Date.now() - perfStart, toolCalls: (outcome?.activity ?? []).length, replyBytes: outcome?.text?.length ?? 0, error: outcome?.error ?? null })
         return outcome
       } catch (error) {
         failed = true
@@ -1589,6 +1591,13 @@ export function apply(ctx, config = {}) {
   // 协调唤醒（修补批 P1-3）：严格 fromBotId === 'chief' 才触发；
   // 限频用 WakeScheduler 合并延后——窗口内事件挂 pending 不丢弃，
   // 当前协调回合结束后统一消费，依赖链不会因限频断掉
+  // 效率计量（v3 效率验收：普通问答不触发后台任务/协调；直连 vs 插件路径的额外回合如实记录）
+  const perfLog = []
+  function logPerf(event) {
+    perfLog.push({ t: Date.now(), ...event })
+    if (perfLog.length > 100) perfLog.shift()
+  }
+
   // 在途唤醒可观测性：记录 触发→在途(deferred/合并)→消费(fire)→结果 全链（验收用，ring 200 条）
   const wakeLog = []
   function logWake(event) {
@@ -2185,6 +2194,7 @@ export function apply(ctx, config = {}) {
             approvals: [...pendingApprovals.values()].map(({ resolve, ...rest }) => rest),
             running: [...runningJobs.entries()].map(([jobId, entry]) => ({ jobId, ...entry })),
             wakeLog: wakeLog.slice(-30),
+            perfLog: perfLog.slice(-30),
             queued: [
               ...pendingJobs.map((j) => ({ jobId: j.jobId, botId: j.toBot, conversationId: j.conversationId ?? null, text: String(j.text || '').slice(0, 60) })),
               ...[...waitingJobs.values()].map((w) => ({ jobId: w.job.jobId, botId: w.resolvedBotId || routeJob(crewState.crew, w.job).id, conversationId: w.job.conversationId ?? null, text: String(w.job.text || '').slice(0, 60), waiting: true })),
