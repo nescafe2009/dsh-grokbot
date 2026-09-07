@@ -384,3 +384,49 @@ test('退避：达到上限后新事件仍可消费（request 重置预算）', 
   if (r === 'pending') { clock.advance(50_000); runTimers() }
   assert.equal(consumes.length, 1, '新事件被消费')
 })
+
+
+test('组合：读取中到达新事件随后失败——timer 至多 1 个、尝试=预算、耗尽 timer=0（Codex 二十四轮）', async () => {
+  const clock = makeClock(0)
+  const timers = []
+  const cancelled = []
+  const attempts = []
+  const sched = new WakeScheduler({
+    intervalMs: 60_000, now: clock.now,
+    delay: (ms, fn) => { timers.push({ at: clock.now() + ms, fn, id: timers.length + 1 }); return timers[timers.length - 1].id },
+    cancelDelay: (h) => { const t = timers.find((x) => x.id === h); if (t) { cancelled.push(t.id); timers.splice(timers.indexOf(t), 1) } },
+    fire: (k) => { attempts.push(clock.now()) },
+  })
+  const runTimers = () => { const due = timers.filter((t) => t.at <= clock.now()); for (const t of due) { t.fn(); timers.splice(timers.indexOf(t), 1) } }
+  const maxTimers = () => { /* 交错断言由各时点 timers.length 直接检查 */ }
+
+  // t=0 首事件 fire（inTransit）——读取挂起（模拟异步读取中）
+  sched.request('g12')
+  assert.equal(attempts.length, 1)
+  // t=10 新事件到达（读取中）→ pending + 安排 t=60 窗口 timer
+  clock.advance(10_000); runTimers()
+  sched.request('g12')
+  assert.equal(sched.state.get('g12').pending, true)
+  assert.equal(timers.length, 1, '读取中到达新事件 → 1 个窗口 timer')
+  // t=20 读取失败（failAttempt）——真正取消旧 timer 后重排（唯一所有权）
+  clock.advance(10_000); runTimers()
+  sched.failAttempt('g12')
+  assert.ok(timers.length <= 1, `重排后 timer ≤ 1（实际 ${timers.length}）`)
+  // 持续失败循环（fire 由窗口 timer 驱动 → fire 回调代表协调；测试里由 timer fn 执行）
+  // 每次窗口到点：timer fire（pending→inTransit→attempts+1）→ 我们调 failAttempt
+  let guard = 0
+  while (timers.length > 0 && guard < 10) {
+    clock.advance(60_000); runTimers()
+    const st = sched.state.get('g12')
+    if (st.inTransit) sched.failAttempt('g12')
+    guard += 1
+  }
+  const st = sched.state.get('g12')
+  assert.equal(st.failBudget, -1, '预算耗尽')
+  assert.equal(timers.length, 0, '耗尽后 timer=0')
+  assert.equal(attempts.length, 3, `总尝试 = 首次+预算2（实际 ${attempts.length}）——旧实现交错时 4 次`)
+  // 新事件恢复
+  clock.advance(10_000); runTimers()
+  const r = sched.request('g12')
+  assert.ok(r === 'fired' || r === 'pending', '新事件可再推动')
+})

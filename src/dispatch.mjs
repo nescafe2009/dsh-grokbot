@@ -55,30 +55,41 @@ export function resolveDispatchTarget(bots, conversation, ref) {
  * 全部时间经注入的 now()，虚拟时钟可测。
  */
 export class WakeScheduler {
-  constructor({ intervalMs = 60_000, fire, delay, now = () => Date.now() }) {
+  constructor({ intervalMs = 60_000, fire, delay, cancelDelay, now = () => Date.now() }) {
     if (typeof fire !== 'function') throw new Error('WakeScheduler 需要 fire 回调')
     this.intervalMs = intervalMs
     this.fire = fire
     this.delay = delay ?? ((ms, fn) => setTimeout(fn, ms))
+    this.cancelDelay = cancelDelay ?? ((handle) => clearTimeout(handle))
     this.now = now
-    this.state = new Map() // key → { lastFiredAt: number, pending: bool, timer?: handle }
+    this.state = new Map() // key → { lastFiredAt, pending, inTransit, failBudget, timer?, timerGen }
   }
 
   _armPending(key) {
     const st = this.state.get(key)
     if (!st || !st.pending || st.timer !== undefined) return
     const wait = Math.max(0, this.intervalMs - (this.now() - st.lastFiredAt))
+    const gen = (st.timerGen = (st.timerGen ?? 0) + 1)
     st.timer = this.delay(wait, () => {
       const cur = this.state.get(key)
-      if (!cur) return
+      // 代次校验：已被取消/重排的旧回调直接失效
+      if (!cur || cur.timerGen !== gen) return
       cur.timer = undefined
       cur.lastFiredAt = this.now()
       if (cur.pending && !cur.inTransit) {
-        // 不清 pending：fire 后若消费方忙，事件保留；消费方真正开始处理时调 ack 确认
         cur.inTransit = true
         this.fire(key)
       }
     })
+  }
+
+  /** 真正取消当前窗口定时器（句柄 + 代次失效），timer 字段清空 */
+  _cancelTimer(st) {
+    if (st.timer !== undefined) {
+      try { this.cancelDelay(st.timer) } catch { /* 已触发/不可取消 */ }
+      st.timer = undefined
+    }
+    st.timerGen = (st.timerGen ?? 0) + 1 // 已入队旧回调失效
   }
 
   request(key) {
@@ -93,6 +104,7 @@ export class WakeScheduler {
     st.pending = false
     st.lastFiredAt = this.now() // fire 即标记：回合进行中的后续 request 进入 pending 合并
     st.inTransit = true
+    this._cancelTimer(st) // 清理读取期间可能残留的窗口 timer
     this.fire(key)
     return 'fired'
   }
@@ -127,9 +139,13 @@ export class WakeScheduler {
     st.inTransit = false
     st.lastFiredAt = this.now()
     if (!st.pending) st.pending = true // 未确认消费的事件保留（首次 fire 即失败的场景）
-    if ((st.failBudget ?? maxRetries) <= 0) { st.failBudget = -1; return -1 } // 已耗尽：不再扣减不重排
+    if ((st.failBudget ?? maxRetries) <= 0) {
+      st.failBudget = -1
+      this._cancelTimer(st) // 耗尽：真正取消定时器（旧回调不得再触发）
+      return -1
+    }
     st.failBudget = (st.failBudget ?? maxRetries) - 1
-    st.timer = undefined
+    this._cancelTimer(st) // 重排前取消旧定时器——任何时刻有效 timer 至多 1 个
     this._armPending(key) // 唯一调度来源：窗口定时器
     // 预算耗尽：不再安排定时器；pending 保留（明确待处理状态），新事件 request 会重置窗口
     return st.failBudget
