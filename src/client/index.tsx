@@ -17,6 +17,7 @@ interface BotInfo {
   status: 'idle' | 'working'
   currentJob: string | null
   currentRunId?: string | null
+  currentTaskId?: string | null
   lastActivity: number | null
   lastMessage?: string
   lastAt?: number | null
@@ -1070,6 +1071,11 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight })
   }, [messages.length, sending, pending.length])
 
+  // 取消确认复位：以服务端状态为准（working 结束即复位），不靠本地定时器
+  useEffect(() => {
+    if (cancelling && bot.status !== 'working') setCancelling(false)
+  }, [cancelling, bot.status])
+
   const stop = useCallback(async (): Promise<void> => {
     await api(`/bots/${encodeURIComponent(bot.id)}/stop`, { method: 'POST' }).catch(() => undefined)
   }, [bot.id])
@@ -1179,8 +1185,15 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
                 members={[{ name: bot.name, glyph: bot.avatar, desc: bot.title || '正在使用本机工具执行任务', state: 'running' }]}
                 time={null}
                 executor="本机"
-                actions={bot.currentRunId
-                  ? [{ label: cancelling ? '停止确认中…' : '取消本次', disabled: cancelling === true, onClick: () => { setCancelling(true); void api(`/tasks/${encodeURIComponent(bot.currentJob ?? '')}/runs/${encodeURIComponent(bot.currentRunId!)}/cancel`, { method: 'POST' }).catch(() => undefined).finally(() => { setTimeout(() => setCancelling(false), 4000) }) } }]
+                actions={bot.currentRunId && bot.currentTaskId
+                  ? [{ label: cancelling ? '停止确认中…' : '取消本次', disabled: cancelling === true, onClick: () => {
+                      setCancelling(true)
+                      void api(`/tasks/${encodeURIComponent(bot.currentTaskId!)}/runs/${encodeURIComponent(bot.currentRunId!)}/cancel`, { method: 'POST' })
+                        .then((r: { ok?: boolean, state?: string, aborted?: boolean }) => {
+                          if (!r?.ok || !r?.aborted) window.alert(`取消未确认：${JSON.stringify(r)}`)
+                        })
+                        .catch((e: unknown) => window.alert(`取消失败：${String(e)}`))
+                    } }]
                   : (sending ? [{ label: '停止', onClick: () => void stop() }] : [])}
               />
             )
@@ -1288,6 +1301,7 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
   const [draft, setDraft] = useState('')
   const [draftTask, setDraftTask] = useState<{ taskId: string; name: string } | null>(null)
   const [sending, setSending] = useState(false)
+  const [cancellingRuns, setCancellingRuns] = useState<Set<string>>(new Set())
   const logRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
@@ -1305,6 +1319,15 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight })
   }, [messages.length, sending])
+
+  // 停止确认复位以服务端状态为准
+  useEffect(() => {
+    const stillWorking = new Set(bots.filter((b) => b.status === 'working').map((b) => b.id))
+    setCancellingRuns((prev) => {
+      if (![...prev].some((id) => stillWorking.has(id))) return new Set()
+      return prev
+    })
+  }, [bots])
 
   const botOf = (botId?: string): BotInfo | undefined => bots.find((bot) => bot.id === botId)
 
@@ -1370,18 +1393,27 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
               )
             })}
         {sending ? <div className="grokbot-empty">成员思考中…</div> : null}
-        {bots.filter((b) => b.status === 'working' && room.memberBotIds.includes(b.id)).map((b) => (
-          <TaskCard
-            key={b.id}
-            title={`${b.name} 正在执行任务`}
-            status="running"
-            members={[{ name: b.name, glyph: b.avatar, desc: b.title || '使用本机工具执行', state: 'running' }]}
-            executor="本机"
-            actions={b.currentRunId && b.currentJob && b.currentJob !== 'chat'
-              ? [{ label: '取消本次', onClick: () => { void api(`/tasks/${encodeURIComponent(b.currentJob!)}/runs/${encodeURIComponent(b.currentRunId!)}/cancel`, { method: 'POST' }).catch(() => undefined) } }]
-              : [{ label: '停止', onClick: () => { void api(`/bots/${encodeURIComponent(b.id)}/stop`, { method: 'POST' }).catch(() => undefined) } }]}
-          />
-        ))}
+        {bots.filter((b) => b.status === 'working' && room.memberBotIds.includes(b.id)).map((b) => {
+          const stopping = cancellingRuns.has(b.id)
+          const cancellable = b.currentRunId && b.currentTaskId
+          return (
+            <TaskCard
+              key={b.id}
+              title={stopping ? `${b.name} 停止确认中…` : `${b.name} 正在执行任务`}
+              status={stopping ? 'confirm-stop' : 'running'}
+              members={[{ name: b.name, glyph: b.avatar, desc: b.title || '使用本机工具执行', state: 'running' }]}
+              executor="本机"
+              actions={cancellable
+                ? [{ label: stopping ? '停止确认中…' : '取消本次', disabled: stopping, onClick: () => {
+                    setCancellingRuns((prev) => new Set(prev).add(b.id))
+                    void api(`/tasks/${encodeURIComponent(b.currentTaskId!)}/runs/${encodeURIComponent(b.currentRunId!)}/cancel`, { method: 'POST' })
+                      .then((r: { ok?: boolean, aborted?: boolean }) => { if (!r?.ok || !r?.aborted) window.alert(`取消未确认：${JSON.stringify(r)}`) })
+                      .catch((e: unknown) => window.alert(`取消失败：${String(e)}`))
+                  } }]
+                : [{ label: '停止', onClick: () => { void api(`/bots/${encodeURIComponent(b.id)}/stop`, { method: 'POST' }).catch(() => undefined) } }]}
+            />
+          )
+        })}
       </div>
       </div>
       {draftTask
