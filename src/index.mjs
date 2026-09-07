@@ -1589,6 +1589,13 @@ export function apply(ctx, config = {}) {
   // 协调唤醒（修补批 P1-3）：严格 fromBotId === 'chief' 才触发；
   // 限频用 WakeScheduler 合并延后——窗口内事件挂 pending 不丢弃，
   // 当前协调回合结束后统一消费，依赖链不会因限频断掉
+  // 在途唤醒可观测性：记录 触发→在途(deferred/合并)→消费(fire)→结果 全链（验收用，ring 200 条）
+  const wakeLog = []
+  function logWake(event) {
+    wakeLog.push({ t: Date.now(), ...event })
+    if (wakeLog.length > 200) wakeLog.shift()
+  }
+
   const chiefWake = new WakeScheduler({
     intervalMs: 60_000,
     fire: (conversationId) => { void chiefCoordinationTurn(conversationId) },
@@ -1608,7 +1615,8 @@ export function apply(ctx, config = {}) {
     if (!chief || !conv) return
     const state = botState(chief.id)
     if (state.status === 'working') {
-      // 幕僚长忙（可能在处理上一轮交付）：稍后重试一次
+      // 幕僚长忙（可能在处理上一轮交付）：稍后重试（事件不丢）
+      logWake({ kind: 'busy-deferred', conversationId, retried })
       if (retried < 2) setTimeout(() => void chiefCoordinationTurn(conversationId, retried + 1), 25000)
       return
     }
@@ -1625,6 +1633,7 @@ export function apply(ctx, config = {}) {
       })
       .join('\n')
     if (!digest) return
+    logWake({ kind: 'consume', conversationId, digestLines: digest.split('\n').length })
     state.status = 'working'
     try {
       const outcome = await chatTurn(chief, [
@@ -1640,13 +1649,16 @@ export function apply(ctx, config = {}) {
       if (reply) {
         await appendRoomMsg(conversationId, { role: 'bot', botId: chief.id, text: reply }).catch(() => undefined)
       }
+      logWake({ kind: 'done', conversationId, replyBytes: reply?.length ?? 0 })
       ctx.logger?.info?.(`grokbot chief 协调了群 ${conv.name}`)
     } catch (error) {
+      logWake({ kind: 'error', conversationId, error: safeError(error) })
       ctx.logger?.warn?.(`grokbot chief 协调失败：${safeError(error)}`)
     } finally {
       state.status = 'idle'
       state.lastActivity = Date.now()
       chiefWake.onFired(conversationId)
+      logWake({ kind: 'cycle-end', conversationId })
     }
   }
 
@@ -2172,6 +2184,7 @@ export function apply(ctx, config = {}) {
             routines: crewState.crew.routines ?? [],
             approvals: [...pendingApprovals.values()].map(({ resolve, ...rest }) => rest),
             running: [...runningJobs.entries()].map(([jobId, entry]) => ({ jobId, ...entry })),
+            wakeLog: wakeLog.slice(-30),
             queued: [
               ...pendingJobs.map((j) => ({ jobId: j.jobId, botId: j.toBot, conversationId: j.conversationId ?? null, text: String(j.text || '').slice(0, 60) })),
               ...[...waitingJobs.values()].map((w) => ({ jobId: w.job.jobId, botId: w.resolvedBotId || routeJob(crewState.crew, w.job).id, conversationId: w.job.conversationId ?? null, text: String(w.job.text || '').slice(0, 60), waiting: true })),

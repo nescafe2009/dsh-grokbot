@@ -89,6 +89,7 @@ export class WakeScheduler {
       return 'pending'
     }
     st.pending = false
+    st.lastFiredAt = this.now() // fire 即标记：回合进行中的后续 request 进入 pending 合并
     this.fire(key)
     return 'fired'
   }

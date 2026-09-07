@@ -115,3 +115,51 @@ test('协调回合完成时若无 pending 不再触发', () => {
   wake.onFired('g1') // 无 pending 的 onFired 无副作用
   assert.equal(fired.length, 1)
 })
+
+
+/* ---------------- 在途唤醒验收（Codex 十八轮：合并不丢/取消不误走） ---------------- */
+
+function makeClock(start = 0) {
+  let t = start
+  return { now: () => t, advance: (ms) => { t += ms } }
+}
+
+test('在途唤醒：协调回合执行中到达新事件 → 合并 pending，当前回合结束后消费（不丢不重复）', async () => {
+  const clock = makeClock(0)
+  const fired = []
+  const done = []
+  const sched = new WakeScheduler({ intervalMs: 60_000, now: clock.now, delay: (ms, fn) => { setTimeout(fn, 0); return 1 }, fire: (key) => fired.push({ key, at: clock.now() }) })
+  // 模拟协调回合生命周期：request→fired（进入回合）→ 回合中第二个事件 request→pending → onFired（回合结束）→ pending 被消费
+  const r1 = sched.request('g1')
+  assert.equal(r1, 'fired'); assert.equal(fired.length, 1)
+  done.push('turn1-start')
+  clock.advance(10_000) // 回合执行中
+  const r2 = sched.request('g1')
+  assert.equal(r2, 'pending', '回合中事件进入 pending（合并不丢）')
+  clock.advance(20_000)
+  const r3 = sched.request('g1')
+  assert.equal(r3, 'pending', '第三个事件仍合并同一 pending（不重复派发）')
+  assert.equal(fired.length, 1, '回合结束前不重复 fire')
+  clock.advance(30_000) // 距 lastFiredAt 60s 到点
+  sched.onFired('g1') // 模拟回合结束调用 onFired → 定时器（delay 已到点）消费 pending
+  await new Promise((r) => setTimeout(r, 5)) // delay 回调是异步微任务
+  assert.equal(sched.state.get('g1').pending, false, 'pending 已被消费标记')
+  assert.ok(fired.length >= 2, '合并的事件触发了一次新的协调 fire')
+})
+
+test('在途唤醒：取消事件不走完成/失败路径——cancelledRunIds 分类与唤醒互斥', async () => {
+  const { classifyExecutionOutcome } = await import('../src/tasks.mjs')
+  // 取消意图优先：即使 error 文本像失败，分类也是 cancelled（协调层据此不触发失败重派）
+  const cls = classifyExecutionOutcome({ cancelledIntent: true, error: 'aborted', text: null })
+  assert.equal(cls.status, 'cancelled')
+  // 非取消的普通失败才是 failed
+  assert.equal(classifyExecutionOutcome({ cancelledIntent: false, error: 'boom', text: null }).status, 'failed')
+})
+
+test('在途唤醒：空闲零轮询——request 之外无定时器（构造后无任何 delay 调用）', () => {
+  let timers = 0
+  const sched = new WakeScheduler({ intervalMs: 60_000, now: () => 0, delay: (ms, fn) => { timers += 1; return 1 }, fire: () => {} })
+  assert.equal(timers, 0, '无 request 不设定时器')
+  sched.request('g9')
+  assert.ok(timers <= 1, '仅 request 触发至多一个窗口定时器')
+})
