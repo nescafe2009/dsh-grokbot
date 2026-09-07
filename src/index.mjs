@@ -587,7 +587,7 @@ export function apply(ctx, config = {}) {
   const cancelledRunIds = new Set()
 
   // 回合收尾统一：关闭本回合实际活动的 run（入口带来的或回合内 task_begin 新建的）
-  /** 返回本回合 run 的最终状态（cancelled/failed/done/null=无 run），供 run/job/奖励/回流统一分类 */
+  /** 返回 { status, runId }（status: cancelled/failed/done/null=无 run），供 run/job/奖励/回流统一分类 */
   async function closeActiveRun(convKey, fallbackTaskId, fallbackRunId, status = 'done') {
     const liveCtx = activeTurnCtx.get(convKey)
     const finTaskId = fallbackRunId ? fallbackTaskId : (liveCtx?.taskId ?? null)
@@ -599,7 +599,7 @@ export function apply(ctx, config = {}) {
       await endRun(stateDir, finTaskId, finRunId, finalStatus).catch(() => null)
     }
     setTurnCtx(convKey, null)
-    return finalStatus
+    return { status: finalStatus, runId: finRunId }
   }
 
   function setTurnCtx(botId, ctx) {
@@ -1390,6 +1390,7 @@ export function apply(ctx, config = {}) {
       state.currentTaskId = taskId || null
       let failed = false
       let cancelled = false
+      let outcome = null
       try {
         let session = chatHandles.get(sessionKey)
         if (!session) {
@@ -1416,7 +1417,7 @@ export function apply(ctx, config = {}) {
           await appendDm(bot.id, { role: 'user', text: preamble ? `${preamble}\n\n${text}` : text }).catch(() => undefined)
         }
         await session.handle.agent.whenIdle()
-        const outcome = {
+        outcome = {
           ...summarizeTurn(session.handle.agent.session.events, firstSeq),
           activity: activityOf(session.handle.agent.session.events, firstSeq),
         }
@@ -1444,7 +1445,7 @@ export function apply(ctx, config = {}) {
         state.currentRunId = null
         state.currentTaskId = null
         const cancelIntent2 = runRef ? cancelledRunIds.has(runRef.id) : false
-        const finalSt = await closeActiveRun(convKey, taskId, runRef?.id ?? null, cancelIntent2 ? 'cancelled' : (failed ? 'failed' : 'done'))
+        const finalSt = (await closeActiveRun(convKey, taskId, runRef?.id ?? null, cancelIntent2 ? 'cancelled' : (failed ? 'failed' : 'done'))).status
         if (finalSt === 'cancelled' && outcome && !outcome.cancelled) outcome.cancelled = true
         if (finalSt === 'cancelled' && writeDm) {
           await appendDm(bot.id, { role: 'system', text: '✕ 已取消：本次执行已停止，未计入完成' }).catch(() => undefined)
@@ -1775,6 +1776,7 @@ export function apply(ctx, config = {}) {
       let outcome = null
       let runFinalStatus = null
       let execError = null
+      let cancelledRunNotifyRunId = null
       try {
       if (ho) {
         let artBlock = ''
@@ -1832,13 +1834,16 @@ export function apply(ctx, config = {}) {
           error: outcome?.error ?? execError,
           text: outcome?.text,
         })
-        runFinalStatus = await closeActiveRun(convKey4Job, jobTaskId, hoRunId, cls.status)
+        const closed = await closeActiveRun(convKey4Job, jobTaskId, hoRunId, cls.status)
+        runFinalStatus = closed.status
+        cancelledRunNotifyRunId = closed.runId
       }
       // 取消终态：job 不计成功、不加奖励，群内持久可见的取消通知
       if (runFinalStatus === 'cancelled') {
+        const cancelRunId = hoRunId || /* 回合内 task_begin 新建 run（ctx 已被 closeActiveRun 清空，从返回值取） */ String(runFinalStatus === 'cancelled' ? (cancelledRunNotifyRunId || '') : '')
         await failJob(job, bot.id, '已取消（用户停止本次执行）').catch(() => undefined)
         if (job.conversationId) {
-          await appendRoomMsg(job.conversationId, { role: 'system', text: `✕ 已取消：本次执行已停止（run ${String(hoRunId).slice(0, 14)}…），未计入完成` }).catch(() => undefined)
+          await appendRoomMsg(job.conversationId, { role: 'system', text: `✕ 已取消：本次执行已停止${cancelRunId ? `（run ${String(cancelRunId).slice(0, 14)}…）` : ''}，未计入完成` }).catch(() => undefined)
         } else {
           await appendDm(bot.id, { role: 'system', text: `✕ 已取消：本次执行已停止，未计入完成` }).catch(() => undefined)
         }
