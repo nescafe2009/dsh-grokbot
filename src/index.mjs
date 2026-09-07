@@ -7,7 +7,7 @@ import { loadOrCreateCrew, routeJob, botWorkspace, serializeCrew, atomicWrite, p
 import { ensureInbox, scanInbox, claimJob, completeJob, failJob, cancelJob, enqueueJob } from './inbox.mjs'
 import { resolveDispatchTarget, WakeScheduler } from './dispatch.mjs'
 import { isInsideRoot, classifyDeliveryTarget, createArtifactSnapshot, artifactMime } from './delivery-core.mjs'
-import { createTask, getTask, listTasks, startRun, endRun, attachArtifact, validateTaskForContext } from './tasks.mjs'
+import { createTask, getTask, listTasks, startRun, endRun, attachArtifact, validateTaskForContext, classifyExecutionOutcome } from './tasks.mjs'
 import { runExclusively } from './exec.mjs'
 import { BOT_TEMPLATES, templateById } from './templates.mjs'
 
@@ -1419,7 +1419,7 @@ export function apply(ctx, config = {}) {
         }
         const turnText = outcome.text?.trim()
         failed = Boolean(outcome.error) || !turnText
-        cancelled = /cancel/i.test(String(outcome.error || '')) || (runRef ? cancelledRunIds.has(runRef.id) : false)
+        cancelled = runRef ? cancelledRunIds.has(runRef.id) : false
         if (cancelled) outcome.cancelled = true
         if (turnText && writeDm) {
           await appendDm(bot.id, { role: 'bot', text: turnText, activity: outcome.activity }).catch(() => undefined)
@@ -1427,14 +1427,14 @@ export function apply(ctx, config = {}) {
         return outcome
       } catch (error) {
         failed = true
-        cancelled = /cancel/i.test(String(error?.message || error))
         throw error
       } finally {
         state.status = prevStatus === 'working' ? 'idle' : prevStatus
         state.currentJob = prevJob ?? null
         state.currentRunId = null
         state.currentTaskId = null
-        const finalSt = await closeActiveRun(convKey, taskId, runRef?.id ?? null, cancelled ? 'cancelled' : (failed ? 'failed' : 'done'))
+        const cancelIntent2 = runRef ? cancelledRunIds.has(runRef.id) : false
+        const finalSt = await closeActiveRun(convKey, taskId, runRef?.id ?? null, cancelIntent2 ? 'cancelled' : (failed ? 'failed' : 'done'))
         if (finalSt === 'cancelled' && writeDm) {
           await appendDm(bot.id, { role: 'system', text: '✕ 已取消：本次执行已停止，未计入完成' }).catch(() => undefined)
         }
@@ -1511,7 +1511,12 @@ export function apply(ctx, config = {}) {
       '若你认为某条工作应由其他成员处理，在回复的最后一行单独写「@成员名 交代内容」，系统会异步转交；不要除此行外提交接。',
     ].filter(Boolean).join('\n')
     const outcome = await chatTurn(responder, senderText, { preamble, conversationId: conversation.id, writeDm: false, taskId, taskOrigin: taskId ? 'continue' : 'user' })
-    const reply = outcome.text?.trim() || `[${responder.name} 未能给出文本回复：${outcome.error || outcome.stopReason}]`
+    let reply = outcome.text?.trim() || `[${responder.name} 未能给出文本回复：${outcome.error || outcome.stopReason}]`
+    if (outcome.cancelled) {
+      // 取消终态：部分文本明确标记未完成 + 群内持久取消通知（群路径 writeDm=false，DM 通知不适用）
+      reply = `${reply}\n\n〔本次执行已取消，以上为部分结果，未计入完成〕`
+      await appendRoomMsg(conversation.id, { role: 'system', text: `✕ 已取消：${responder.name} 的本次执行已停止` }).catch(() => undefined)
+    }
     // 解析末尾交接行 → bot↔bot 异步交接
     const lines = reply.split('\n')
     const lastLine = lines[lines.length - 1]?.trim() ?? ''
@@ -1742,6 +1747,7 @@ export function apply(ctx, config = {}) {
       let heartbeat = null
       let outcome = null
       let runFinalStatus = null
+      let execError = null
       try {
       if (ho) {
         let artBlock = ''
@@ -1776,23 +1782,28 @@ export function apply(ctx, config = {}) {
           }, 240_000)
         : null
       {
-        await session.handle.agent.whenIdle()
+        await session.handle.agent.whenIdle().catch((e) => { execError = e })
+        if (execError && !(hoRunId && cancelledRunIds.has(hoRunId))) throw execError
         const firstSeq = session.handle.agent.session.seq
         const basePrompt = handoffPreamble || promptText
         const withImages = job.images.length > 0
           ? `${basePrompt}\n\n【图片】请阅读：\n${job.images.join('\n')}`
           : basePrompt
         session.handle.agent.followup(userMessage(withImages))
-        await session.handle.agent.whenIdle()
+        await session.handle.agent.whenIdle().catch((e) => { if (!execError) execError = e })
         outcome = summarizeTurn(session.handle.agent.session.events, firstSeq)
+        if (execError && !(hoRunId && cancelledRunIds.has(hoRunId))) throw execError
       }
       } finally {
         if (timeout) clearTimeout(timeout)
         if (heartbeat) clearInterval(heartbeat)
-        const replyProbe = outcome?.text?.trim()
-        const cancelledByIntent = hoRunId ? cancelledRunIds.has(hoRunId) : false
-        const jobFailed = Boolean(outcome?.error) || !replyProbe
-        runFinalStatus = await closeActiveRun(convKey4Job, jobTaskId, hoRunId, cancelledByIntent ? 'cancelled' : (jobFailed ? 'failed' : 'done'))
+        // 统一分类（abort 抛异常/正常返回都走这里）：意图优先，不靠 error 文本
+        const cls = classifyExecutionOutcome({
+          cancelledIntent: hoRunId ? cancelledRunIds.has(hoRunId) : false,
+          error: outcome?.error ?? execError,
+          text: outcome?.text,
+        })
+        runFinalStatus = await closeActiveRun(convKey4Job, jobTaskId, hoRunId, cls.status)
       }
       // 取消终态：job 不计成功、不加奖励，群内持久可见的取消通知
       if (runFinalStatus === 'cancelled') {
@@ -2053,6 +2064,7 @@ export function apply(ctx, config = {}) {
             routines: crewState.crew.routines ?? [],
             approvals: [...pendingApprovals.values()].map(({ resolve, ...rest }) => rest),
             running: [...runningJobs.entries()].map(([jobId, entry]) => ({ jobId, ...entry })),
+            queued: pendingJobs.map((j) => ({ jobId: j.jobId, botId: j.toBot, conversationId: j.conversationId ?? null, text: String(j.text || '').slice(0, 60) })),
             queueDepth: pendingJobs.length,
             recentJobs,
             lastTarget: uiState.lastTarget,
@@ -2068,6 +2080,22 @@ export function apply(ctx, config = {}) {
           }
           await persistUiState()
           respond(res, 200, { ok: true }); return
+        }
+        // R2-B：排队任务单独取消（未建 run，稳定身份=jobId；不影响执行中的任务）
+        const queuedCancelMatch = /^\/queue\/([A-Za-z0-9_-]+)\/cancel$/.exec(suffix)
+        if (method === 'POST' && queuedCancelMatch) {
+          const jobId = queuedCancelMatch[1]
+          const idx = pendingJobs.findIndex((j) => j.jobId === jobId)
+          const running = runningJobs.get(jobId)
+          if (running) throw new HttpError(409, '该任务已在执行，请用 run 级取消')
+          if (idx < 0) throw new HttpError(404, `排队任务不存在：${jobId}`)
+          const [job] = pendingJobs.splice(idx, 1)
+          await cancelJob(job, job.toBot || '', '用户取消排队任务（未执行）')
+          if (job.conversationId) {
+            await appendRoomMsg(job.conversationId, { role: 'system', text: `✕ 已取消排队任务（未开始执行）：${String(job.text || '').slice(0, 40)}` }).catch(() => undefined)
+          }
+          recordRecent({ jobId, botId: job.toBot || '', status: 'cancelled', endedAt: Date.now() })
+          respond(res, 200, { ok: true, cancelled: jobId }); return
         }
         // R2-B：run 级取消（与 bot 级 stop 区分；仅取消指定 run 的执行）
         const runCancelMatch = /^\/tasks\/([a-z0-9-]+)\/runs\/([a-z0-9-]+)\/cancel$/.exec(suffix)

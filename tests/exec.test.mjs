@@ -97,3 +97,22 @@ test('快照 SHA 与 meta/字节一致（执行根正确性连带）', async () 
   const { meta } = await createArtifactSnapshot({ artifactsRoot: join(workdir, 'arts'), sourceReal: join(workdir, 'f.bin'), workspaceRoot: workdir })
   assert.equal(meta.sha256, createHash('sha256').update(content).digest('hex'))
 })
+
+/* ---------------- 取消统一分类回归（abort 正常返回 / abort reject / 普通异常） ---------------- */
+import { classifyExecutionOutcome } from '../src/tasks.mjs'
+
+test('分类：取消意图优先——即使 whenIdle 抛错/正常返回文本', () => {
+  assert.deepEqual(classifyExecutionOutcome({ cancelledIntent: true, error: null, text: '部分文本' }), { status: 'cancelled', notifyKind: 'cancelled' })
+  assert.deepEqual(classifyExecutionOutcome({ cancelledIntent: true, error: new Error('agent aborted'), text: null }), { status: 'cancelled', notifyKind: 'cancelled' })
+})
+
+test('分类：无意图时普通错误=failed（含 error 文本带 cancel 字样的 provider 错误）', () => {
+  const r = classifyExecutionOutcome({ cancelledIntent: false, error: 'provider cannot cancel request', text: 'x' })
+  assert.equal(r.status, 'failed')
+  assert.equal(r.notifyKind, 'failed')
+})
+
+test('分类：无意图无错误有文本=done；无文本=failed', () => {
+  assert.deepEqual(classifyExecutionOutcome({ cancelledIntent: false, error: null, text: 'ok' }), { status: 'done', notifyKind: 'none' })
+  assert.deepEqual(classifyExecutionOutcome({ cancelledIntent: false, error: null, text: '  ' }), { status: 'failed', notifyKind: 'failed' })
+})

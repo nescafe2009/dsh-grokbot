@@ -102,6 +102,7 @@ interface GrokbotState {
   routines: RoutineInfo[]
   approvals: ApprovalInfo[]
   running: { jobId: string; botId: string; startedAt: number }[]
+  queued: { jobId: string; botId: string; conversationId: string | null; text: string }[]
   queueDepth: number
   recentJobs: { jobId: string; botId: string; status: string; endedAt: number | null }[]
 }
@@ -1029,7 +1030,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
   const [draft, setDraft] = useState('')
   const [draftTask, setDraftTask] = useState<{ taskId: string; name: string } | null>(null)
   const [sending, setSending] = useState(false)
-  const [cancelling, setCancelling] = useState(false)
+  const [cancelling, setCancelling] = useState<string | null>(null)
   const [editing, setEditing] = useState(false)
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [newRoutine, setNewRoutine] = useState(false)
@@ -1071,10 +1072,10 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight })
   }, [messages.length, sending, pending.length])
 
-  // 取消确认复位：以服务端状态为准（working 结束即复位），不靠本地定时器
+  // 取消确认复位：按 runId 对齐服务端（run 变了/结束了都可重试或复位），失败不清按钮由 catch 处理
   useEffect(() => {
-    if (cancelling && bot.status !== 'working') setCancelling(false)
-  }, [cancelling, bot.status])
+    if (cancelling && (!bot.currentRunId || bot.currentRunId !== cancelling)) setCancelling(null)
+  }, [cancelling, bot.currentRunId])
 
   const stop = useCallback(async (): Promise<void> => {
     await api(`/bots/${encodeURIComponent(bot.id)}/stop`, { method: 'POST' }).catch(() => undefined)
@@ -1186,13 +1187,17 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
                 time={null}
                 executor="本机"
                 actions={bot.currentRunId && bot.currentTaskId
-                  ? [{ label: cancelling ? '停止确认中…' : '取消本次', disabled: cancelling === true, onClick: () => {
-                      setCancelling(true)
-                      void api(`/tasks/${encodeURIComponent(bot.currentTaskId!)}/runs/${encodeURIComponent(bot.currentRunId!)}/cancel`, { method: 'POST' })
+                  ? [{ label: cancelling === bot.currentRunId ? '停止确认中…' : '取消本次', disabled: cancelling === bot.currentRunId, onClick: () => {
+                      const targetRun = bot.currentRunId
+                      setCancelling(targetRun ?? null)
+                      void api(`/tasks/${encodeURIComponent(bot.currentTaskId!)}/runs/${encodeURIComponent(targetRun!)}/cancel`, { method: 'POST' })
                         .then((r: { ok?: boolean, state?: string, aborted?: boolean }) => {
-                          if (!r?.ok || !r?.aborted) window.alert(`取消未确认：${JSON.stringify(r)}`)
+                          if (!r?.ok || !r?.aborted) {
+                            window.alert(`取消未确认：${JSON.stringify(r)}`)
+                            setCancelling(null) // 失败/unknown 恢复可重试
+                          }
                         })
-                        .catch((e: unknown) => window.alert(`取消失败：${String(e)}`))
+                        .catch((e: unknown) => { window.alert(`取消失败：${String(e)}`); setCancelling(null) })
                     } }]
                   : (sending ? [{ label: '停止', onClick: () => void stop() }] : [])}
               />
@@ -1293,7 +1298,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
 
 /* ---------------- 群聊视图 ---------------- */
 
-function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] }): ReactNode {
+function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[]; queued?: { jobId: string; botId: string; text: string }[] }): ReactNode {
   const room = { id: props.conversation.id, name: props.conversation.name || props.conversation.memberBotIds.map((botId) => props.bots.find((bot) => bot.id === botId)?.name ?? botId).join('、'), memberBotIds: props.conversation.memberBotIds }
   const bots = props.bots
   const [detailsOpen, setDetailsOpen] = useState(false)
@@ -1301,7 +1306,8 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
   const [draft, setDraft] = useState('')
   const [draftTask, setDraftTask] = useState<{ taskId: string; name: string } | null>(null)
   const [sending, setSending] = useState(false)
-  const [cancellingRuns, setCancellingRuns] = useState<Set<string>>(new Set())
+  const [cancellingRuns, setCancellingRuns] = useState<Map<string, string>>(new Map())
+  const queued = props.queued ?? []
   const logRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
@@ -1320,12 +1326,17 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight })
   }, [messages.length, sending])
 
-  // 停止确认复位以服务端状态为准
+  // 停止确认复位：按 (botId → 其当前 runId) 与服务端对齐；run 已变/结束即清该项
   useEffect(() => {
-    const stillWorking = new Set(bots.filter((b) => b.status === 'working').map((b) => b.id))
+    const liveRun = new Map(bots.filter((b) => b.status === 'working' && b.currentRunId).map((b) => [b.id, b.currentRunId]))
     setCancellingRuns((prev) => {
-      if (![...prev].some((id) => stillWorking.has(id))) return new Set()
-      return prev
+      let changed = false
+      const next = new Map(prev)
+      for (const [botId, runId] of prev) {
+        const now = liveRun.get(botId)
+        if (now !== runId) { next.delete(botId); changed = true }
+      }
+      return changed ? next : prev
     })
   }, [bots])
 
@@ -1393,8 +1404,20 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
               )
             })}
         {sending ? <div className="grokbot-empty">成员思考中…</div> : null}
+        {queued.map((q) => (
+          <TaskCard
+            key={q.jobId}
+            title={`排队中：${String(q.text).slice(0, 30) || '任务'}`}
+            status="queued"
+            members={[{ name: bots.find((b) => b.id === q.botId)?.name ?? q.botId, glyph: bots.find((b) => b.id === q.botId)?.avatar, desc: '等待执行（当前有任务占用）', state: 'idle' }]}
+            actions={[{ label: '取消排队', onClick: () => {
+              void api(`/queue/${encodeURIComponent(q.jobId)}/cancel`, { method: 'POST' })
+                .catch((e: unknown) => window.alert(`取消排队失败：${String(e)}`))
+            } }]}
+          />
+        ))}
         {bots.filter((b) => b.status === 'working' && room.memberBotIds.includes(b.id)).map((b) => {
-          const stopping = cancellingRuns.has(b.id)
+          const stopping = cancellingRuns.get(b.id) === b.currentRunId
           const cancellable = b.currentRunId && b.currentTaskId
           return (
             <TaskCard
@@ -1405,10 +1428,19 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
               executor="本机"
               actions={cancellable
                 ? [{ label: stopping ? '停止确认中…' : '取消本次', disabled: stopping, onClick: () => {
-                    setCancellingRuns((prev) => new Set(prev).add(b.id))
-                    void api(`/tasks/${encodeURIComponent(b.currentTaskId!)}/runs/${encodeURIComponent(b.currentRunId!)}/cancel`, { method: 'POST' })
-                      .then((r: { ok?: boolean, aborted?: boolean }) => { if (!r?.ok || !r?.aborted) window.alert(`取消未确认：${JSON.stringify(r)}`) })
-                      .catch((e: unknown) => window.alert(`取消失败：${String(e)}`))
+                    const targetRun = b.currentRunId!
+                    setCancellingRuns((prev) => new Map(prev).set(b.id, targetRun))
+                    void api(`/tasks/${encodeURIComponent(b.currentTaskId!)}/runs/${encodeURIComponent(targetRun)}/cancel`, { method: 'POST' })
+                      .then((r: { ok?: boolean, aborted?: boolean }) => {
+                        if (!r?.ok || !r?.aborted) {
+                          window.alert(`取消未确认：${JSON.stringify(r)}`)
+                          setCancellingRuns((prev) => { const n = new Map(prev); n.delete(b.id); return n })
+                        }
+                      })
+                      .catch((e: unknown) => {
+                        window.alert(`取消失败：${String(e)}`)
+                        setCancellingRuns((prev) => { const n = new Map(prev); n.delete(b.id); return n })
+                      })
                   } }]
                 : [{ label: '停止', onClick: () => { void api(`/bots/${encodeURIComponent(b.id)}/stop`, { method: 'POST' }).catch(() => undefined) } }]}
             />
@@ -1581,7 +1613,7 @@ export function GrokbotMainView(): ReactNode {
       {(() => {
         if (isComputer) return <iframe src="http://127.0.0.1:6080/vnc.html?autoconnect=true" style={{ width: '100%', height: '100%', border: 'none' }} />
         if (bot) return <BotChatView bot={bot} state={state} />
-        if (conversation && isGroup) return <GroupChatView conversation={conversation} bots={state?.bots ?? []} />
+        if (conversation && isGroup) return <GroupChatView conversation={conversation} bots={state?.bots ?? []} queued={(state?.queued ?? []).filter((q) => q.conversationId === conversation.id)} />
         if (creatingUi || entering) {
           return (
             <div className="grokbot-creating">

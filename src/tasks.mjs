@@ -181,3 +181,16 @@ export function validateTaskForContext(taskId, { conversationId, botId, getTask:
     return { ok: true, task }
   })()
 }
+
+
+/**
+ * 取消小批统一终态分类（run/job/奖励/通知共用；不靠 error 文本猜测意图）。
+ * cancelledIntent：该 run 是否登记过取消意图（cancelledRunIds）。
+ * 返回 { status, notifyKind }：status ∈ done|failed|cancelled；notifyKind ∈ none|cancelled|failed。
+ */
+export function classifyExecutionOutcome({ cancelledIntent, error, text }) {
+  if (cancelledIntent) return { status: 'cancelled', notifyKind: 'cancelled' }
+  if (error) return { status: 'failed', notifyKind: 'failed' }
+  if (!String(text || '').trim()) return { status: 'failed', notifyKind: 'failed' }
+  return { status: 'done', notifyKind: 'none' }
+}
