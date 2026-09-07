@@ -1700,10 +1700,15 @@ export function apply(ctx, config = {}) {
       const promptText = job.text?.trim()
         || `（无文字内容${job.images.length > 0 ? '，请查看同目录图片附件' : ''}）`
       // R2-A：handoff 交接上下文（指定版本注入 + SHA 校验要求）；taskId 贯穿 deliver_file
-      let handoffPreamble = ''
+      // 生命周期保护从 startRun/setTurnCtx/createBotAgent 开始：任何一步抛错都结束 run 并清空 convKey 上下文
       const ho = job.handoff || null
       const jobTaskId = ho?.taskId || job.taskId || null
+      let handoffPreamble = ''
       let hoRunId = null
+      let timeout = null
+      let heartbeat = null
+      let outcome = null
+      try {
       if (ho) {
         let artBlock = ''
         if (ho.artifactId) {
@@ -1723,17 +1728,16 @@ export function apply(ctx, config = {}) {
       const jobTaskWs = jobTask?.workspace || null
       setTurnCtx(convKey4Job, { taskId: jobTaskId, runId: hoRunId, conversationId: job.conversationId || null, taskWorkspace: jobTaskWs })
       session = await createBotAgent(bot, { conversationId: job.conversationId || null, cwd: jobTaskWs || undefined })
-      const timeout = setTimeout(() => session.abort.abort(new Error(`job timeout after ${jobTimeoutMs}ms`)), jobTimeoutMs)
+      timeout = setTimeout(() => session.abort.abort(new Error(`job timeout after ${jobTimeoutMs}ms`)), jobTimeoutMs)
       // 长任务群内心跳：让群里知道成员还活着在干活（不触发幕僚长唤醒）
       const startedAt = Date.now()
-      const heartbeat = job.conversationId
+      heartbeat = job.conversationId
         ? setInterval(() => {
             const minutes = Math.round((Date.now() - startedAt) / 60000)
             appendRoomMsg(job.conversationId, { role: 'system', text: `⏳ ${bot.name} 仍在处理任务（已进行 ${minutes} 分钟）…` }).catch(() => undefined)
           }, 240_000)
         : null
-      let outcome
-      try {
+      {
         await session.handle.agent.whenIdle()
         const firstSeq = session.handle.agent.session.seq
         const basePrompt = handoffPreamble || promptText
@@ -1743,8 +1747,9 @@ export function apply(ctx, config = {}) {
         session.handle.agent.followup(userMessage(withImages))
         await session.handle.agent.whenIdle()
         outcome = summarizeTurn(session.handle.agent.session.events, firstSeq)
+      }
       } finally {
-        clearTimeout(timeout)
+        if (timeout) clearTimeout(timeout)
         if (heartbeat) clearInterval(heartbeat)
         const replyProbe = outcome?.text?.trim()
         const jobFailed = Boolean(outcome?.error) || !replyProbe
