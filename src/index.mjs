@@ -1399,7 +1399,9 @@ export function apply(ctx, config = {}) {
     // 统一执行入口：任务锁 → bot 锁 → workspace 写队列（与 runInboxJob 同序）
     const defaultWs4Turn = await realpath(botWorkspace(stateDir, bot)).catch(() => botWorkspace(stateDir, bot))
     const lockWs4Turn = taskWs ? (await realpath(taskWs).catch(() => taskWs)) : defaultWs4Turn
+    const submitTs = Date.now() // 提交时间戳（锁外）：含排队
     return runExclusively({ taskId, botId: bot.id, workspace: lockWs4Turn }, async () => {
+      const lockAcquiredTs = Date.now() // 获锁时间戳：排队 = 此值 - 提交
       let runRef = null
       if (taskId && existingRunId) {
         runRef = { id: existingRunId } // handoff 已建 run，本回合复用
@@ -1419,7 +1421,7 @@ export function apply(ctx, config = {}) {
       let failed = false
       let cancelled = false
       let outcome = null
-      const perfStart = Date.now() // 锁外取值：含排队等待
+      const execStart = lockAcquiredTs
       try {
         let session = chatHandles.get(sessionKey)
         if (!session) {
@@ -1457,9 +1459,8 @@ export function apply(ctx, config = {}) {
         if (turnText && writeDm) {
           await appendDm(bot.id, { role: 'bot', text: turnText, activity: outcome.activity }).catch(() => undefined)
         }
-        const perfEnd = Date.now()
-        outcome.perf = { totalMs: perfEnd - perfStart, toolCalls: (outcome?.activity ?? []).length }
-        logPerf({ kind: 'chat-turn', botId: bot.id, conversationId: conversationId || bot.id, taskId: taskId || null, ms: perfEnd - perfStart, toolCalls: (outcome?.activity ?? []).length, replyBytes: outcome?.text?.length ?? 0, error: outcome?.error ?? null })
+        outcome.perf = { totalMs: Date.now() - submitTs, executionMs: Date.now() - execStart, queueMs: execStart - submitTs, toolCalls: (outcome?.activity ?? []).length }
+        logPerf({ kind: 'chat-turn', botId: bot.id, conversationId: conversationId || bot.id, taskId: taskId || null, ms: Date.now() - submitTs, executionMs: Date.now() - execStart, queueMs: execStart - submitTs, toolCalls: (outcome?.activity ?? []).length, replyBytes: outcome?.text?.length ?? 0, error: outcome?.error ?? null })
         return outcome
       } catch (error) {
         failed = true
@@ -1468,8 +1469,10 @@ export function apply(ctx, config = {}) {
         const cancelIntentErr = (runRef?.id ?? liveCtxNow?.runId) ? cancelledRunIds.has(runRef?.id ?? liveCtxNow.runId) : false
         if (cancelIntentErr) {
           cancelled = true
+          logPerf({ kind: 'chat-turn', botId: bot.id, conversationId: conversationId || bot.id, taskId: taskId || null, ms: Date.now() - submitTs, executionMs: Date.now() - execStart, queueMs: execStart - submitTs, toolCalls: 0, replyBytes: outcome?.text?.length ?? 0, error: 'cancelled', cancelled: true })
           return { text: outcome?.text?.trim() || '', activity: [], error: null, cancelled: true }
         }
+        logPerf({ kind: 'chat-turn', botId: bot.id, conversationId: conversationId || bot.id, taskId: taskId || null, ms: Date.now() - submitTs, executionMs: Date.now() - execStart, queueMs: execStart - submitTs, toolCalls: (outcome?.activity ?? []).length, replyBytes: outcome?.text?.length ?? 0, error: safeError(error) })
         throw error
       } finally {
         state.status = prevStatus === 'working' ? 'idle' : prevStatus
@@ -2321,19 +2324,20 @@ export function apply(ctx, config = {}) {
         if (method === 'GET' && suffix === '/crew') {
           respond(res, 200, { crew: crewState.crew }); return
         }
-        // 效率配对：DSH 直连基线（裸 agents 会话，无插件编排层）
+        // 效率配对：DSH 直连基线（裸 agents 会话，无插件工具/编排），冷启每次
         if (method === 'POST' && suffix === '/__perf/direct') {
           const body = await readJsonBody(req)
           const text = String(body?.text || '').trim()
           if (!text) throw new HttpError(400, 'text 不能为空')
           const t0 = Date.now()
           const sessionId = randomUUID()
+          let handle = null
           try {
             const fallbackSel = typeof ctx.agentDefaultModel?.currentSelection === 'function' ? ctx.agentDefaultModel.currentSelection() : null
             const sel = crewState.crew.defaultModel?.provider && crewState.crew.defaultModel?.model
               ? crewState.crew.defaultModel
               : (fallbackSel?.provider && fallbackSel?.model ? fallbackSel : null)
-            const handle = await ctx.agents.create({
+            handle = await ctx.agents.create({
               sessionId,
               meta: { cwd: join(stateDir, 'workspace') },
               ...(sel ? { agentOptions: sel } : {}),
@@ -2344,13 +2348,24 @@ export function apply(ctx, config = {}) {
             handle.agent.followup(userMessage(text))
             await handle.agent.whenIdle()
             const ms = Date.now() - t0
-            try { handle.agent.cancel({ kind: 'user' }, { keepInbox: true }) } catch { /* best effort */ }
-            try { await handle.dispose() } catch { /* best effort */ }
-            logPerf({ kind: 'dsh-direct', conversationId: '__perf__', ms, toolCalls: 0 })
-            respond(res, 200, { ms, sessionId }); return
+            // 事件解析：真实工具次数 + 回复 + 错误（不用常量 0）
+            const events = handle.agent.session.events
+            const turn = summarizeTurn(events, firstSeq)
+            const activity = activityOf(events, firstSeq)
+            const toolCalls = (activity ?? []).length
+            const reply = turn?.text?.trim() ?? ''
+            const turnError = turn?.error ?? null
+            const status = turnError ? 'failed' : (reply ? 'ok' : 'empty')
+            logPerf({ kind: 'dsh-direct', conversationId: '__perf__', ms, toolCalls, status, replyBytes: reply.length, model: sel ? `${sel.provider}/${sel.model}` : null, error: turnError })
+            respond(res, 200, { ms, sessionId, status, toolCalls, replyBytes: reply.length, error: turnError }); return
           } catch (error) {
-            logPerf({ kind: 'dsh-direct-error', error: safeError(error) })
+            logPerf({ kind: 'dsh-direct-error', ms: Date.now() - t0, error: safeError(error) })
             throw new HttpError(500, safeError(error))
+          } finally {
+            if (handle) {
+              try { handle.agent.cancel({ kind: 'user' }, { keepInbox: true }) } catch { /* best effort */ }
+              try { await handle.dispose() } catch { /* best effort */ }
+            }
           }
         }
         // 预览 POST 边界测试端点（R2-B）：无害副作用（计数器），验证沙箱产物被阻止调用
