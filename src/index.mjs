@@ -1591,6 +1591,7 @@ export function apply(ctx, config = {}) {
   // 协调唤醒（修补批 P1-3）：严格 fromBotId === 'chief' 才触发；
   // 限频用 WakeScheduler 合并延后——窗口内事件挂 pending 不丢弃，
   // 当前协调回合结束后统一消费，依赖链不会因限频断掉
+  let probeEchoCount = 0
   // 效率计量（v3 效率验收：普通问答不触发后台任务/协调；直连 vs 插件路径的额外回合如实记录）
   const perfLog = []
   function logPerf(event) {
@@ -2265,6 +2266,14 @@ export function apply(ctx, config = {}) {
         }
         if (method === 'GET' && suffix === '/crew') {
           respond(res, 200, { crew: crewState.crew }); return
+        }
+        // 预览 POST 边界测试端点（R2-B）：无害副作用（计数器），验证沙箱产物被阻止调用
+        if (method === 'POST' && suffix === '/__probe/echo') {
+          probeEchoCount += 1
+          respond(res, 200, { ok: true, count: probeEchoCount }); return
+        }
+        if (method === 'GET' && suffix === '/__probe/count') {
+          respond(res, 200, { count: probeEchoCount }); return
         }
         // 成果原件：GET 服务快照（?download=1 保存副本）；POST ?action=reveal 在本机打开源文件
         const artifactMatch = /^\/artifacts\/([a-z0-9-]+)$/.exec(suffix)
