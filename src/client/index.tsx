@@ -1033,6 +1033,8 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
   const [cancelling, setCancelling] = useState<string | null>(null)
   const [editing, setEditing] = useState(false)
   const [detailsOpen, setDetailsOpen] = useState(false)
+  // 失败/结果未知时的逻辑请求（重试复用原 requestId 与载荷；续改 taskId 不丢）
+  const [retryRequest, setRetryRequest] = useState<{ requestId: string; text: string; taskId: string | null } | null>(null)
   const [newRoutine, setNewRoutine] = useState(false)
   const [catalog, setCatalog] = useState<CatalogProvider[]>([])
   const [historyRefresh, forceRefresh] = useState(0)
@@ -1081,16 +1083,20 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
     await api(`/bots/${encodeURIComponent(bot.id)}/stop`, { method: 'POST' }).catch(() => undefined)
   }, [bot.id])
 
-  const send = useCallback(async (overrideText?: string): Promise<void> => {
-    const text = (overrideText ?? draft).trim()
+  const send = useCallback(async (overrideText?: string, overrideRequest?: { requestId: string; text: string; taskId: string | null }): Promise<void> => {
+    const isRetry = Boolean(overrideRequest)
+    const text = (isRetry ? overrideRequest!.text : (overrideText ?? draft)).trim()
     if (!text || sending) return
-    setDraft('')
+    const requestId = isRetry ? overrideRequest!.requestId : `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+    const taskForSend = isRetry ? overrideRequest!.taskId : (draftTask?.taskId ?? null)
+    if (!isRetry) setDraft('')
+    setRetryRequest(null)
     appendLocal(bot.id, { id: `${Date.now()}-u`, role: 'user', text, at: Date.now() })
     setSending(true)
     try {
       const outcome = await api(`/conversations/${encodeURIComponent(bot.id)}/chat`, {
         method: 'POST',
-        body: JSON.stringify({ text, requestId: `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`, ...(draftTask ? { taskId: draftTask.taskId } : {}) }),
+        body: JSON.stringify({ text, requestId, ...(taskForSend ? { taskId: taskForSend } : {}) }),
       })
       const activity = (outcome?.activity ?? []) as string[]
       if (activity.length > 0) {
@@ -1108,6 +1114,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
       appendLocal(bot.id, { id: `${Date.now()}-b`, role: 'bot', text: String(outcome?.reply ?? ''), at: Date.now() })
       // 本回合可能有 deliver_file 交付的卡片：以服务端历史为准刷新（立即可见）
       await refetchHistory()
+      setDraftTask(null)
     } catch (error) {
       appendLocal(bot.id, {
         id: `${Date.now()}-e`,
@@ -1115,9 +1122,10 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
         text: String((error as Error)?.message ?? error),
         at: Date.now(),
       })
+      // 失败/结果未知：保留逻辑请求（重试复用原 ID；服务端已执行的场景由去重缓存返回原结果）
+      setRetryRequest({ requestId, text, taskId: taskForSend })
     } finally {
       setSending(false)
-      setDraftTask(null)
     }
   }, [draft, sending, bot.id, refetchHistory, draftTask])
 
@@ -1273,6 +1281,15 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
           )
           : null}
       </div>
+      {retryRequest
+        ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 22px 0' }}>
+            <span style={{ fontSize: 12, color: 'rgba(176,48,48,.9)' }}>上次发送结果未知（服务端可能已执行）</span>
+            <button type="button" style={{ border: '1px solid rgba(176,48,48,.4)', background: 'rgba(176,48,48,.06)', color: 'rgba(176,48,48,.9)', borderRadius: 99, padding: '3px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }} disabled={sending} onClick={() => void send(undefined, retryRequest)}>重试本次</button>
+            <button type="button" style={{ border: 'none', background: 'none', cursor: 'pointer', color: 'rgba(29,29,31,.4)', fontSize: 12 }} onClick={() => setRetryRequest(null)}>放弃</button>
+          </div>
+        )
+        : null}
       {draftTask
         ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 22px 0' }}>
@@ -1307,6 +1324,7 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[];
   const [draftTask, setDraftTask] = useState<{ taskId: string; name: string } | null>(null)
   const [sending, setSending] = useState(false)
   const [cancellingRuns, setCancellingRuns] = useState<Map<string, string>>(new Map())
+  const [retryRequest, setRetryRequest] = useState<{ requestId: string; text: string; taskId: string | null } | null>(null)
   const queued = props.queued ?? []
   const logRef = useRef<HTMLDivElement | null>(null)
 
@@ -1342,22 +1360,27 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[];
 
   const botOf = (botId?: string): BotInfo | undefined => bots.find((bot) => bot.id === botId)
 
-  const send = useCallback(async (): Promise<void> => {
-    const text = draft.trim()
+  const send = useCallback(async (overrideRequest?: { requestId: string; text: string; taskId: string | null }): Promise<void> => {
+    const isRetry = Boolean(overrideRequest)
+    const text = (isRetry ? overrideRequest!.text : draft).trim()
     if (!text || sending) return
-    setDraft('')
+    const requestId = isRetry ? overrideRequest!.requestId : `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+    const taskForSend = isRetry ? overrideRequest!.taskId : (draftTask?.taskId ?? null)
+    if (!isRetry) setDraft('')
+    setRetryRequest(null)
     setSending(true)
     try {
       const outcome = await api(`/conversations/${encodeURIComponent(room.id)}/chat`, {
         method: 'POST',
-        body: JSON.stringify({ text, requestId: `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`, ...(draftTask ? { taskId: draftTask.taskId } : {}) }),
+        body: JSON.stringify({ text, requestId, ...(taskForSend ? { taskId: taskForSend } : {}) }),
       })
       setMessages(((outcome?.messages ?? []) as RoomMessage[]).slice())
+      setDraftTask(null)
     } catch (error) {
-      setMessages((prev) => [...prev, { ts: Date.now(), role: 'system', text: `发送失败：${String((error as Error)?.message ?? error)}` }])
+      setMessages((prev) => [...prev, { ts: Date.now(), role: 'system', text: `发送失败：${String((error as Error)?.message ?? error)}（可重试本次，复用原请求）` }])
+      setRetryRequest({ requestId, text, taskId: taskForSend })
     } finally {
       setSending(false)
-      setDraftTask(null)
     }
   }, [draft, sending, room.id, draftTask])
 
@@ -1448,6 +1471,15 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[];
         })}
       </div>
       </div>
+      {retryRequest
+        ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 22px 0' }}>
+            <span style={{ fontSize: 12, color: 'rgba(176,48,48,.9)' }}>上次发送结果未知（服务端可能已执行）</span>
+            <button type="button" style={{ border: '1px solid rgba(176,48,48,.4)', background: 'rgba(176,48,48,.06)', color: 'rgba(176,48,48,.9)', borderRadius: 99, padding: '3px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }} disabled={sending} onClick={() => void send(retryRequest)}>重试本次</button>
+            <button type="button" style={{ border: 'none', background: 'none', cursor: 'pointer', color: 'rgba(29,29,31,.4)', fontSize: 12 }} onClick={() => setRetryRequest(null)}>放弃</button>
+          </div>
+        )
+        : null}
       {draftTask
         ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 22px 0' }}>

@@ -185,7 +185,7 @@ test('去重：成功 TTL 内缓存命中；失败短 TTL 内返回失败不重�
   const rf = await fail.run()
   assert.equal(rf.ok, false)
   const retry = reg.begin('req-4', { text: 'b' }, async () => { calls += 1; return { v: 9 } })
-  assert.equal(retry.deduped, true); assert.equal(retry.error, 'boom')
+  assert.equal(retry.deduped, true); assert.equal(retry.cachedFailure, 'boom'); assert.equal(retry.error, null)
   assert.equal(calls, 2) // 失败那次只执行了一次
   time += 31_000
   const retryLate = reg.begin('req-4', { text: 'b' }, async () => { calls += 1; return { v: 9 } })

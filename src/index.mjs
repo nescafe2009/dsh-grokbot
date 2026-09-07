@@ -2622,10 +2622,10 @@ export function apply(ctx, config = {}) {
               if (dedup.error) throw new HttpError(dedup.error.status || 409, dedup.error.message)
               if (dedup.deduped) {
                 if (dedup.result) { respond(res, 200, { ...dedup.result, deduped: true }); return }
-                if (dedup.error) { respond(res, 502, { error: dedup.error, deduped: true }); return }
+                if (dedup.cachedFailure) { respond(res, 502, { error: dedup.cachedFailure, deduped: true, retryableAfterMs: 30_000 }); return }
                 const shared = await dedup.run()
                 if (shared.ok) { respond(res, 200, { ...shared.result, deduped: true }); return }
-                respond(res, 502, { error: shared.error, deduped: true }); return
+                respond(res, 502, { error: shared.error, deduped: true, retryableAfterMs: 30_000 }); return
               }
               const own = await dedup.run()
               if (!own.ok) throw new HttpError(502, own.error)

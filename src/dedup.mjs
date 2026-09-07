@@ -35,8 +35,8 @@ export class ChatRequestRegistry {
           return { deduped: false, result: null, error: { status: 409, message: `requestId ${id} 已绑定不同载荷` } }
         }
         return cached.ok
-          ? { deduped: true, result: cached.result, error: null, run: null }
-          : { deduped: true, result: null, error: cached.error, run: null }
+          ? { deduped: true, result: cached.result, error: null, cachedFailure: null, run: null }
+          : { deduped: true, result: null, error: null, cachedFailure: cached.error, run: null }
       }
       this.results.delete(id)
     }
