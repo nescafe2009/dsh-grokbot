@@ -84,6 +84,7 @@ export class WakeScheduler {
   request(key) {
     const st = this.state.get(key) ?? { lastFiredAt: -Infinity, pending: false }
     this.state.set(key, st)
+    st.failBudget = undefined // 新事件重置失败预算（新恢复机会）
     if (this.now() - st.lastFiredAt < this.intervalMs) {
       st.pending = true
       this._armPending(key)
@@ -104,12 +105,33 @@ export class WakeScheduler {
     this._armPending(key)
   }
 
-  /** 消费方确认：真正开始处理时调用（清除 pending/inTransit） */
+  /** 消费方确认：真正开始处理时调用（清除 pending/inTransit + 重置失败预算） */
   ack(key) {
     const st = this.state.get(key)
     if (!st) return
     st.pending = false
     st.inTransit = false
     st.lastFiredAt = this.now()
+    st.failBudget = undefined
+  }
+
+  /**
+   * 尝试失败收尾（读取失败/空 digest）：结束当前尝试（inTransit），但**保留未确认消费的事件**
+   * （pending 置真——fire 时 pending 被转 inTransit，此处归还），并扣减跨回调的失败预算。
+   * 返回剩余预算（<0 表示已达上限，不再安排重试，但事件保留待后续新事件推动）。
+   * 唯一后续调度来源：_armPending 窗口（由本方法触发），调用方无需另排退避定时器。
+   */
+  failAttempt(key, { maxRetries = 2 } = {}) {
+    const st = this.state.get(key)
+    if (!st) return -1
+    st.inTransit = false
+    st.lastFiredAt = this.now()
+    if (!st.pending) st.pending = true // 未确认消费的事件保留（首次 fire 即失败的场景）
+    if ((st.failBudget ?? maxRetries) <= 0) { st.failBudget = -1; return -1 } // 已耗尽：不再扣减不重排
+    st.failBudget = (st.failBudget ?? maxRetries) - 1
+    st.timer = undefined
+    this._armPending(key) // 唯一调度来源：窗口定时器
+    // 预算耗尽：不再安排定时器；pending 保留（明确待处理状态），新事件 request 会重置窗口
+    return st.failBudget
   }
 }

@@ -318,76 +318,69 @@ test('组合：读取失败释放领取权——后续事件仍可消费', async
 })
 
 
-test('组合：读取暂时失败（空 digest）→ onFired 结束在途 → 新事件窗口后可消费（Codex 二十二轮）', async () => {
+
+
+/* ---------------- 退避状态机（Codex 二十三轮：生产 failAttempt 语义） ---------------- */
+test('退避：单事件首次读取失败（无新事件）——预算内窗口恢复消费', async () => {
   const clock = makeClock(0)
   const timers = []
-  const fired = []
   const consumes = []
-  const sched = new WakeScheduler({ intervalMs: 60_000, now: clock.now, delay: (ms, fn) => { timers.push({ at: clock.now() + ms, fn }); return timers.length }, fire: (k) => fired.push(k) })
+  const reads = []
+  const sched = new WakeScheduler({ intervalMs: 60_000, now: clock.now, delay: (ms, fn) => { timers.push({ at: clock.now() + ms, fn }); return timers.length }, fire: (k) => { reads.push(clock.now()) } })
   const runTimers = () => { const due = timers.filter((t) => t.at <= clock.now()); for (const t of due) { t.fn(); timers.splice(timers.indexOf(t), 1) } }
-
-  // 模拟原协调函数的生产语义（readRoomMsgs catch → [] → 空 digest 分支）
-  const claims = new Set()
   let readFail = true
-  let reads = 0
-  const coordinate = async (key, retried = 0) => {
-    if (claims.has(key)) return
-    claims.add(key)
-    try {
-      reads += 1
-      const msgs = readFail ? [] : [{ role: 'bot', botId: 'x', text: '有效事件' }] // catch(() => []) 语义
-      if (msgs.length === 0) {
-        // 生产分支：releaseClaim + onFired（结束 inTransit，pending 保留）+ 有界退避
-        claims.delete(key)
-        sched.onFired(key)
-        const st = sched.state.get(key)
-        if (st && (st.pending || st.inTransit) && retried < 1) {
-          timers.push({ at: clock.now() + 10_000, fn: () => { void coordinate(key, retried + 1) } })
-        }
-        return
-      }
-      consumes.push({ at: clock.now() })
-      sched.ack(key)
-      timers.push({ at: clock.now() + 5_000, fn: () => sched.onFired(key) }) // 回合 5s 完成
-    } finally { claims.delete(key) }
+  const coordinate = async (key) => {
+    if (reads.length === 0) return
+    if (!readFail) { consumes.push(clock.now()); sched.ack(key) }
+    else { sched.failAttempt(key) } // 生产空 digest 分支
   }
-  // t=0 事件 fire，读取异常 → 空 digest 分支
-  sched.request('g7')
-  await coordinate('g7')
-  assert.equal(reads, 1); assert.equal(consumes.length, 0)
-  assert.equal(sched.state.get('g7').inTransit, false, '在途已结束（onFired）——不卡后续')
-  // t=10 新有效事件 → pending + 窗口
-  clock.advance(10_000); runTimers()
+  // t=0 首事件（窗口外立即 fire → pending=false/inTransit=true）——你指出的丢事件场景
+  sched.request('g9')
+  await coordinate('g9')
+  assert.equal(consumes.length, 0)
+  const st1 = sched.state.get('g9')
+  assert.equal(st1.pending, true, '事件保留（旧实现 inTransit+pending 双 false 丢失）')
+  assert.ok(st1.failBudget >= 0, '预算未耗尽')
+  // t=60 窗口重试（failAttempt 安排的唯一调度源）
   readFail = false
-  sched.request('g7')
-  assert.equal(sched.state.get('g7').pending, true)
-  // t=70 窗口到点 fire → 消费成功
   clock.advance(60_000); runTimers()
-  assert.ok(fired.length >= 2, '窗口到点再 fire')
-  await coordinate('g7')
-  assert.equal(consumes.length, 1, '新事件被消费（旧实现此处 inTransit 卡死）')
-  clock.advance(10_000); runTimers()
-  // 推进到 240s：状态一致
-  clock.advance(160_000); runTimers()
-  const st = sched.state.get('g7')
-  assert.equal(st.pending, false); assert.equal(st.inTransit, false)
-  assert.equal(consumes.length, 1, '无重复消费')
+  await coordinate('g9')
+  assert.equal(consumes.length, 1, '无新事件也能恢复（窗口重试）')
+  assert.equal(sched.state.get('g9').pending, false)
 })
 
-test('组合：空 digest 的退避重试有界（retried<1）——不无限循环', async () => {
+test('退避：持续失败到上限——定时器清空、事件保留待处理（不假称消费）', async () => {
   const clock = makeClock(0)
   const timers = []
-  const sched = new WakeScheduler({ intervalMs: 60_000, now: clock.now, delay: (ms, fn) => { timers.push({ at: clock.now() + ms, fn }); return timers.length }, fire: () => {} })
+  const attempts = []
+  const sched = new WakeScheduler({ intervalMs: 60_000, now: clock.now, delay: (ms, fn) => { timers.push({ at: clock.now() + ms, fn }); return timers.length }, fire: (k) => { attempts.push(clock.now()); sched.failAttempt(k) } })
   const runTimers = () => { const due = timers.filter((t) => t.at <= clock.now()); for (const t of due) { t.fn(); timers.splice(timers.indexOf(t), 1) } }
-  let attempts = 0
-  const coordinate = async (key, retried = 0) => {
-    attempts += 1
-    if (retried >= 1) return // 有界：空 digest 只退避一次
-    sched.onFired(key)
-    timers.push({ at: clock.now() + 10_000, fn: () => { void coordinate(key, retried + 1) } })
-  }
-  sched.request('g8')
-  await coordinate('g8')
+  sched.request('g10') // t=0 fire（fire 回调即协调语义：持续失败 → failAttempt）
+  for (let i = 0; i < 5; i++) { clock.advance(60_000); runTimers() }
+  const st = sched.state.get('g10')
+  assert.equal(st.failBudget, -1, '预算耗尽')
+  assert.equal(timers.length, 0, '定时器清空（停止重试）')
+  assert.equal(st.pending, true, '事件保留为明确待处理（不 ack）')
+  const attemptsAtStop = attempts.length
   clock.advance(300_000); runTimers()
-  assert.equal(attempts, 2, '退避一次后停止（有界）')
+  assert.equal(attempts.length, attemptsAtStop, '上限后不再自动重试')
+})
+
+test('退避：达到上限后新事件仍可消费（request 重置预算）', async () => {
+  const clock = makeClock(0)
+  const timers = []
+  const consumes = []
+  const sched = new WakeScheduler({ intervalMs: 60_000, now: clock.now, delay: (ms, fn) => { timers.push({ at: clock.now() + ms, fn }); return timers.length }, fire: (k) => { const st = sched.state.get(k); if (!st) return; if (!readFail) { consumes.push(1); sched.ack(k) } else sched.failAttempt(k) } })
+  const runTimers = () => { const due = timers.filter((t) => t.at <= clock.now()); for (const t of due) { t.fn(); timers.splice(timers.indexOf(t), 1) } }
+  let readFail = true
+  sched.request('g11')
+  for (let i = 0; i < 4; i++) { clock.advance(60_000); runTimers() }
+  assert.equal(sched.state.get('g11').failBudget, -1, '耗尽')
+  // 新有效事件：request 重置预算
+  readFail = false
+  clock.advance(10_000); runTimers()
+  const r = sched.request('g11')
+  assert.ok(r === 'fired' || r === 'pending', '新事件触发（预算重置；窗口已过则立即 fire）')
+  if (r === 'pending') { clock.advance(50_000); runTimers() }
+  assert.equal(consumes.length, 1, '新事件被消费')
 })
