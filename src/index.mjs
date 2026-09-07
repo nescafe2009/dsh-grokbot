@@ -1687,8 +1687,11 @@ export function apply(ctx, config = {}) {
       }
     }
     // 统一执行锁：任务 → bot → workspace；锁内重读校验（排队期间成员/会话/任务可能变化）
+    // workspace 在参数求值前取好（避免 getTask 异步读文件造成锁获取顺序反转）
+    const execTaskWs = jobTaskIdPre ? (await getTask(stateDir, jobTaskIdPre).catch(() => null))?.workspace || null : null
+    const execWs = execTaskWs || botWorkspace(stateDir, bot)
     await runExclusively(
-      { taskId: jobTaskIdPre, botId: bot.id, workspace: (await getTask(stateDir, jobTaskIdPre).catch(() => null))?.workspace || botWorkspace(stateDir, bot) },
+      { taskId: jobTaskIdPre, botId: bot.id, workspace: execWs },
       async () => {
         if (job.conversationId) {
           const convNow2 = (crewState.crew.conversations ?? []).find((c) => c.id === job.conversationId)
