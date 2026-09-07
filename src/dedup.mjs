@@ -24,19 +24,19 @@ export class ChatRequestRegistry {
    * - 命中缓存/共享在途：deduped=true
    * - 载荷冲突：error={status:409,...}
    */
-  begin(id, payload, exec) {
-    if (!id) return { deduped: false, result: null, error: null, run: () => Promise.resolve(exec()) }
+  begin(id, payload, exec, { retryOnly = false } = {}) {
+    if (!id) return { deduped: false, result: null, error: null, unknown: false, run: () => Promise.resolve(exec()) }
     const t = this.now()
     const cached = this.results.get(id)
     if (cached) {
       const ttl = cached.ok ? this.successTtlMs : this.failureTtlMs
       if (t - cached.at < ttl) {
         if (!this._samePayload(cached.payload, payload)) {
-          return { deduped: false, result: null, error: { status: 409, message: `requestId ${id} 已绑定不同载荷` } }
+          return { deduped: false, result: null, error: { status: 409, message: `requestId ${id} 已绑定不同载荷` }, unknown: false, run: null }
         }
         return cached.ok
-          ? { deduped: true, result: cached.result, error: null, cachedFailure: null, run: null }
-          : { deduped: true, result: null, error: null, cachedFailure: cached.error, run: null }
+          ? { deduped: true, result: cached.result, error: null, cachedFailure: null, unknown: false, run: null }
+          : { deduped: true, result: null, error: null, cachedFailure: cached.error, unknown: false, run: null }
       }
       this.results.delete(id)
     }
@@ -45,7 +45,11 @@ export class ChatRequestRegistry {
       if (!this._samePayload(flying.payload, payload)) {
         return { deduped: false, result: null, error: { status: 409, message: `requestId ${id} 在途请求载荷不同` } }
       }
-      return { deduped: true, result: null, error: null, run: () => flying.promise }
+      return { deduped: true, result: null, error: null, unknown: false, run: () => flying.promise }
+    }
+    // 无记录（过期/重启丢失/从未到达）：重试模式拒绝执行——缓存未命中≠新执行授权
+    if (retryOnly) {
+      return { deduped: false, result: null, error: null, cachedFailure: null, unknown: true, run: null }
     }
     const promise = Promise.resolve()
       .then(() => exec())

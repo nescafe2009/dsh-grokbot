@@ -2617,10 +2617,16 @@ export function apply(ctx, config = {}) {
             if (requestId) {
               // 去重：第一次副作用（用户消息落盘）前登记在途；并发同 ID 共享同一执行
               const payload = { text, taskId: bodyTaskId, mentions: Array.isArray(body?.mentions) ? body.mentions.map(String) : [] }
+              // retryMode=retry：仅允许加入在途/返回已有结果；记录不存在（过期/重启丢失）→
+              // 419「原结果未知/不可恢复」，不追加消息、不调模型——用户明确选择才重新执行（新 ID）
+              const retryOnly = String(body?.retryMode || '') === 'retry'
               const dedup = chatRequestRegistry.begin(requestId, payload, async () => {
                 await appendConversationMsg(conversation, { role: 'user', text })
                 return await handleChatTurn()
-              })
+              }, { retryOnly })
+              if (dedup.unknown) {
+                respond(res, 419, { error: '原请求的执行记录已不可恢复（过期或宿主重启）：请选择「重新执行」生成新请求，或确认原执行结果后继续', unknown: true }); return
+              }
               if (dedup.error) throw new HttpError(dedup.error.status || 409, dedup.error.message)
               if (dedup.deduped) {
                 if (dedup.result) { respond(res, 200, { ...dedup.result, deduped: true }); return }

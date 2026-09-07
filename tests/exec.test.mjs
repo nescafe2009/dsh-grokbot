@@ -202,3 +202,60 @@ test('去重：不同 ID 正常执行互不影响', async () => {
   const ra = await a.run(); const rb = await b.run()
   assert.equal(calls, 2); assert.equal(ra.result, 'A'); assert.equal(rb.result, 'B')
 })
+
+/* ---------------- retryOnly 协议（Codex 十六轮） ---------------- */
+test('协议：部分副作用后失败 → TTL 内重试返回缓存失败；31s（超失败 TTL）→ unknown 拒绝执行', async () => {
+  let time = 1000
+  const reg = new ChatRequestRegistry({ now: () => time })
+  let effects = 0
+  const first = reg.begin('p1', { text: 'x' }, async () => { effects += 1; throw new Error('partial then fail') })
+  const rf = await first.run()
+  assert.equal(rf.ok, false); assert.equal(effects, 1)
+  time += 20_000
+  const inTtl = reg.begin('p1', { text: 'x' }, async () => { effects += 1; return {} }, { retryOnly: true })
+  assert.equal(inTtl.cachedFailure, 'partial then fail'); assert.equal(inTtl.unknown, false)
+  assert.equal(effects, 1, '失败缓存 TTL 内查询不执行')
+  time += 11_000 // 合计 31s > 30s 失败 TTL
+  const retry = reg.begin('p1', { text: 'x' }, async () => { effects += 1; return {} }, { retryOnly: true })
+  assert.equal(retry.unknown, true, '超失败 TTL 拒绝执行（Codex 第 31 秒路径）')
+  assert.equal(retry.run, null)
+  assert.equal(effects, 1, '副作用计数不增加')
+})
+
+test('协议：失败缓存过期 → retryOnly 返回 unknown（不执行）；明确新 ID 才执行', async () => {
+  let time = 1000
+  const reg = new ChatRequestRegistry({ now: () => time })
+  let effects = 0
+  await reg.begin('p2', { text: 'x' }, async () => { effects += 1; throw new Error('fail') }).run()
+  time += 31_000 + 1_000
+  const retry = reg.begin('p2', { text: 'x' }, async () => { effects += 1; return {} }, { retryOnly: true })
+  assert.equal(retry.unknown, true, '过期后重试拒绝执行')
+  assert.equal(retry.run, null)
+  assert.equal(effects, 1)
+  // 明确新执行（新 ID，非 retryOnly）
+  const fresh = reg.begin('p2-new', { text: 'x' }, async () => { effects += 1; return { v: 2 } })
+  const rf = await fresh.run()
+  assert.equal(rf.ok, true); assert.equal(effects, 2)
+})
+
+test('协议：成功结果过期 → retryOnly unknown；窗口内 → 返回原结果不执行', async () => {
+  let time = 1000
+  const reg = new ChatRequestRegistry({ now: () => time })
+  let effects = 0
+  await reg.begin('p3', { text: 'x' }, async () => { effects += 1; return { v: 'first' } }).run()
+  time += 60_000
+  assert.equal((reg.begin('p3', { text: 'x' }, async () => { effects += 1; return {} }, { retryOnly: true })).result?.v, 'first')
+  assert.equal(effects, 1, '成功 TTL 内查询返回原结果')
+  time += 5 * 60_000
+  const late = reg.begin('p3', { text: 'x' }, async () => { effects += 1; return {} }, { retryOnly: true })
+  assert.equal(late.unknown, true); assert.equal(effects, 1, '成功过期后拒绝执行')
+})
+
+test('协议：模拟重启（新 registry）→ retryOnly unknown', async () => {
+  let effects = 0
+  const reg1 = new ChatRequestRegistry()
+  await reg1.begin('p4', { text: 'x' }, async () => { effects += 1; return {} }).run()
+  const reg2 = new ChatRequestRegistry() // 重启清空
+  const retry = reg2.begin('p4', { text: 'x' }, async () => { effects += 1; return {} }, { retryOnly: true })
+  assert.equal(retry.unknown, true); assert.equal(effects, 1)
+})
