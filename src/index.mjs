@@ -1676,7 +1676,18 @@ export function apply(ctx, config = {}) {
         return `用户: ${String(msg.text || '').slice(0, 120)}`
       })
       .join('\n')
-    if (!digest) { releaseClaim(); return }
+    if (!digest) {
+      // 空 digest（含读取失败被吞成 []）：结束本次协调尝试（释放 claims + 调度器在途），
+      // 不 ack（事件不丢弃）；短暂退避后若有未消费事件再试一次（有界，不无限重试）
+      releaseClaim()
+      chiefWake.onFired(conversationId)
+      logWake({ kind: 'empty-digest-backoff', conversationId })
+      const st = chiefWake.state.get(conversationId)
+      if (st && (st.pending || st.inTransit) && retried < 1) {
+        setTimeout(() => { void chiefCoordinationTurn(conversationId, retried + 1) }, 10_000)
+      }
+      return
+    }
     logWake({ kind: 'consume', conversationId, digestLines: digest.split('\n').length })
     chiefWake.ack(conversationId) // 消费确认：清除 pending/inTransit（真正开始处理）
     // 领取一次性状态转换：撤销本会话残留的释放探针（事件已被消费，不得再触发）
@@ -1710,10 +1721,14 @@ export function apply(ctx, config = {}) {
       releaseClaim()
     }
     } catch (claimError) {
-      // 读取/构建 digest 期间的异常也不能泄漏领取权
+      // 读取/构建 digest 期间的异常：释放 claims + 结束调度器在途（不 ack，事件保留）
       releaseClaim()
+      chiefWake.onFired(conversationId)
       logWake({ kind: 'claim-error', conversationId, error: safeError(claimError) })
-      throw claimError
+      const st = chiefWake.state.get(conversationId)
+      if (st && (st.pending || st.inTransit) && retried < 1) {
+        setTimeout(() => { void chiefCoordinationTurn(conversationId, retried + 1) }, 10_000)
+      }
     }
   }
 
