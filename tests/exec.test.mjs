@@ -146,3 +146,59 @@ test('编排：无 run 的普通回合=done/failed 不误标', () => {
   assert.equal(resolveTurnFinalOutcome({ entryRunId: null, liveRunId: null, cancelledSet: new Set(), error: null, text: 'ok' }).finalStatus, 'done')
   assert.equal(resolveTurnFinalOutcome({ entryRunId: null, liveRunId: null, cancelledSet: new Set(), error: 'e', text: null }).finalStatus, 'failed')
 })
+
+/* ---------------- 请求去重注册表（R2-B 十二轮 P1） ---------------- */
+import { ChatRequestRegistry } from '../src/dedup.mjs'
+
+test('去重：并发同 ID 共享在途（exec 只执行一次）', async () => {
+  const reg = new ChatRequestRegistry()
+  let calls = 0
+  const exec = async () => { calls += 1; await new Promise((r) => setTimeout(r, 40)); return { reply: 'R' } }
+  const a = reg.begin('req-1', { text: 'hi' }, exec)
+  const b = reg.begin('req-1', { text: 'hi' }, exec)
+  const ra = await a.run(); const rb = await b.run()
+  assert.equal(calls, 1)
+  assert.deepEqual(rb.result?.reply ?? rb, ra.result?.reply ?? 'R')
+})
+
+test('去重：同 ID 不同载荷 → 409 冲突（不执行）', async () => {
+  const reg = new ChatRequestRegistry()
+  let calls = 0
+  const a = reg.begin('req-2', { text: 'x' }, async () => { calls += 1; return {} })
+  const b = reg.begin('req-2', { text: 'y' }, async () => { calls += 1; return {} })
+  await a.run()
+  assert.equal(b.error?.status, 409)
+  assert.equal(calls, 1)
+})
+
+test('去重：成功 TTL 内缓存命中；失败短 TTL 内返回失败不重做', async () => {
+  let time = 1000
+  const reg = new ChatRequestRegistry({ now: () => time })
+  let calls = 0
+  const ok = reg.begin('req-3', { text: 'a' }, async () => { calls += 1; return { v: 1 } })
+  await ok.run()
+  time += 60_000
+  const hit = reg.begin('req-3', { text: 'a' }, async () => { calls += 1; return { v: 2 } })
+  assert.equal(hit.deduped, true); assert.deepEqual(hit.result, { v: 1 }); assert.equal(calls, 1)
+  // 失败：短 TTL 内重试返回失败、不重做
+  const fail = reg.begin('req-4', { text: 'b' }, async () => { calls += 1; throw new Error('boom') })
+  const rf = await fail.run()
+  assert.equal(rf.ok, false)
+  const retry = reg.begin('req-4', { text: 'b' }, async () => { calls += 1; return { v: 9 } })
+  assert.equal(retry.deduped, true); assert.equal(retry.error, 'boom')
+  assert.equal(calls, 2) // 失败那次只执行了一次
+  time += 31_000
+  const retryLate = reg.begin('req-4', { text: 'b' }, async () => { calls += 1; return { v: 9 } })
+  assert.equal(retryLate.deduped, false) // TTL 过后放行显式重试
+  await retryLate.run()
+  assert.equal(calls, 3)
+})
+
+test('去重：不同 ID 正常执行互不影响', async () => {
+  const reg = new ChatRequestRegistry()
+  let calls = 0
+  const a = reg.begin('id-a', { text: 'x' }, async () => { calls += 1; return 'A' })
+  const b = reg.begin('id-b', { text: 'x' }, async () => { calls += 1; return 'B' })
+  const ra = await a.run(); const rb = await b.run()
+  assert.equal(calls, 2); assert.equal(ra.result, 'A'); assert.equal(rb.result, 'B')
+})

@@ -1090,7 +1090,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
     try {
       const outcome = await api(`/conversations/${encodeURIComponent(bot.id)}/chat`, {
         method: 'POST',
-        body: JSON.stringify({ text, ...(draftTask ? { taskId: draftTask.taskId } : {}) }),
+        body: JSON.stringify({ text, requestId: `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`, ...(draftTask ? { taskId: draftTask.taskId } : {}) }),
       })
       const activity = (outcome?.activity ?? []) as string[]
       if (activity.length > 0) {
@@ -1350,7 +1350,7 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[];
     try {
       const outcome = await api(`/conversations/${encodeURIComponent(room.id)}/chat`, {
         method: 'POST',
-        body: JSON.stringify({ text, ...(draftTask ? { taskId: draftTask.taskId } : {}) }),
+        body: JSON.stringify({ text, requestId: `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`, ...(draftTask ? { taskId: draftTask.taskId } : {}) }),
       })
       setMessages(((outcome?.messages ?? []) as RoomMessage[]).slice())
     } catch (error) {

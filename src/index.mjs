@@ -9,6 +9,7 @@ import { resolveDispatchTarget, WakeScheduler } from './dispatch.mjs'
 import { isInsideRoot, classifyDeliveryTarget, createArtifactSnapshot, artifactMime } from './delivery-core.mjs'
 import { createTask, getTask, listTasks, startRun, endRun, attachArtifact, validateTaskForContext, classifyExecutionOutcome, resolveTurnFinalOutcome } from './tasks.mjs'
 import { runExclusively } from './exec.mjs'
+import { ChatRequestRegistry } from './dedup.mjs'
 import { BOT_TEMPLATES, templateById } from './templates.mjs'
 
 const API_ROOT = '/api/plugins/grokbot'
@@ -104,8 +105,8 @@ export function apply(ctx, config = {}) {
   const botStates = new Map()
   const chatHandles = new Map()
   const chatSessionIds = new Map()
-  // 请求去重缓存：requestId → { at, result }（窗口 5 分钟；重启即清）
-  const chatRequestCache = new Map()
+  // 请求去重：在途共享 + 成功/失败分级 TTL（重启即清）
+  const chatRequestRegistry = new ChatRequestRegistry()
   const pendingJobs = []
   // R2-B：调度占位——pump 已提交但尚未 claim 的 job（含等待 task/bot/workspace 锁者）。
   // 状态三处可见：/state.queued、/queue/:id/cancel、锁内执行前取消检查。
@@ -1983,15 +1984,18 @@ export function apply(ctx, config = {}) {
     while (runningJobs.size + waitingJobs.size < maxConcurrentJobs && pendingJobs.length > 0) {
       const busy = new Set([
         ...[...runningJobs.values()].map((entry) => entry.botId),
-        ...[...waitingJobs.values()].map((w) => w.job.toBot),
+        ...[...waitingJobs.values()].map((w) => w.resolvedBotId || routeJob(crewState.crew, w.job).id),
       ])
-      const index = pendingJobs.findIndex((job) => {
-        const bot = routeJob(crewState.crew, job)
-        return !busy.has(bot.id)
-      })
-      if (index < 0) break
-      const [job] = pendingJobs.splice(index, 1)
-      if (!runningJobs.has(job.jobId)) waitingJobs.set(job.jobId, { job, since: Date.now(), cancelRequested: false })
+      let picked = -1
+      let pickedBot = null
+      for (let i = 0; i < pendingJobs.length; i++) {
+        const bot = routeJob(crewState.crew, pendingJobs[i])
+        if (!busy.has(bot.id)) { picked = i; pickedBot = bot; break }
+      }
+      if (picked < 0) break
+      const [job] = pendingJobs.splice(picked, 1)
+      // 占位保存解析后的 botId（routeJob 可解析空/回退目标）——busy、/state、领取身份一致
+      if (!runningJobs.has(job.jobId)) waitingJobs.set(job.jobId, { job, since: Date.now(), cancelRequested: false, resolvedBotId: pickedBot.id })
       void runInboxJob(job)
     }
   }
@@ -2168,7 +2172,7 @@ export function apply(ctx, config = {}) {
             running: [...runningJobs.entries()].map(([jobId, entry]) => ({ jobId, ...entry })),
             queued: [
               ...pendingJobs.map((j) => ({ jobId: j.jobId, botId: j.toBot, conversationId: j.conversationId ?? null, text: String(j.text || '').slice(0, 60) })),
-              ...[...waitingJobs.values()].map((w) => ({ jobId: w.job.jobId, botId: w.job.toBot, conversationId: w.job.conversationId ?? null, text: String(w.job.text || '').slice(0, 60), waiting: true })),
+              ...[...waitingJobs.values()].map((w) => ({ jobId: w.job.jobId, botId: w.resolvedBotId || routeJob(crewState.crew, w.job).id, conversationId: w.job.conversationId ?? null, text: String(w.job.text || '').slice(0, 60), waiting: true })),
             ],
             queueDepth: pendingJobs.length,
             recentJobs,
@@ -2576,27 +2580,43 @@ export function apply(ctx, config = {}) {
             const body = await readJsonBody(req)
             const text = String(body?.text || '').trim()
             if (!text) throw new HttpError(400, 'text 不能为空')
-            // 请求去重：同 requestId 短窗内重发返回上次结果（不重复执行/副作用）
+            // 请求去重：第一次副作用（含消息落盘）前登记在途；并发同 ID 共享执行结果
             const requestId = /^[a-zA-Z0-9_-]{6,64}$/.test(String(body?.requestId || '')) ? `${conversationId}:${body.requestId}` : null
-            if (requestId) {
-              const cached = chatRequestCache.get(requestId)
-              if (cached && Date.now() - cached.at < 5 * 60_000) {
-                respond(res, 200, { ...cached.result, deduped: true }); return
-              }
-            }
             const bodyTaskId = /^[a-z0-9-]+$/i.test(String(body?.taskId || '')) ? String(body.taskId) : null
-            await appendConversationMsg(conversation, { role: 'user', text })
+            if (requestId) {
+              const payload = { text, taskId: bodyTaskId, mentions: Array.isArray(body?.mentions) ? body.mentions.map(String) : [] }
+              const dedup = chatRequestRegistry.begin(requestId, payload, async () => {
+                await appendConversationMsg(conversation, { role: 'user', text })
+                return await handleChatTurn()
+              })
+              if (dedup.error) {
+                throw new HttpError(dedup.error.status || 409, dedup.error.message)
+              }
+              if (dedup.deduped) {
+                // 命中缓存（成功/失败分级 TTL）或共享在途：结构一致返回
+                if (dedup.result) { respond(res, 200, { ...dedup.result, deduped: true }); return }
+                if (dedup.error) { respond(res, 502, { error: dedup.error, deduped: true }); return }
+                // 在途共享
+                const shared = await dedup.run()
+                if (shared.ok) { respond(res, 200, { ...shared.result, deduped: true }); return }
+                respond(res, 502, { error: shared.error, deduped: true }); return
+              }
+              const own = await dedup.run()
+              if (!own.ok) throw new HttpError(502, own.error)
+              respond(res, 200, { ...own.result }); return
+            }
+            const handleChatTurn = async () => {
             if (conversation.memberBotIds.length === 1) {
               const memberBot = crewState.crew.bots.find((entry) => entry.id === conversation.memberBotIds[0])
               const setupReply = memberBot ? await trySetupTurn(memberBot, text) : null
               if (setupReply) {
                 await appendDm(memberBot.id, { role: 'bot', text: setupReply.reply }).catch(() => undefined)
-                respond(res, 200, {
+                return {
                   responder: publicBot(crewState.crew.bots.find((entry) => entry.id === memberBot.id) ?? memberBot),
                   reply: setupReply.reply,
                   handoffTo: null,
                   messages: await readConversationMsgs(conversationOf(conversationId)),
-                }); return
+                }
               }
             }
             // mentions[]：前端结构化 @（精确 botId，须为在册成员；A2），
@@ -2607,13 +2627,34 @@ export function apply(ctx, config = {}) {
               mentionTarget = eligibleBots(conversation).find((bot) => bot.id === wanted) ?? null
             }
             const result = await conversationTurn(conversation, text, { mentionTarget, taskId: bodyTaskId })
-            if (requestId) chatRequestCache.set(requestId, { at: Date.now(), result: { responder: publicBot(result.responder), reply: result.reply } })
-            respond(res, 200, {
+            return {
               responder: publicBot(result.responder),
               reply: result.reply,
               handoffTo: result.handoffTo,
               messages: await readConversationMsgs(conversation),
-            }); return
+            }
+            }
+            if (requestId) {
+              // 去重：第一次副作用（用户消息落盘）前登记在途；并发同 ID 共享同一执行
+              const payload = { text, taskId: bodyTaskId, mentions: Array.isArray(body?.mentions) ? body.mentions.map(String) : [] }
+              const dedup = chatRequestRegistry.begin(requestId, payload, async () => {
+                await appendConversationMsg(conversation, { role: 'user', text })
+                return await handleChatTurn()
+              })
+              if (dedup.error) throw new HttpError(dedup.error.status || 409, dedup.error.message)
+              if (dedup.deduped) {
+                if (dedup.result) { respond(res, 200, { ...dedup.result, deduped: true }); return }
+                if (dedup.error) { respond(res, 502, { error: dedup.error, deduped: true }); return }
+                const shared = await dedup.run()
+                if (shared.ok) { respond(res, 200, { ...shared.result, deduped: true }); return }
+                respond(res, 502, { error: shared.error, deduped: true }); return
+              }
+              const own = await dedup.run()
+              if (!own.ok) throw new HttpError(502, own.error)
+              respond(res, 200, own.result); return
+            }
+            await appendConversationMsg(conversation, { role: 'user', text })
+            respond(res, 200, await handleChatTurn()); return
           }
         }
         if (method === 'GET' && suffix === '/skills') {
