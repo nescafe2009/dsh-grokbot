@@ -269,3 +269,50 @@ test('组合：释放回调竞争——事件已被消费（pending=false），�
   sched.request('g4'); sched.ack('g4') // 事件消费完毕
   assert.equal(gate(), false, '已消费事件 → 释放探针不触发（第三轮被阻止）')
 })
+
+
+test('组合：同刻释放竞争——两个回调同时越过 idle 检查、异步读取，consume 严格 1 次/领取（Codex 二十一轮）', async () => {
+  // 模拟原函数结构：同步 claim → await 读取 → ack/执行
+  const claims = new Set()
+  const consumes = []
+  let reads = 0
+  const readMsgs = async () => { reads += 1; await new Promise((r) => setTimeout(r, 5)); return [{ role: 'bot', botId: 'x', text: 'm' }] }
+  const coordinate = async (key) => {
+    if (claims.has(key)) return 'lost'          // 原子领取失败（另一回调已占用）
+    claims.add(key)                              // 同步占用——在第一个 await 之前
+    try {
+      const msgs = await readMsgs()              // 竞争窗口：两回调都可能到达这里
+      consumes.push({ key, at: reads })
+      return 'won'
+    } finally { claims.delete(key) }
+  }
+  // 两个回调同刻进入（都见 idle）：只有一个能 claim
+  const [a, b] = await Promise.all([coordinate('g5'), coordinate('g5')])
+  const winners = [a, b].filter((r) => r === 'won')
+  assert.equal(winners.length, 1, '严格一次领取/消费')
+  assert.equal(consumes.length, 1)
+  // 领取已释放 → 下一个有效事件可再消费（领取权不泄漏）
+  const c = await coordinate('g5')
+  assert.equal(c, 'won')
+  assert.equal(consumes.length, 2)
+})
+
+test('组合：读取失败释放领取权——后续事件仍可消费', async () => {
+  const claims = new Set()
+  const consumed = []
+  let failNext = true
+  const coordinate = async (key) => {
+    if (claims.has(key)) return 'lost'
+    claims.add(key)
+    try {
+      if (failNext) { failNext = false; throw new Error('read fail') }
+      consumed.push(key)
+      return 'won'
+    } finally { claims.delete(key) }
+  }
+  await assert.rejects(() => coordinate('g6'), /read fail/)
+  assert.equal(claims.size, 0, '异常路径领取权已释放')
+  const r = await coordinate('g6')
+  assert.equal(r, 'won')
+  assert.equal(consumed.length, 1)
+})

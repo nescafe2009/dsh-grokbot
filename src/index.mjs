@@ -1621,14 +1621,20 @@ export function apply(ctx, config = {}) {
     } catch { /* 会话已删除等 */ }
   }
 
+  // 协调领取权：同步检查并占用（同一事件循环段内完成，覆盖多回调同时见 idle 的竞争窗口）；
+  // 只有获准者读取消息/ack/执行模型；未获准者直接退出（事件保留在调度器 pending）
+  const coordinationClaims = new Set() // conversationId 集合：已领取未释放
+
   async function chiefCoordinationTurn(conversationId, retried = 0) {
     const chief = crewState.crew.bots.find((bot) => bot.id === 'chief')
     const conv = crewState.crew.conversations?.find((c) => c.id === conversationId)
     if (!chief || !conv) return
     const state = botState(chief.id)
-    if (state.status === 'working') {
+    // 原子领取：busy 或已被其他回调领取 → 退出（pending 保留给后续）
+    if (state.status === 'working' || coordinationClaims.has(conversationId)) {
+      const claimedButIdle = !coordinationClaims.has(conversationId)
       // 幕僚长忙（可能在处理上一轮交付/另一群协调）：事件不丢——pending 保留在调度器，
-      // 由空闲探询消费（空闲探针仅查内存状态，不调模型；30s 一次直到释放）
+      // 由轻量内存轮询探针消费（零模型调用；30s 一次直到释放）
       logWake({ kind: 'busy-deferred', conversationId, retried })
       if (!busyProbes.has(conversationId)) {
         busyProbes.set(conversationId, setInterval(() => {
@@ -1653,6 +1659,11 @@ export function apply(ctx, config = {}) {
       }
       return
     }
+    // 领取成功（同步段内完成）：此后所有异步操作期间，其他回调被挡在入口
+    coordinationClaims.add(conversationId)
+    let claimReleased = false
+    const releaseClaim = () => { if (!claimReleased) { claimReleased = true; coordinationClaims.delete(conversationId) } }
+    try {
     const msgs = await readRoomMsgs(conversationId, 12).catch(() => [])
     const digest = msgs.slice(-6)
       .map((msg) => {
@@ -1665,7 +1676,7 @@ export function apply(ctx, config = {}) {
         return `用户: ${String(msg.text || '').slice(0, 120)}`
       })
       .join('\n')
-    if (!digest) return
+    if (!digest) { releaseClaim(); return }
     logWake({ kind: 'consume', conversationId, digestLines: digest.split('\n').length })
     chiefWake.ack(conversationId) // 消费确认：清除 pending/inTransit（真正开始处理）
     // 领取一次性状态转换：撤销本会话残留的释放探针（事件已被消费，不得再触发）
@@ -1696,6 +1707,13 @@ export function apply(ctx, config = {}) {
       state.lastActivity = Date.now()
       chiefWake.onFired(conversationId)
       logWake({ kind: 'cycle-end', conversationId })
+      releaseClaim()
+    }
+    } catch (claimError) {
+      // 读取/构建 digest 期间的异常也不能泄漏领取权
+      releaseClaim()
+      logWake({ kind: 'claim-error', conversationId, error: safeError(claimError) })
+      throw claimError
     }
   }
 
