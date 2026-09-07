@@ -194,3 +194,20 @@ export function classifyExecutionOutcome({ cancelledIntent, error, text }) {
   if (!String(text || '').trim()) return { status: 'failed', notifyKind: 'failed' }
   return { status: 'done', notifyKind: 'none' }
 }
+
+
+/**
+ * 编排取消收尾统一判定（chatTurn / runJobBody 共用；可测）。
+ * entryRunId：入口带来的 run（续改/handoff）；liveRunId：回合内 task_begin 新建 run
+ * （从 activeTurnCtx 读取）。两者取一作为"本回合实际 run"。
+ * 返回 { actualRunId, cancelled, finalStatus }——供存储、返回值、群/DM 通知、
+ * job 分类与奖励统一使用；普通异常 finalStatus='failed' 不变。
+ */
+export function resolveTurnFinalOutcome({ entryRunId, liveRunId, entryTaskId, liveTaskId, cancelledSet, error, text }) {
+  const actualRunId = entryRunId ?? liveRunId ?? null
+  const actualTaskId = entryRunId ? entryTaskId : (liveTaskId ?? null)
+  const cancelled = actualRunId ? cancelledSet.has(actualRunId) : false
+  if (cancelled) return { actualRunId, actualTaskId, cancelled: true, finalStatus: 'cancelled' }
+  const cls = classifyExecutionOutcome({ cancelledIntent: false, error, text })
+  return { actualRunId, actualTaskId, cancelled: false, finalStatus: cls.status }
+}

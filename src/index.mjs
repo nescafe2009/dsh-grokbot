@@ -7,7 +7,7 @@ import { loadOrCreateCrew, routeJob, botWorkspace, serializeCrew, atomicWrite, p
 import { ensureInbox, scanInbox, claimJob, completeJob, failJob, cancelJob, enqueueJob } from './inbox.mjs'
 import { resolveDispatchTarget, WakeScheduler } from './dispatch.mjs'
 import { isInsideRoot, classifyDeliveryTarget, createArtifactSnapshot, artifactMime } from './delivery-core.mjs'
-import { createTask, getTask, listTasks, startRun, endRun, attachArtifact, validateTaskForContext, classifyExecutionOutcome } from './tasks.mjs'
+import { createTask, getTask, listTasks, startRun, endRun, attachArtifact, validateTaskForContext, classifyExecutionOutcome, resolveTurnFinalOutcome } from './tasks.mjs'
 import { runExclusively } from './exec.mjs'
 import { BOT_TEMPLATES, templateById } from './templates.mjs'
 
@@ -105,6 +105,9 @@ export function apply(ctx, config = {}) {
   const chatHandles = new Map()
   const chatSessionIds = new Map()
   const pendingJobs = []
+  // R2-B：调度占位——pump 已提交但尚未 claim 的 job（含等待 task/bot/workspace 锁者）。
+  // 状态三处可见：/state.queued、/queue/:id/cancel、锁内执行前取消检查。
+  const waitingJobs = new Map() // jobId -> { job, since, cancelRequested }
   const runningJobs = new Map()
   const seenJobIds = new Set()
   const recentJobs = []
@@ -1427,6 +1430,13 @@ export function apply(ctx, config = {}) {
         return outcome
       } catch (error) {
         failed = true
+        // 取消意图下的异常（abort reject）不作为普通失败外抛：返回可识别的取消结果
+        const liveCtxNow = activeTurnCtx.get(convKey)
+        const cancelIntentErr = (runRef?.id ?? liveCtxNow?.runId) ? cancelledRunIds.has(runRef?.id ?? liveCtxNow.runId) : false
+        if (cancelIntentErr) {
+          cancelled = true
+          return { text: outcome?.text?.trim() || '', activity: [], error: null, cancelled: true }
+        }
         throw error
       } finally {
         state.status = prevStatus === 'working' ? 'idle' : prevStatus
@@ -1435,6 +1445,7 @@ export function apply(ctx, config = {}) {
         state.currentTaskId = null
         const cancelIntent2 = runRef ? cancelledRunIds.has(runRef.id) : false
         const finalSt = await closeActiveRun(convKey, taskId, runRef?.id ?? null, cancelIntent2 ? 'cancelled' : (failed ? 'failed' : 'done'))
+        if (finalSt === 'cancelled' && outcome && !outcome.cancelled) outcome.cancelled = true
         if (finalSt === 'cancelled' && writeDm) {
           await appendDm(bot.id, { role: 'system', text: '✕ 已取消：本次执行已停止，未计入完成' }).catch(() => undefined)
         }
@@ -1713,6 +1724,7 @@ export function apply(ctx, config = {}) {
         await runJobBody(job, bot, convKey4Job, jobTaskIdPre)
       },
     ).catch(async (error) => {
+      waitingJobs.delete(job.jobId)
       await failJob(job, bot.id, safeError(error)).catch(() => undefined)
       recordRecent({ jobId: job.jobId, botId: bot.id, status: 'failed', error: safeError(error).slice(0, 80), endedAt: Date.now() })
       if (job.conversationId) {
@@ -1724,6 +1736,18 @@ export function apply(ctx, config = {}) {
 
   async function runJobBody(job, bot, convKey4Job, jobTaskIdPre) {
     {
+    // 调度占位落定：取消已请求 → 不 claim/不建 run/不调模型；否则移出等待表
+    const waiting = waitingJobs.get(job.jobId)
+    if (waiting?.cancelRequested) {
+      waitingJobs.delete(job.jobId)
+      await cancelJob(job, bot.id, '用户取消排队任务（未执行）').catch(() => undefined)
+      if (job.conversationId) {
+        await appendRoomMsg(job.conversationId, { role: 'system', text: `✕ 已取消排队任务（未开始执行）：${String(job.text || '').slice(0, 40)}` }).catch(() => undefined)
+      }
+      recordRecent({ jobId: job.jobId, botId: bot.id, status: 'cancelled', endedAt: Date.now() })
+      return
+    }
+    waitingJobs.delete(job.jobId)
     const state = botState(bot.id)
     state.status = 'working'
     state.currentJob = job.jobId
@@ -1783,7 +1807,8 @@ export function apply(ctx, config = {}) {
         : null
       {
         await session.handle.agent.whenIdle().catch((e) => { execError = e })
-        if (execError && !(hoRunId && cancelledRunIds.has(hoRunId))) throw execError
+        const liveRunNow2 = activeTurnCtx.get(convKey4Job)?.runId ?? null
+        if (execError && !cancelledRunIds.has(hoRunId ?? liveRunNow2)) throw execError
         const firstSeq = session.handle.agent.session.seq
         const basePrompt = handoffPreamble || promptText
         const withImages = job.images.length > 0
@@ -1792,7 +1817,8 @@ export function apply(ctx, config = {}) {
         session.handle.agent.followup(userMessage(withImages))
         await session.handle.agent.whenIdle().catch((e) => { if (!execError) execError = e })
         outcome = summarizeTurn(session.handle.agent.session.events, firstSeq)
-        if (execError && !(hoRunId && cancelledRunIds.has(hoRunId))) throw execError
+        const liveRunIdNow = activeTurnCtx.get(convKey4Job)?.runId ?? null
+        if (execError && !cancelledRunIds.has(hoRunId ?? liveRunIdNow)) throw execError
       }
       } finally {
         if (timeout) clearTimeout(timeout)
@@ -1890,6 +1916,7 @@ export function apply(ctx, config = {}) {
       })
       if (index < 0) break
       const [job] = pendingJobs.splice(index, 1)
+      if (!runningJobs.has(job.jobId)) waitingJobs.set(job.jobId, { job, since: Date.now(), cancelRequested: false })
       void runInboxJob(job)
     }
   }
@@ -2064,7 +2091,10 @@ export function apply(ctx, config = {}) {
             routines: crewState.crew.routines ?? [],
             approvals: [...pendingApprovals.values()].map(({ resolve, ...rest }) => rest),
             running: [...runningJobs.entries()].map(([jobId, entry]) => ({ jobId, ...entry })),
-            queued: pendingJobs.map((j) => ({ jobId: j.jobId, botId: j.toBot, conversationId: j.conversationId ?? null, text: String(j.text || '').slice(0, 60) })),
+            queued: [
+              ...pendingJobs.map((j) => ({ jobId: j.jobId, botId: j.toBot, conversationId: j.conversationId ?? null, text: String(j.text || '').slice(0, 60) })),
+              ...[...waitingJobs.values()].map((w) => ({ jobId: w.job.jobId, botId: w.job.toBot, conversationId: w.job.conversationId ?? null, text: String(w.job.text || '').slice(0, 60), waiting: true })),
+            ],
             queueDepth: pendingJobs.length,
             recentJobs,
             lastTarget: uiState.lastTarget,
@@ -2088,6 +2118,12 @@ export function apply(ctx, config = {}) {
           const idx = pendingJobs.findIndex((j) => j.jobId === jobId)
           const running = runningJobs.get(jobId)
           if (running) throw new HttpError(409, '该任务已在执行，请用 run 级取消')
+          // 等锁中的任务：标记取消请求，由锁内执行前检查落定（不 claim/不 run）
+          const waitingEntry = waitingJobs.get(jobId)
+          if (waitingEntry) {
+            waitingEntry.cancelRequested = true
+            respond(res, 200, { ok: true, cancelled: jobId, note: '已确认取消：任务将在获得锁前丢弃' }); return
+          }
           if (idx < 0) throw new HttpError(404, `排队任务不存在：${jobId}`)
           const [job] = pendingJobs.splice(idx, 1)
           await cancelJob(job, job.toBot || '', '用户取消排队任务（未执行）')

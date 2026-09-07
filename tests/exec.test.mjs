@@ -116,3 +116,33 @@ test('分类：无意图无错误有文本=done；无文本=failed', () => {
   assert.deepEqual(classifyExecutionOutcome({ cancelledIntent: false, error: null, text: 'ok' }), { status: 'done', notifyKind: 'none' })
   assert.deepEqual(classifyExecutionOutcome({ cancelledIntent: false, error: null, text: '  ' }), { status: 'failed', notifyKind: 'failed' })
 })
+
+/* ---------------- 编排收尾贯通回归（Codex 十轮 P1-1）---------------- */
+import { resolveTurnFinalOutcome } from '../src/tasks.mjs'
+
+test('编排：入口 run（续改/handoff）取消——正常返回', () => {
+  const r = resolveTurnFinalOutcome({ entryRunId: 'r1', entryTaskId: 't1', liveRunId: null, liveTaskId: null, cancelledSet: new Set(['r1']), error: null, text: '部分' })
+  assert.equal(r.cancelled, true); assert.equal(r.finalStatus, 'cancelled'); assert.equal(r.actualRunId, 'r1')
+})
+
+test('编排：入口 run 取消——whenIdle reject（error 非空）仍 cancelled', () => {
+  const r = resolveTurnFinalOutcome({ entryRunId: 'r1', entryTaskId: 't1', liveRunId: null, liveTaskId: null, cancelledSet: new Set(['r1']), error: new Error('agent aborted'), text: null })
+  assert.equal(r.finalStatus, 'cancelled')
+})
+
+test('编排：回合内 task_begin 新建 run（liveRunId）取消——正常/reject 两条', () => {
+  for (const error of [null, new Error('aborted')]) {
+    const r = resolveTurnFinalOutcome({ entryRunId: null, entryTaskId: null, liveRunId: 'r2', liveTaskId: 't2', cancelledSet: new Set(['r2']), error, text: 'x' })
+    assert.equal(r.cancelled, true); assert.equal(r.finalStatus, 'cancelled'); assert.equal(r.actualRunId, 'r2'); assert.equal(r.actualTaskId, 't2')
+  }
+})
+
+test('编排：无意图普通异常=failed（chat 与 job 同判）', () => {
+  const r = resolveTurnFinalOutcome({ entryRunId: 'r1', entryTaskId: 't1', liveRunId: null, liveTaskId: null, cancelledSet: new Set(), error: new Error('boom'), text: 'x' })
+  assert.equal(r.finalStatus, 'failed'); assert.equal(r.cancelled, false)
+})
+
+test('编排：无 run 的普通回合=done/failed 不误标', () => {
+  assert.equal(resolveTurnFinalOutcome({ entryRunId: null, liveRunId: null, cancelledSet: new Set(), error: null, text: 'ok' }).finalStatus, 'done')
+  assert.equal(resolveTurnFinalOutcome({ entryRunId: null, liveRunId: null, cancelledSet: new Set(), error: 'e', text: null }).finalStatus, 'failed')
+})
