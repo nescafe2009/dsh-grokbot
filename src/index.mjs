@@ -1419,7 +1419,7 @@ export function apply(ctx, config = {}) {
       let failed = false
       let cancelled = false
       let outcome = null
-      const perfStart = Date.now()
+      const perfStart = Date.now() // 锁外取值：含排队等待
       try {
         let session = chatHandles.get(sessionKey)
         if (!session) {
@@ -1457,7 +1457,9 @@ export function apply(ctx, config = {}) {
         if (turnText && writeDm) {
           await appendDm(bot.id, { role: 'bot', text: turnText, activity: outcome.activity }).catch(() => undefined)
         }
-        logPerf({ kind: 'chat-turn', botId: bot.id, conversationId: conversationId || bot.id, taskId: taskId || null, ms: Date.now() - perfStart, toolCalls: (outcome?.activity ?? []).length, replyBytes: outcome?.text?.length ?? 0, error: outcome?.error ?? null })
+        const perfEnd = Date.now()
+        outcome.perf = { totalMs: perfEnd - perfStart, toolCalls: (outcome?.activity ?? []).length }
+        logPerf({ kind: 'chat-turn', botId: bot.id, conversationId: conversationId || bot.id, taskId: taskId || null, ms: perfEnd - perfStart, toolCalls: (outcome?.activity ?? []).length, replyBytes: outcome?.text?.length ?? 0, error: outcome?.error ?? null })
         return outcome
       } catch (error) {
         failed = true
@@ -2319,6 +2321,38 @@ export function apply(ctx, config = {}) {
         if (method === 'GET' && suffix === '/crew') {
           respond(res, 200, { crew: crewState.crew }); return
         }
+        // 效率配对：DSH 直连基线（裸 agents 会话，无插件编排层）
+        if (method === 'POST' && suffix === '/__perf/direct') {
+          const body = await readJsonBody(req)
+          const text = String(body?.text || '').trim()
+          if (!text) throw new HttpError(400, 'text 不能为空')
+          const t0 = Date.now()
+          const sessionId = randomUUID()
+          try {
+            const fallbackSel = typeof ctx.agentDefaultModel?.currentSelection === 'function' ? ctx.agentDefaultModel.currentSelection() : null
+            const sel = crewState.crew.defaultModel?.provider && crewState.crew.defaultModel?.model
+              ? crewState.crew.defaultModel
+              : (fallbackSel?.provider && fallbackSel?.model ? fallbackSel : null)
+            const handle = await ctx.agents.create({
+              sessionId,
+              meta: { cwd: join(stateDir, 'workspace') },
+              ...(sel ? { agentOptions: sel } : {}),
+              setup: () => { /* 不注册任何插件工具——纯 DSH */ },
+            })
+            await handle.agent.whenIdle()
+            const firstSeq = handle.agent.session.seq
+            handle.agent.followup(userMessage(text))
+            await handle.agent.whenIdle()
+            const ms = Date.now() - t0
+            try { handle.agent.cancel({ kind: 'user' }, { keepInbox: true }) } catch { /* best effort */ }
+            try { await handle.dispose() } catch { /* best effort */ }
+            logPerf({ kind: 'dsh-direct', conversationId: '__perf__', ms, toolCalls: 0 })
+            respond(res, 200, { ms, sessionId }); return
+          } catch (error) {
+            logPerf({ kind: 'dsh-direct-error', error: safeError(error) })
+            throw new HttpError(500, safeError(error))
+          }
+        }
         // 预览 POST 边界测试端点（R2-B）：无害副作用（计数器），验证沙箱产物被阻止调用
         if (method === 'POST' && suffix === '/__probe/echo') {
           probeEchoCount += 1
@@ -2673,7 +2707,9 @@ export function apply(ctx, config = {}) {
             if (String(body?.retryMode || '') === 'retry' && !requestId) {
               throw new HttpError(419, '查询模式（retryMode=retry）需要有效 requestId；缺失或非法 ID 不可降级为新执行')
             }
+            const apiPerfStart = Date.now()
             const handleChatTurn = async () => {
+              const r = await (async () => {
             if (conversation.memberBotIds.length === 1) {
               const memberBot = crewState.crew.bots.find((entry) => entry.id === conversation.memberBotIds[0])
               const setupReply = memberBot ? await trySetupTurn(memberBot, text) : null
@@ -2695,12 +2731,16 @@ export function apply(ctx, config = {}) {
               mentionTarget = eligibleBots(conversation).find((bot) => bot.id === wanted) ?? null
             }
             const result = await conversationTurn(conversation, text, { mentionTarget, taskId: bodyTaskId })
-            return {
-              responder: publicBot(result.responder),
-              reply: result.reply,
-              handoffTo: result.handoffTo,
-              messages: await readConversationMsgs(conversation),
-            }
+              return {
+                responder: publicBot(result.responder),
+                reply: result.reply,
+                handoffTo: result.handoffTo,
+                messages: await readConversationMsgs(conversation),
+                outcome: result.outcome,
+              }
+              })()
+              logPerf({ kind: 'api-chat', conversationId, apiMs: Date.now() - apiPerfStart, turnMs: r?.outcome?.perf?.totalMs ?? null, toolCalls: r?.outcome?.perf?.toolCalls ?? null, error: r?.outcome?.error ?? null })
+              return r
             }
             if (requestId) {
               // 去重：第一次副作用（用户消息落盘）前登记在途；并发同 ID 共享同一执行
