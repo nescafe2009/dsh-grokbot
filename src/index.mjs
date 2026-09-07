@@ -2583,28 +2583,6 @@ export function apply(ctx, config = {}) {
             // 请求去重：第一次副作用（含消息落盘）前登记在途；并发同 ID 共享执行结果
             const requestId = /^[a-zA-Z0-9_-]{6,64}$/.test(String(body?.requestId || '')) ? `${conversationId}:${body.requestId}` : null
             const bodyTaskId = /^[a-z0-9-]+$/i.test(String(body?.taskId || '')) ? String(body.taskId) : null
-            if (requestId) {
-              const payload = { text, taskId: bodyTaskId, mentions: Array.isArray(body?.mentions) ? body.mentions.map(String) : [] }
-              const dedup = chatRequestRegistry.begin(requestId, payload, async () => {
-                await appendConversationMsg(conversation, { role: 'user', text })
-                return await handleChatTurn()
-              })
-              if (dedup.error) {
-                throw new HttpError(dedup.error.status || 409, dedup.error.message)
-              }
-              if (dedup.deduped) {
-                // 命中缓存（成功/失败分级 TTL）或共享在途：结构一致返回
-                if (dedup.result) { respond(res, 200, { ...dedup.result, deduped: true }); return }
-                if (dedup.error) { respond(res, 502, { error: dedup.error, deduped: true }); return }
-                // 在途共享
-                const shared = await dedup.run()
-                if (shared.ok) { respond(res, 200, { ...shared.result, deduped: true }); return }
-                respond(res, 502, { error: shared.error, deduped: true }); return
-              }
-              const own = await dedup.run()
-              if (!own.ok) throw new HttpError(502, own.error)
-              respond(res, 200, { ...own.result }); return
-            }
             const handleChatTurn = async () => {
             if (conversation.memberBotIds.length === 1) {
               const memberBot = crewState.crew.bots.find((entry) => entry.id === conversation.memberBotIds[0])
