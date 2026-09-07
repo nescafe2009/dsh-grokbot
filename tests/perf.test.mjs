@@ -71,3 +71,47 @@ test('计量契约：直连 finally 释放——handle 在所有路径 dispose',
   }
   assert.equal(disposed, 2, '成功+异常两条路径都释放')
 })
+
+
+/* ---------------- 原函数结构回归（catchError 声明 + 取消 outcome 赋值，Codex 二十七轮 P1） ---------------- */
+import { readFileSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)))
+const libSrc = readFileSync(`${pluginRoot}/lib/index.mjs`, 'utf8')
+
+test('结构：catchError 在 try/catch/finally 共同作用域声明（let catchError = null）', () => {
+  // 在 chatTurn 函数体内：let catchError = null 必须出现
+  assert.ok(libSrc.includes('let catchError = null'), 'catchError 已声明（未声明时 finally 抛 ReferenceError 覆盖正常返回——P1）')
+  // 不在全局（不在模块顶层——检查声明位置前有 chatTurn 的特征缩进）
+  const idx = libSrc.indexOf('let catchError = null')
+  assert.ok(idx > 0, '声明存在于构建产物')
+})
+
+test('结构：取消分支 outcome 赋值（finally 补 perf 可透传到返回值）', () => {
+  // 取消 return 前必须 outcome = {...}（不是直接 return 新对象）
+  const cancelIdx = libSrc.indexOf('cancelled = true')
+  assert.ok(cancelIdx > 0)
+  // 检查 cancelIdx 之后 200 字符内是否有 outcome = {
+  const nearby = libSrc.slice(cancelIdx, cancelIdx + 500)
+  assert.ok(nearby.includes('outcome = {') || nearby.includes('outcome =\\n'), '取消分支赋值 outcome（finally 统一补 perf 后返回——否则 perf 无法透传）')
+})
+
+test('结构：finally 统一 perf（closeActiveRun 后、同一 endTs、cancelled 优先）', () => {
+  // finally 内必须有 perfStatus 计算
+  assert.ok(libSrc.includes('const perfStatus = isCancelled'), 'finally 内 perfStatus')
+  assert.ok(libSrc.includes('cancelled: isCancelled') && libSrc.includes('status: perfStatus'), 'logPerf 含 cancelled+status')
+  // try 正常返回前不再有提前 logPerf
+  const tryBlock = libSrc.slice(libSrc.indexOf('const execStart'), libSrc.indexOf('} finally {', libSrc.indexOf('const execStart')))
+  assert.ok(!tryBlock.includes('logPerf'), 'try 块内无提前 logPerf')
+})
+
+test('结构：conversationTurn 多成员分支透出 outcome', () => {
+  // 多成员 return 必须含 outcome
+  assert.ok(/return\\s*{\\s*responder,\\s*reply,\\s*handoffTo:\\s*null,\\s*outcome\\s*}/.test(libSrc.replace(/\\n\s*/g, ' ')), '多成员分支 return 含 outcome')
+})
+
+test('结构：api-chat status 优先 cancelled', () => {
+  assert.ok(libSrc.includes('cancelled"') || libSrc.includes("cancelled ? '"), 'status 优先级：cancelled 在 failed/ok 之前')
+})

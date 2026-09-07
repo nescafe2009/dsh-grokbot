@@ -1421,6 +1421,7 @@ export function apply(ctx, config = {}) {
       let failed = false
       let cancelled = false
       let outcome = null
+      let catchError = null
       const execStart = lockAcquiredTs
       try {
         let session = chatHandles.get(sessionKey)
@@ -1467,7 +1468,9 @@ export function apply(ctx, config = {}) {
         const cancelIntentErr = (runRef?.id ?? liveCtxNow?.runId) ? cancelledRunIds.has(runRef?.id ?? liveCtxNow.runId) : false
         if (cancelIntentErr) {
           cancelled = true
-          return { text: outcome?.text?.trim() || '', activity: [], error: null, cancelled: true }
+          // 构造取消结果对象并赋给 outcome——finally 统一补 perf 后由外层 return
+          outcome = { text: outcome?.text?.trim() || '', activity: [], error: null, cancelled: true }
+          return outcome
         }
         catchError = error
         throw error
