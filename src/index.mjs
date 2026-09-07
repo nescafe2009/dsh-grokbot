@@ -1459,8 +1459,6 @@ export function apply(ctx, config = {}) {
         if (turnText && writeDm) {
           await appendDm(bot.id, { role: 'bot', text: turnText, activity: outcome.activity }).catch(() => undefined)
         }
-        outcome.perf = { totalMs: Date.now() - submitTs, executionMs: Date.now() - execStart, queueMs: execStart - submitTs, toolCalls: (outcome?.activity ?? []).length }
-        logPerf({ kind: 'chat-turn', botId: bot.id, conversationId: conversationId || bot.id, taskId: taskId || null, ms: Date.now() - submitTs, executionMs: Date.now() - execStart, queueMs: execStart - submitTs, toolCalls: (outcome?.activity ?? []).length, replyBytes: outcome?.text?.length ?? 0, error: outcome?.error ?? null })
         return outcome
       } catch (error) {
         failed = true
@@ -1469,10 +1467,9 @@ export function apply(ctx, config = {}) {
         const cancelIntentErr = (runRef?.id ?? liveCtxNow?.runId) ? cancelledRunIds.has(runRef?.id ?? liveCtxNow.runId) : false
         if (cancelIntentErr) {
           cancelled = true
-          logPerf({ kind: 'chat-turn', botId: bot.id, conversationId: conversationId || bot.id, taskId: taskId || null, ms: Date.now() - submitTs, executionMs: Date.now() - execStart, queueMs: execStart - submitTs, toolCalls: 0, replyBytes: outcome?.text?.length ?? 0, error: 'cancelled', cancelled: true })
           return { text: outcome?.text?.trim() || '', activity: [], error: null, cancelled: true }
         }
-        logPerf({ kind: 'chat-turn', botId: bot.id, conversationId: conversationId || bot.id, taskId: taskId || null, ms: Date.now() - submitTs, executionMs: Date.now() - execStart, queueMs: execStart - submitTs, toolCalls: (outcome?.activity ?? []).length, replyBytes: outcome?.text?.length ?? 0, error: safeError(error) })
+        catchError = error
         throw error
       } finally {
         state.status = prevStatus === 'working' ? 'idle' : prevStatus
@@ -1491,6 +1488,13 @@ export function apply(ctx, config = {}) {
         })
         const finalSt = (await closeActiveRun(convKey, resolved2.actualTaskId ?? taskId, resolved2.actualRunId ?? runRef?.id ?? null, resolved2.finalStatus)).status
         if (finalSt === 'cancelled' && outcome && !outcome.cancelled) outcome.cancelled = true
+        // 统一性能记录：最终状态明确后（closeActiveRun 后）、同一结束时间戳；cancelled 优先
+        const endTs = Date.now()
+        const isCancelled = finalSt === 'cancelled' || cancelled
+        const perfStatus = isCancelled ? 'cancelled' : (catchError || outcome?.error ? 'failed' : (outcome?.text?.trim() ? 'ok' : 'empty'))
+        const perf = { totalMs: endTs - submitTs, executionMs: endTs - execStart, queueMs: execStart - submitTs, toolCalls: (outcome?.activity ?? []).length, status: perfStatus }
+        if (outcome) outcome.perf = perf
+        logPerf({ kind: 'chat-turn', botId: bot.id, conversationId: conversationId || bot.id, taskId: taskId || null, ms: perf.totalMs, executionMs: perf.executionMs, queueMs: perf.queueMs, toolCalls: perf.toolCalls, replyBytes: outcome?.text?.length ?? 0, error: catchError ? safeError(catchError) : (outcome?.error ?? null), cancelled: isCancelled, status: perfStatus })
         if (finalSt === 'cancelled' && writeDm) {
           await appendDm(bot.id, { role: 'system', text: '✕ 已取消：本次执行已停止，未计入完成' }).catch(() => undefined)
         }
@@ -1588,7 +1592,7 @@ export function apply(ctx, config = {}) {
       }
     }
     await appendRoomMsg(conversation.id, { role: 'bot', botId: responder.id, text: reply })
-    return { responder, reply, handoffTo: null }
+    return { responder, reply, handoffTo: null, outcome }
   }
 
   // ---------- 幕僚长协调：成员交付回流群后自动唤醒 ----------
@@ -2754,7 +2758,7 @@ export function apply(ctx, config = {}) {
                 outcome: result.outcome,
               }
               })()
-              logPerf({ kind: 'api-chat', conversationId, apiMs: Date.now() - apiPerfStart, turnMs: r?.outcome?.perf?.totalMs ?? null, executionMs: r?.outcome?.perf?.executionMs ?? null, queueMs: r?.outcome?.perf?.queueMs ?? null, toolCalls: r?.outcome?.perf?.toolCalls ?? null, error: r?.outcome?.error ?? null, cancelled: r?.outcome?.cancelled ?? false, status: r?.outcome?.error ? 'failed' : (r?.reply ? 'ok' : 'empty') })
+              logPerf({ kind: 'api-chat', conversationId, apiMs: Date.now() - apiPerfStart, turnMs: r?.outcome?.perf?.totalMs ?? null, executionMs: r?.outcome?.perf?.executionMs ?? null, queueMs: r?.outcome?.perf?.queueMs ?? null, toolCalls: r?.outcome?.perf?.toolCalls ?? null, error: r?.outcome?.error ?? null, cancelled: r?.outcome?.cancelled ?? false, status: r?.outcome?.cancelled ? 'cancelled' : (r?.outcome?.error ? 'failed' : (r?.reply ? 'ok' : 'empty')) })
               return r
             }
             if (requestId) {
