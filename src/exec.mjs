@@ -13,7 +13,10 @@ const wsLocks = new Map()
 function chain(map, key, fn) {
   const prev = map.get(key) ?? Promise.resolve()
   const next = prev.then(fn, fn)
-  map.set(key, next.catch(() => undefined))
+  const tail = next.catch(() => undefined)
+  map.set(key, tail)
+  // 回收：链尾 settle 后若仍是当前尾（无新排队者）则清条目，防 Map 无限增长
+  void tail.then(() => { if (map.get(key) === tail) map.delete(key) })
   return next
 }
 

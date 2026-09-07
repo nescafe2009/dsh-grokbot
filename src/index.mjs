@@ -104,6 +104,8 @@ export function apply(ctx, config = {}) {
   const botStates = new Map()
   const chatHandles = new Map()
   const chatSessionIds = new Map()
+  // 请求去重缓存：requestId → { at, result }（窗口 5 分钟；重启即清）
+  const chatRequestCache = new Map()
   const pendingJobs = []
   // R2-B：调度占位——pump 已提交但尚未 claim 的 job（含等待 task/bot/workspace 锁者）。
   // 状态三处可见：/state.queued、/queue/:id/cancel、锁内执行前取消检查。
@@ -1011,6 +1013,30 @@ export function apply(ctx, config = {}) {
     await mkdir(join(stateDir, 'memory'), { recursive: true })
     await mkdir(skillsDir, { recursive: true })
     await mkdir(roomsDir, { recursive: true })
+    // R2-B 重启恢复：上次运行中断的 claimed job 标记失败（不盲重派）；
+    // 其关联 running run 由 endRun 标 interrupted
+    try {
+      const { readdirSync } = await import('node:fs')
+      for (const jobDir of readdirSync(inboxRoot)) {
+        const statusPath = join(inboxRoot, jobDir, 'status.json')
+        let st = null
+        try { st = JSON.parse(await readFile(statusPath, 'utf8')) } catch { continue }
+        if (st?.status !== 'claimed') continue
+        const jobId = String(st.jobId || jobDir)
+        await writeFile(statusPath, JSON.stringify({ ...st, status: 'failed', endedAt: Date.now(), reason: '宿主重启：执行中断（不自动重派）' }, null, 1))
+        recordRecent({ jobId, botId: String(st.botId || ''), status: 'failed', error: 'interrupted-by-restart', endedAt: Date.now() })
+        ctx.logger?.warn?.(`grokbot job ${jobId} marked interrupted by restart`)
+      }
+      // running run → interrupted
+      for (const t of await listTasks(stateDir, {})) {
+        let dirty = false
+        for (const r of t.runs ?? []) {
+          if (r.status === 'running') { r.status = 'interrupted'; r.endedAt = Date.now(); dirty = true }
+        }
+        if (dirty) await writeFile(join(stateDir, 'tasks', `${t.id}.json`), JSON.stringify(t, null, 1))
+      }
+    } catch (error) { ctx.logger?.warn?.(`grokbot restart sweep error: ${safeError(error)}`) }
+
     const loaded = await loadOrCreateCrew(stateDir)
     crewState.path = loaded.path
     crewState.crew = loaded.crew
@@ -2509,6 +2535,14 @@ export function apply(ctx, config = {}) {
             const body = await readJsonBody(req)
             const text = String(body?.text || '').trim()
             if (!text) throw new HttpError(400, 'text 不能为空')
+            // 请求去重：同 requestId 短窗内重发返回上次结果（不重复执行/副作用）
+            const requestId = /^[a-zA-Z0-9_-]{6,64}$/.test(String(body?.requestId || '')) ? `${conversationId}:${body.requestId}` : null
+            if (requestId) {
+              const cached = chatRequestCache.get(requestId)
+              if (cached && Date.now() - cached.at < 5 * 60_000) {
+                respond(res, 200, { ...cached.result, deduped: true }); return
+              }
+            }
             const bodyTaskId = /^[a-z0-9-]+$/i.test(String(body?.taskId || '')) ? String(body.taskId) : null
             await appendConversationMsg(conversation, { role: 'user', text })
             if (conversation.memberBotIds.length === 1) {
@@ -2532,6 +2566,7 @@ export function apply(ctx, config = {}) {
               mentionTarget = eligibleBots(conversation).find((bot) => bot.id === wanted) ?? null
             }
             const result = await conversationTurn(conversation, text, { mentionTarget, taskId: bodyTaskId })
+            if (requestId) chatRequestCache.set(requestId, { at: Date.now(), result: { responder: publicBot(result.responder), reply: result.reply } })
             respond(res, 200, {
               responder: publicBot(result.responder),
               reply: result.reply,
