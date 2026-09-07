@@ -1470,8 +1470,17 @@ export function apply(ctx, config = {}) {
         state.currentJob = prevJob ?? null
         state.currentRunId = null
         state.currentTaskId = null
-        const cancelIntent2 = runRef ? cancelledRunIds.has(runRef.id) : false
-        const finalSt = (await closeActiveRun(convKey, taskId, runRef?.id ?? null, cancelIntent2 ? 'cancelled' : (failed ? 'failed' : 'done'))).status
+        const liveCtx2 = activeTurnCtx.get(convKey)
+        const resolved2 = resolveTurnFinalOutcome({
+          entryRunId: runRef?.id ?? null,
+          entryTaskId: taskId,
+          liveRunId: liveCtx2?.runId ?? null,
+          liveTaskId: liveCtx2?.taskId ?? null,
+          cancelledSet: cancelledRunIds,
+          error: outcome?.error,
+          text: outcome?.text,
+        })
+        const finalSt = (await closeActiveRun(convKey, resolved2.actualTaskId ?? taskId, resolved2.actualRunId ?? runRef?.id ?? null, resolved2.finalStatus)).status
         if (finalSt === 'cancelled' && outcome && !outcome.cancelled) outcome.cancelled = true
         if (finalSt === 'cancelled' && writeDm) {
           await appendDm(bot.id, { role: 'system', text: '✕ 已取消：本次执行已停止，未计入完成' }).catch(() => undefined)
@@ -1684,6 +1693,8 @@ export function apply(ctx, config = {}) {
   async function runInboxJob(job) {
     const bot = routeJob(crewState.crew, job)
     const convKey4Job = `${job.conversationId || bot.id}:${bot.id}`
+    // 占位生命周期：本函数任何出口（前置校验失败/锁内拒绝/执行/取消）都释放 waiting 占位
+    const releaseWaiting = () => { waitingJobs.delete(job.jobId) }
     // （前置快速校验见下；锁内复查在 runExclusively 内）
     const hoPre = job.handoff || null
     const jobTaskIdPre = hoPre?.taskId || job.taskId || null
@@ -1691,11 +1702,13 @@ export function apply(ctx, config = {}) {
     if (job.conversationId) {
       const convNow = (crewState.crew.conversations ?? []).find((c) => c.id === job.conversationId)
       if (!convNow) {
+        releaseWaiting()
         await failJob(job, bot.id, `会话 ${job.conversationId} 已不存在，任务取消（不降级投递）`).catch(() => undefined)
         recordRecent({ jobId: job.jobId, botId: bot.id, status: 'failed', error: 'conversation-gone', endedAt: Date.now() })
         return
       }
       if (!convNow.memberBotIds.includes(bot.id)) {
+        releaseWaiting()
         await failJob(job, bot.id, `${bot.name} 已被移出会话 ${job.conversationId}，任务取消`).catch(() => undefined)
         recordRecent({ jobId: job.jobId, botId: bot.id, status: 'failed', error: 'member-removed', endedAt: Date.now() })
         return
@@ -1708,6 +1721,7 @@ export function apply(ctx, config = {}) {
         getTask: (id) => getTask(stateDir, id),
       })
       if (!chk.ok) {
+        releaseWaiting()
         await failJob(job, bot.id, `任务校验失败：${chk.error}`).catch(() => undefined)
         recordRecent({ jobId: job.jobId, botId: bot.id, status: 'failed', error: 'task-scope', endedAt: Date.now() })
         return
@@ -1777,7 +1791,8 @@ export function apply(ctx, config = {}) {
       recordRecent({ jobId: job.jobId, botId: bot.id, status: 'cancelled', endedAt: Date.now() })
       return
     }
-    waitingJobs.delete(job.jobId)
+    // 领取互斥：占位保留到 claim 完成登记 running 之后（期间取消可见可标记）；
+    // claim 成功后再查一次取消标记（标记早于/伴随领取发生 → 不启动模型）
     const state = botState(bot.id)
     state.status = 'working'
     state.currentJob = job.jobId
@@ -1786,6 +1801,20 @@ export function apply(ctx, config = {}) {
     let session = null
     try {
       await claimJob(job, bot.id)
+      const waitingAtClaim = waitingJobs.get(job.jobId)
+      waitingJobs.delete(job.jobId)
+      if (waitingAtClaim?.cancelRequested) {
+        // 领取窗口内取消已确认：不建 run/不调模型，落定取消
+        await cancelJob(job, bot.id, '用户取消（领取窗口）').catch(() => undefined)
+        if (job.conversationId) {
+          await appendRoomMsg(job.conversationId, { role: 'system', text: `✕ 已取消：${String(job.text || '').slice(0, 36)}（未执行）` }).catch(() => undefined)
+        }
+        recordRecent({ jobId: job.jobId, botId: bot.id, status: 'cancelled', endedAt: Date.now() })
+        state.status = 'idle'
+        state.currentJob = null
+        pump()
+        return
+      }
       // 保存取消句柄：stop 接口可中止后台任务（#1-5）
       runningJobs.set(job.jobId, { botId: bot.id, startedAt: Date.now(), get abort() { return session?.abort } })
       // 上下文随 session 闭包绑定（P1-1）：inbox 任务派发的子任务回流 job.conversationId
@@ -1854,13 +1883,19 @@ export function apply(ctx, config = {}) {
       } finally {
         if (timeout) clearTimeout(timeout)
         if (heartbeat) clearInterval(heartbeat)
-        // 统一分类（abort 抛异常/正常返回都走这里）：意图优先，不靠 error 文本
-        const cls = classifyExecutionOutcome({
-          cancelledIntent: hoRunId ? cancelledRunIds.has(hoRunId) : false,
+        // 统一收尾（生产路径调用经测试的 resolveTurnFinalOutcome）：实际 run=入口 ho ?? 回合内 task_begin 新建
+        const liveRunId = activeTurnCtx.get(convKey4Job)?.runId ?? null
+        const liveTaskId = activeTurnCtx.get(convKey4Job)?.taskId ?? null
+        const resolved = resolveTurnFinalOutcome({
+          entryRunId: hoRunId,
+          entryTaskId: jobTaskId,
+          liveRunId,
+          liveTaskId,
+          cancelledSet: cancelledRunIds,
           error: outcome?.error ?? execError,
           text: outcome?.text,
         })
-        const closed = await closeActiveRun(convKey4Job, jobTaskId, hoRunId, cls.status)
+        const closed = await closeActiveRun(convKey4Job, resolved.actualTaskId ?? jobTaskId, resolved.actualRunId ?? hoRunId, resolved.finalStatus)
         runFinalStatus = closed.status
         cancelledRunNotifyRunId = closed.runId
       }
@@ -1927,6 +1962,7 @@ export function apply(ctx, config = {}) {
       ctx.logger?.warn?.(`grokbot job ${job.jobId} error: ${reason}`)
     } finally {
       void session?.dispose()
+      waitingJobs.delete(job.jobId)
       runningJobs.delete(job.jobId)
       state.status = 'idle'
       state.currentJob = null
@@ -1942,8 +1978,13 @@ export function apply(ctx, config = {}) {
 
   function pump() {
     if (disposed) return
-    while (runningJobs.size < maxConcurrentJobs && pendingJobs.length > 0) {
-      const busy = new Set([...runningJobs.values()].map((entry) => entry.botId))
+    // 调度容量/忙闲计入占位：已派出未终态（waiting 等 bot/ws 锁 + claiming 领取中）与 running 同占容量；
+    // 同一 bot 只允许一个在途（排队按队列序，不一次性提交）
+    while (runningJobs.size + waitingJobs.size < maxConcurrentJobs && pendingJobs.length > 0) {
+      const busy = new Set([
+        ...[...runningJobs.values()].map((entry) => entry.botId),
+        ...[...waitingJobs.values()].map((w) => w.job.toBot),
+      ])
       const index = pendingJobs.findIndex((job) => {
         const bot = routeJob(crewState.crew, job)
         return !busy.has(bot.id)
