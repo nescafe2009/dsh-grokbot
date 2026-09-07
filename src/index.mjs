@@ -1633,6 +1633,16 @@ export function apply(ctx, config = {}) {
       if (!busyProbes.has(conversationId)) {
         busyProbes.set(conversationId, setInterval(() => {
           const st = botState('chief')
+          // 双重闸门：chief 空闲 且 该会话仍有未消费事件（pending 或 inTransit 在途领取）才触发；
+          // 事件已被消费/会话已删除 → 清探针退出，不空转
+          const wakeSt = chiefWake.state.get(conversationId)
+          const hasEvent = Boolean(wakeSt && (wakeSt.pending || wakeSt.inTransit))
+          const convGone = !crewState.crew.conversations?.some((c) => c.id === conversationId)
+          if (convGone || (!hasEvent)) {
+            clearInterval(busyProbes.get(conversationId))
+            busyProbes.delete(conversationId)
+            return
+          }
           if (st.status !== 'working') {
             clearInterval(busyProbes.get(conversationId))
             busyProbes.delete(conversationId)
@@ -1658,6 +1668,9 @@ export function apply(ctx, config = {}) {
     if (!digest) return
     logWake({ kind: 'consume', conversationId, digestLines: digest.split('\n').length })
     chiefWake.ack(conversationId) // 消费确认：清除 pending/inTransit（真正开始处理）
+    // 领取一次性状态转换：撤销本会话残留的释放探针（事件已被消费，不得再触发）
+    const staleProbe = busyProbes.get(conversationId)
+    if (staleProbe) { clearInterval(staleProbe); busyProbes.delete(conversationId) }
     state.status = 'working'
     try {
       const outcome = await chatTurn(chief, [
@@ -2826,6 +2839,8 @@ export function apply(ctx, config = {}) {
 
   ctx.effect(() => () => {
     disposed = true
+    for (const probe of busyProbes.values()) clearInterval(probe)
+    busyProbes.clear()
     clearInterval(rescanTimer)
     clearInterval(routineTimer)
     clearInterval(servicesTimer)

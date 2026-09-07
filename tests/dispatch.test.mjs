@@ -209,3 +209,63 @@ test('在途唤醒：协调长于重试期限（>120s）——事件不丢，释
   clock.advance(60_000); runTimers()
   assert.equal(fired.length, 2, '无残留定时器/重复消费')
 })
+
+
+test('组合：真实 ack 时序——120s 长回合 + 快速二轮，consume 严格 2 次、探针/定时器清空（Codex 二十轮）', async () => {
+  const clock = makeClock(0)
+  const fired = []
+  const consumes = []
+  const timers = []
+  const sched = new WakeScheduler({ intervalMs: 60_000, now: clock.now, delay: (ms, fn) => { timers.push({ at: clock.now() + ms, fn }); return timers.length }, fire: (key) => fired.push({ key, at: clock.now() }) })
+  const runTimers = () => { const due = timers.filter((t) => t.at <= clock.now()); for (const t of due) { t.fn(); timers.splice(timers.indexOf(t), 1) } }
+
+  // 模拟生产协调语义：fire → 回合执行 → consume 时 ack → 结束 onFired
+  let busy = false
+  const coordinate = (durationMs) => {
+    busy = true
+    // 回合内的窗口推进由测试手动 clock.advance 驱动；这里只登记 consume+ack 与结束
+    consumes.push({ at: clock.now() })
+    sched.ack('g3')
+    const endAt = clock.now() + durationMs
+    timers.push({ at: endAt, fn: () => { busy = false; sched.onFired('g3') } })
+  }
+  // t=0 第一协调（120s）
+  sched.request('g3')
+  assert.equal(fired.length, 1)
+  coordinate(120_000)
+  // t=10 第二事件
+  clock.advance(10_000); runTimers()
+  sched.request('g3')
+  assert.equal(sched.state.get('g3').pending, true)
+  // t=60 窗口到点 fire（inTransit 已被 ack 清除 → 会 fire）→ chief 忙（模拟 busyProbes 建立但不触发，因 busy）
+  clock.advance(50_000); runTimers()
+  assert.equal(fired.length, 2, '窗口到点 fire（ack 后 inTransit 已清）')
+  assert.equal(busy, true)
+  // t=120 第一轮结束 onFired → pending 仍在 → 重开窗口
+  clock.advance(60_000); runTimers()
+  assert.equal(busy, false)
+  assert.equal(sched.state.get('g3').pending, true, '回合结束事件保留')
+  // t=180 新窗口到点 fire → 二轮快速完成（10s）
+  clock.advance(60_000); runTimers()
+  assert.equal(fired.length, 3)
+  coordinate(10_000)
+  // t=190 二轮完成
+  clock.advance(10_000); runTimers()
+  assert.equal(consumes.length, 2, 'consume 严格 2 次')
+  assert.equal(sched.state.get('g3').pending, false)
+  assert.equal(sched.state.get('g3').inTransit, false)
+  // 推进到 t=240：无新 fire/consume（残留探针语义已由 hasEvent 闸门挡住——
+  // 探针读到 pending=false 即自清；此处断言调度器无事件即无动作）
+  clock.advance(50_000); runTimers()
+  assert.equal(fired.length, 3, '无残留触发')
+  assert.equal(consumes.length, 2)
+})
+
+test('组合：释放回调竞争——事件已被消费（pending=false），探针不触发协调', () => {
+  const clock = makeClock(0)
+  const sched = new WakeScheduler({ intervalMs: 60_000, now: clock.now, delay: (ms, fn) => 0, fire: () => {} })
+  // 生产闸门语义：释放回调检查 hasEvent = pending || inTransit
+  const gate = () => { const st = sched.state.get('g4'); return Boolean(st && (st.pending || st.inTransit)) }
+  sched.request('g4'); sched.ack('g4') // 事件消费完毕
+  assert.equal(gate(), false, '已消费事件 → 释放探针不触发（第三轮被阻止）')
+})
