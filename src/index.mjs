@@ -1397,8 +1397,9 @@ export function apply(ctx, config = {}) {
     const wsKey = taskWs && taskWs !== defaultWs ? `|ws:${taskWs}` : ''
     const sessionKey = `${convKey}${wsKey}`
     // 统一执行入口：任务锁 → bot 锁 → workspace 写队列（与 runInboxJob 同序）
-    const defaultWs4Turn = botWorkspace(stateDir, bot)
-    return runExclusively({ taskId, botId: bot.id, workspace: taskWs || defaultWs4Turn }, async () => {
+    const defaultWs4Turn = await realpath(botWorkspace(stateDir, bot)).catch(() => botWorkspace(stateDir, bot))
+    const lockWs4Turn = taskWs ? (await realpath(taskWs).catch(() => taskWs)) : defaultWs4Turn
+    return runExclusively({ taskId, botId: bot.id, workspace: lockWs4Turn }, async () => {
       let runRef = null
       if (taskId && existingRunId) {
         runRef = { id: existingRunId } // handoff 已建 run，本回合复用
@@ -1731,7 +1732,8 @@ export function apply(ctx, config = {}) {
     // 统一执行锁：任务 → bot → workspace；锁内重读校验（排队期间成员/会话/任务可能变化）
     // workspace 在参数求值前取好（避免 getTask 异步读文件造成锁获取顺序反转）
     const execTaskWs = jobTaskIdPre ? (await getTask(stateDir, jobTaskIdPre).catch(() => null))?.workspace || null : null
-    const execWs = execTaskWs || botWorkspace(stateDir, bot)
+    const rawWs = execTaskWs || botWorkspace(stateDir, bot)
+    const execWs = await realpath(rawWs).catch(() => rawWs)
     await runExclusively(
       { taskId: jobTaskIdPre, botId: bot.id, workspace: execWs },
       async () => {
