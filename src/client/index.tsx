@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { AvatarView, MarkdownView, splitChips, SidebarRow, MessageView, Composer, TaskCard } from './components'
 import { GKF_CSS } from './tokens'
-import { getPendingRetry, setPendingRetry, clearPendingRetry, retryMatches } from './retry-store'
+import { getPendingRetry, setPendingRetry, clearPendingRetry, retryMatches, withinGuarantee } from './retry-store'
 
 const API_ROOT = '/api/plugins/grokbot'
 const POLL_MS = 2000
@@ -1035,7 +1035,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
   const [editing, setEditing] = useState(false)
   const [detailsOpen, setDetailsOpen] = useState(false)
   // 失败/结果未知时的逻辑请求（按会话隔离存储；重试仅作用于原会话）
-  const [retryRequest, setRetryRequest] = useState<{ conversationId: string; requestId: string; text: string; taskId: string | null } | null>(null)
+  const [retryRequest, setRetryRequest] = useState<{ conversationId: string; requestId: string; text: string; taskId: string | null; createdAt: number } | null>(null)
   useEffect(() => {
     // 切换会话（同类视图复用 state）：从会话存储恢复本会话记录，其他会话的记录不串
     setRetryRequest(getPendingRetry(bot.id))
@@ -1088,10 +1088,10 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
     await api(`/bots/${encodeURIComponent(bot.id)}/stop`, { method: 'POST' }).catch(() => undefined)
   }, [bot.id])
 
-  const send = useCallback(async (overrideText?: string, overrideRequest?: { conversationId: string; requestId: string; text: string; taskId: string | null }): Promise<void> => {
+  const send = useCallback(async (overrideText?: string, overrideRequest?: { conversationId: string; requestId: string; text: string; taskId: string | null; createdAt?: number }): Promise<void> => {
     const isRetry = Boolean(overrideRequest)
     // 重试仅作用于原会话（当前视图会话不一致时拒绝——URL 永远取当前会话，防打错目标）
-    if (isRetry && !retryMatches(overrideRequest!, bot.id)) return
+    if (isRetry && !retryMatches({ ...overrideRequest!, createdAt: overrideRequest!.createdAt ?? 0 }, bot.id)) return
     const text = (isRetry ? overrideRequest!.text : (overrideText ?? draft)).trim()
     if (!text || sending) return
     const requestId = isRetry ? overrideRequest!.requestId : `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
@@ -1130,7 +1130,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
         at: Date.now(),
       })
       // 失败/结果未知：按会话保留逻辑请求（重试复用原 ID；服务端已执行的场景由去重缓存返回原结果）
-      const pending = { conversationId: bot.id, requestId, text, taskId: taskForSend }
+      const pending = { conversationId: bot.id, requestId, text, taskId: taskForSend, createdAt: Date.now() }
       setPendingRetry(pending); setRetryRequest(pending)
     } finally {
       setSending(false)
@@ -1292,8 +1292,19 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
       {retryRequest
         ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 22px 0' }}>
-            <span style={{ fontSize: 12, color: 'rgba(176,48,48,.9)' }}>上次发送结果未知（服务端可能已执行）</span>
-            <button type="button" style={{ border: '1px solid rgba(176,48,48,.4)', background: 'rgba(176,48,48,.06)', color: 'rgba(176,48,48,.9)', borderRadius: 99, padding: '3px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }} disabled={sending} onClick={() => void send(undefined, retryRequest)}>重试本次</button>
+            {withinGuarantee(retryRequest)
+              ? (
+                <>
+                  <span style={{ fontSize: 12, color: 'rgba(176,48,48,.9)' }}>上次发送结果未知（服务端可能已执行）</span>
+                  <button type="button" style={{ border: '1px solid rgba(176,48,48,.4)', background: 'rgba(176,48,48,.06)', color: 'rgba(176,48,48,.9)', borderRadius: 99, padding: '3px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }} disabled={sending} onClick={() => void send(undefined, retryRequest)}>重试本次（安全）</button>
+                </>
+              )
+              : (
+                <>
+                  <span style={{ fontSize: 12, color: 'rgba(176,48,48,.9)' }}>上次发送结果未知且已超去重保留期——重发将作为<b>新执行</b>（可能重复）</span>
+                  <button type="button" style={{ border: '1px solid rgba(176,48,48,.4)', background: 'rgba(176,48,48,.06)', color: 'rgba(176,48,48,.9)', borderRadius: 99, padding: '3px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }} disabled={sending} onClick={() => { if (window.confirm('已超保留期：重发将作为新执行，原执行可能已发生。确认？')) void send(retryRequest.text) }}>重新执行</button>
+                </>
+              )}
             <button type="button" style={{ border: 'none', background: 'none', cursor: 'pointer', color: 'rgba(29,29,31,.4)', fontSize: 12 }} onClick={() => { setRetryRequest(null); clearPendingRetry(bot.id) }}>放弃</button>
           </div>
         )
@@ -1332,7 +1343,7 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[];
   const [draftTask, setDraftTask] = useState<{ taskId: string; name: string } | null>(null)
   const [sending, setSending] = useState(false)
   const [cancellingRuns, setCancellingRuns] = useState<Map<string, string>>(new Map())
-  const [retryRequest, setRetryRequest] = useState<{ conversationId: string; requestId: string; text: string; taskId: string | null } | null>(null)
+  const [retryRequest, setRetryRequest] = useState<{ conversationId: string; requestId: string; text: string; taskId: string | null; createdAt: number } | null>(null)
   useEffect(() => {
     setRetryRequest(getPendingRetry(room.id))
   }, [room.id])
@@ -1371,9 +1382,9 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[];
 
   const botOf = (botId?: string): BotInfo | undefined => bots.find((bot) => bot.id === botId)
 
-  const send = useCallback(async (overrideRequest?: { conversationId: string; requestId: string; text: string; taskId: string | null }): Promise<void> => {
+  const send = useCallback(async (overrideRequest?: { conversationId: string; requestId: string; text: string; taskId: string | null; createdAt?: number }): Promise<void> => {
     const isRetry = Boolean(overrideRequest)
-    if (isRetry && !retryMatches(overrideRequest!, room.id)) return
+    if (isRetry && !retryMatches({ ...overrideRequest!, createdAt: overrideRequest!.createdAt ?? 0 }, room.id)) return
     const text = (isRetry ? overrideRequest!.text : draft).trim()
     if (!text || sending) return
     const requestId = isRetry ? overrideRequest!.requestId : `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
@@ -1390,7 +1401,7 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[];
       setDraftTask(null)
     } catch (error) {
       setMessages((prev) => [...prev, { ts: Date.now(), role: 'system', text: `发送失败：${String((error as Error)?.message ?? error)}（可重试本次，复用原请求）` }])
-      const pending = { conversationId: room.id, requestId, text, taskId: taskForSend }
+      const pending = { conversationId: room.id, requestId, text, taskId: taskForSend, createdAt: Date.now() }
       setPendingRetry(pending); setRetryRequest(pending)
     } finally {
       setSending(false)
@@ -1487,8 +1498,19 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[];
       {retryRequest
         ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 22px 0' }}>
-            <span style={{ fontSize: 12, color: 'rgba(176,48,48,.9)' }}>上次发送结果未知（服务端可能已执行）</span>
-            <button type="button" style={{ border: '1px solid rgba(176,48,48,.4)', background: 'rgba(176,48,48,.06)', color: 'rgba(176,48,48,.9)', borderRadius: 99, padding: '3px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }} disabled={sending} onClick={() => void send(retryRequest)}>重试本次</button>
+            {withinGuarantee(retryRequest)
+              ? (
+                <>
+                  <span style={{ fontSize: 12, color: 'rgba(176,48,48,.9)' }}>上次发送结果未知（服务端可能已执行）</span>
+                  <button type="button" style={{ border: '1px solid rgba(176,48,48,.4)', background: 'rgba(176,48,48,.06)', color: 'rgba(176,48,48,.9)', borderRadius: 99, padding: '3px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }} disabled={sending} onClick={() => void send(retryRequest)}>重试本次（安全）</button>
+                </>
+              )
+              : (
+                <>
+                  <span style={{ fontSize: 12, color: 'rgba(176,48,48,.9)' }}>已超去重保留期——重发将作为<b>新执行</b>（可能重复）</span>
+                  <button type="button" style={{ border: '1px solid rgba(176,48,48,.4)', background: 'rgba(176,48,48,.06)', color: 'rgba(176,48,48,.9)', borderRadius: 99, padding: '3px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }} disabled={sending} onClick={() => { if (window.confirm('已超保留期：重发将作为新执行，原执行可能已发生。确认？')) void send({ conversationId: room.id, requestId: `ui-${Date.now().toString(36)}-re`, text: retryRequest.text, taskId: retryRequest.taskId }) }}>重新执行</button>
+                </>
+              )}
             <button type="button" style={{ border: 'none', background: 'none', cursor: 'pointer', color: 'rgba(29,29,31,.4)', fontSize: 12 }} onClick={() => { setRetryRequest(null); clearPendingRetry(room.id) }}>放弃</button>
           </div>
         )
