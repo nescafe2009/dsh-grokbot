@@ -73,8 +73,9 @@ export class WakeScheduler {
       if (!cur) return
       cur.timer = undefined
       cur.lastFiredAt = this.now()
-      if (cur.pending) {
-        cur.pending = false
+      if (cur.pending && !cur.inTransit) {
+        // 不清 pending：fire 后若消费方忙，事件保留；消费方真正开始处理时调 ack 确认
+        cur.inTransit = true
         this.fire(key)
       }
     })
@@ -90,6 +91,7 @@ export class WakeScheduler {
     }
     st.pending = false
     st.lastFiredAt = this.now() // fire 即标记：回合进行中的后续 request 进入 pending 合并
+    st.inTransit = true
     this.fire(key)
     return 'fired'
   }
@@ -97,7 +99,17 @@ export class WakeScheduler {
   onFired(key) {
     const st = this.state.get(key)
     if (!st) return
-    st.lastFiredAt = this.now()
+    st.inTransit = false
+    // pending 仍在（忙期间的新事件）→ 重开窗口到点再 fire，直到被真正消费（ack）——不丢
     this._armPending(key)
+  }
+
+  /** 消费方确认：真正开始处理时调用（清除 pending/inTransit） */
+  ack(key) {
+    const st = this.state.get(key)
+    if (!st) return
+    st.pending = false
+    st.inTransit = false
+    st.lastFiredAt = this.now()
   }
 }

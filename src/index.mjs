@@ -1601,6 +1601,8 @@ export function apply(ctx, config = {}) {
 
   // 在途唤醒可观测性：记录 触发→在途(deferred/合并)→消费(fire)→结果 全链（验收用，ring 200 条）
   const wakeLog = []
+  // 忙碌释放探针（内存状态查询，零模型调用；释放即触发一次协调消费）
+  const busyProbes = new Map()
   function logWake(event) {
     wakeLog.push({ t: Date.now(), ...event })
     if (wakeLog.length > 200) wakeLog.shift()
@@ -1625,9 +1627,20 @@ export function apply(ctx, config = {}) {
     if (!chief || !conv) return
     const state = botState(chief.id)
     if (state.status === 'working') {
-      // 幕僚长忙（可能在处理上一轮交付）：稍后重试（事件不丢）
+      // 幕僚长忙（可能在处理上一轮交付/另一群协调）：事件不丢——pending 保留在调度器，
+      // 由空闲探询消费（空闲探针仅查内存状态，不调模型；30s 一次直到释放）
       logWake({ kind: 'busy-deferred', conversationId, retried })
-      if (retried < 2) setTimeout(() => void chiefCoordinationTurn(conversationId, retried + 1), 25000)
+      if (!busyProbes.has(conversationId)) {
+        busyProbes.set(conversationId, setInterval(() => {
+          const st = botState('chief')
+          if (st.status !== 'working') {
+            clearInterval(busyProbes.get(conversationId))
+            busyProbes.delete(conversationId)
+            logWake({ kind: 'busy-released', conversationId })
+            void chiefCoordinationTurn(conversationId, retried + 1)
+          }
+        }, 30_000))
+      }
       return
     }
     const msgs = await readRoomMsgs(conversationId, 12).catch(() => [])
@@ -1644,6 +1657,7 @@ export function apply(ctx, config = {}) {
       .join('\n')
     if (!digest) return
     logWake({ kind: 'consume', conversationId, digestLines: digest.split('\n').length })
+    chiefWake.ack(conversationId) // 消费确认：清除 pending/inTransit（真正开始处理）
     state.status = 'working'
     try {
       const outcome = await chatTurn(chief, [

@@ -141,10 +141,20 @@ test('在途唤醒：协调回合执行中到达新事件 → 合并 pending，�
   assert.equal(r3, 'pending', '第三个事件仍合并同一 pending（不重复派发）')
   assert.equal(fired.length, 1, '回合结束前不重复 fire')
   clock.advance(30_000) // 距 lastFiredAt 60s 到点
-  sched.onFired('g1') // 模拟回合结束调用 onFired → 定时器（delay 已到点）消费 pending
-  await new Promise((r) => setTimeout(r, 5)) // delay 回调是异步微任务
-  assert.equal(sched.state.get('g1').pending, false, 'pending 已被消费标记')
-  assert.ok(fired.length >= 2, '合并的事件触发了一次新的协调 fire')
+  // 窗口定时器到点：fire（inTransit 防重），pending 保留到消费方 ack
+  await new Promise((r) => setTimeout(r, 5))
+  assert.ok(fired.length >= 1, '窗口到点触发 fire')
+  assert.equal(sched.state.get('g1').inTransit, true, 'fire 进入 inTransit')
+  assert.equal(sched.state.get('g1').pending, true, 'pending 保留到真正消费（不丢）')
+  // 消费方开始处理 → ack 确认
+  sched.ack('g1')
+  assert.equal(sched.state.get('g1').pending, false, 'ack 后 pending 清除')
+  assert.equal(sched.state.get('g1').inTransit, false)
+  // 回合结束 onFired：无 pending → 无新 fire
+  const firedBefore = fired.length
+  sched.onFired('g1')
+  await new Promise((r) => setTimeout(r, 5))
+  assert.equal(fired.length, firedBefore, '无 pending 不重复 fire')
 })
 
 test('在途唤醒：取消事件不走完成/失败路径——cancelledRunIds 分类与唤醒互斥', async () => {
@@ -162,4 +172,40 @@ test('在途唤醒：空闲零轮询——request 之外无定时器（构造后
   assert.equal(timers, 0, '无 request 不设定时器')
   sched.request('g9')
   assert.ok(timers <= 1, '仅 request 触发至多一个窗口定时器')
+})
+
+
+test('在途唤醒：协调长于重试期限（>120s）——事件不丢，释放后恰好追加一次协调', async () => {
+  const clock = makeClock(0)
+  const fired = []
+  // 受控 delay：记录但不自动执行（我们手动推进）
+  const timers = []
+  const sched = new WakeScheduler({ intervalMs: 60_000, now: clock.now, delay: (ms, fn) => { timers.push({ at: clock.now() + ms, fn }); return timers.length }, fire: (key) => fired.push({ key, at: clock.now() }) })
+  const runTimers = () => {
+    const due = timers.filter((t) => t.at <= clock.now())
+    for (const t of due) { t.fn(); timers.splice(timers.indexOf(t), 1) }
+  }
+  // t=0 第一协调回合开始（持续 120s）
+  sched.request('g2')
+  assert.equal(fired.length, 1)
+  // t=10 新事件 → pending
+  clock.advance(10_000); runTimers()
+  sched.request('g2')
+  assert.equal(sched.state.get('g2').pending, true)
+  // t=60 窗口到点：第一回合的 fire 仍在途（inTransit 防重）→ 不重复 fire；pending 保留
+  clock.advance(50_000); runTimers()
+  assert.equal(fired.length, 1, '消费方在途时不重复 fire')
+  assert.equal(sched.state.get('g2').pending, true, '忙时 pending 不被清除（旧实现此处被清丢失）')
+  // t=120 第一回合结束 onFired → pending 仍在 → 重开窗口
+  clock.advance(60_000); runTimers()
+  sched.onFired('g2')
+  assert.equal(sched.state.get('g2').pending, true, '回合结束后事件仍保留')
+  // t=180（新窗口到点）再 fire → 这次消费方空闲 → ack
+  clock.advance(60_000); runTimers()
+  assert.equal(fired.length, 2, '释放后追加恰好一次协调 fire')
+  sched.ack('g2')
+  assert.equal(sched.state.get('g2').pending, false)
+  // t=240 无 pending 无新 fire
+  clock.advance(60_000); runTimers()
+  assert.equal(fired.length, 2, '无残留定时器/重复消费')
 })
