@@ -2754,7 +2754,7 @@ export function apply(ctx, config = {}) {
                 outcome: result.outcome,
               }
               })()
-              logPerf({ kind: 'api-chat', conversationId, apiMs: Date.now() - apiPerfStart, turnMs: r?.outcome?.perf?.totalMs ?? null, toolCalls: r?.outcome?.perf?.toolCalls ?? null, error: r?.outcome?.error ?? null })
+              logPerf({ kind: 'api-chat', conversationId, apiMs: Date.now() - apiPerfStart, turnMs: r?.outcome?.perf?.totalMs ?? null, executionMs: r?.outcome?.perf?.executionMs ?? null, queueMs: r?.outcome?.perf?.queueMs ?? null, toolCalls: r?.outcome?.perf?.toolCalls ?? null, error: r?.outcome?.error ?? null, cancelled: r?.outcome?.cancelled ?? false, status: r?.outcome?.error ? 'failed' : (r?.reply ? 'ok' : 'empty') })
               return r
             }
             if (requestId) {
