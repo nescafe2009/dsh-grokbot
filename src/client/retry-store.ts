@@ -13,13 +13,21 @@ export interface PendingRetry {
   createdAt: number
 }
 
-/** 服务端去重保留期（与 dedup.mjs 一致：失败 30s / 成功 5min） */
+/**
+ * 服务端去重保留边界（与 dedup.mjs 一致：失败 30s / 成功 5min / 宿主重启清空）。
+ * 注意：这是服务端行为，客户端无法核实请求落在哪个边界（失败或成功未知、重启未知）——
+ * 因此 UI 不据此显示"安全"承诺；withinGuarantee 仅用于文案分级（高/低重复风险），
+ * 重试始终复用原 requestId：命中服务端缓存/在途即返回原结果（免费），未命中才执行。
+ */
 export const RETRY_GUARANTEE_MS = 5 * 60_000
+export const RETRY_FAILURE_GUARANTEE_MS = 30_000
 
 const store = new Map<string, PendingRetry>()
 
 export function setPendingRetry(retry: PendingRetry): void {
-  store.set(retry.conversationId, retry)
+  // 保留首次创建时间：重复失败不延长原请求的保留期
+  const existing = store.get(retry.conversationId)
+  store.set(retry.conversationId, existing ? { ...retry, createdAt: existing.createdAt } : retry)
 }
 
 export function clearPendingRetry(conversationId: string): void {
@@ -35,7 +43,14 @@ export function retryMatches(retry: PendingRetry | null, conversationId: string)
   return Boolean(retry) && retry!.conversationId === conversationId
 }
 
-/** 是否仍在去重保证窗口内（UI 据此区分安全重试/需确认的重新执行） */
-export function withinGuarantee(retry: PendingRetry, now = Date.now()): boolean {
-  return now - retry.createdAt < RETRY_GUARANTEE_MS
+/**
+ * 风险分级（仅文案，不是安全承诺）：30s 内高把握命中去重（失败缓存最短边界）；
+ * 30s~5min 中风险；超 5min 低把握（且服务端重启会清空，任何时候重启都不保证）。
+ * 首次失败时间不因重复失败刷新（createdAt 记录首次创建，setPendingRetry 已存在时不覆盖）。
+ */
+export function retryRiskLevel(retry: PendingRetry, now = Date.now()): 'high' | 'medium' | 'low' {
+  const age = now - retry.createdAt
+  if (age < RETRY_FAILURE_GUARANTEE_MS) return 'high'
+  if (age < RETRY_GUARANTEE_MS) return 'medium'
+  return 'low'
 }
