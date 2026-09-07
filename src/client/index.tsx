@@ -16,6 +16,7 @@ interface BotInfo {
   hidden: boolean
   status: 'idle' | 'working'
   currentJob: string | null
+  currentRunId?: string | null
   lastActivity: number | null
   lastMessage?: string
   lastAt?: number | null
@@ -82,6 +83,7 @@ interface ArtifactInfo {
   size?: number | null
   mime?: string | null
   sha256?: string | null
+  taskId?: string | null
 }
 
 interface ChatMessage {
@@ -1026,6 +1028,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
   const [draft, setDraft] = useState('')
   const [draftTask, setDraftTask] = useState<{ taskId: string; name: string } | null>(null)
   const [sending, setSending] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
   const [editing, setEditing] = useState(false)
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [newRoutine, setNewRoutine] = useState(false)
@@ -1176,7 +1179,9 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
                 members={[{ name: bot.name, glyph: bot.avatar, desc: bot.title || '正在使用本机工具执行任务', state: 'running' }]}
                 time={null}
                 executor="本机"
-                actions={sending ? [{ label: '停止', onClick: () => void stop() }] : []}
+                actions={bot.currentRunId
+                  ? [{ label: cancelling ? '停止确认中…' : '取消本次', disabled: cancelling === true, onClick: () => { setCancelling(true); void api(`/tasks/${encodeURIComponent(bot.currentJob ?? '')}/runs/${encodeURIComponent(bot.currentRunId!)}/cancel`, { method: 'POST' }).catch(() => undefined).finally(() => { setTimeout(() => setCancelling(false), 4000) }) } }]
+                  : (sending ? [{ label: '停止', onClick: () => void stop() }] : [])}
               />
             )
             : null}
@@ -1302,6 +1307,11 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
   }, [messages.length, sending])
 
   const botOf = (botId?: string): BotInfo | undefined => bots.find((bot) => bot.id === botId)
+  // 当前会话最近的任务 id（供 run 级取消；无任务时回落 bot 级停止）
+  const botTaskOf = (botId: string): string | null => {
+    const hit = [...messages].reverse().find((m) => m.role === 'bot' && m.botId === botId && m.artifact?.taskId)
+    return hit?.artifact?.taskId ?? null
+  }
 
   const send = useCallback(async (): Promise<void> => {
     const text = draft.trim()
@@ -1372,7 +1382,9 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[] 
             status="running"
             members={[{ name: b.name, glyph: b.avatar, desc: b.title || '使用本机工具执行', state: 'running' }]}
             executor="本机"
-            actions={[{ label: '停止', onClick: () => { void api(`/bots/${encodeURIComponent(b.id)}/stop`, { method: 'POST' }).catch(() => undefined) } }]}
+            actions={b.currentRunId && botTaskOf(b.id)
+              ? [{ label: '取消本次', onClick: () => { void api(`/tasks/${encodeURIComponent(botTaskOf(b.id)!)}/runs/${encodeURIComponent(b.currentRunId!)}/cancel`, { method: 'POST' }).catch(() => undefined) } }]
+              : [{ label: '停止', onClick: () => { void api(`/bots/${encodeURIComponent(b.id)}/stop`, { method: 'POST' }).catch(() => undefined) } }]}
           />
         ))}
       </div>

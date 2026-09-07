@@ -86,7 +86,7 @@ async function withTaskMutation(taskId, fn) {
   return next
 }
 
-export async function startRun(stateDir, taskId, { botId, origin, note }) {
+export async function startRun(stateDir, taskId, { botId, origin, note, executor = null }) {
   return withTaskMutation(taskId, async () => {
   const task = await getTask(stateDir, taskId)
   if (!task) return null
@@ -95,6 +95,7 @@ export async function startRun(stateDir, taskId, { botId, origin, note }) {
     botId: botId || null,
     origin: ['user', 'continue', 'handoff'].includes(origin) ? origin : 'user',
     note: String(note || '').slice(0, 200),
+    ...(executor && executor.kind ? { executor } : {}),
     startedAt: Date.now(),
     endedAt: null,
     status: 'running',

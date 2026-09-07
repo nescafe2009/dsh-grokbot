@@ -65,7 +65,7 @@ export const TOKENS = {
 export const GKF_CSS = `
 .gkf-root { font-family: ${TOKENS.font.family}; color: ${TOKENS.color.text1}; }
 /* --- Message --- */
-.gkf-msg { display:flex; flex-direction:column; max-width:100%; }
+.gkf-msg { flex:none; display:flex; flex-direction:column; max-width:100%; }
 .gkf-msg__meta { font-size:${TOKENS.font.meta}px; color:${TOKENS.color.text3}; margin-bottom:3px; font-variant-numeric:tabular-nums; }
 .gkf-msg__meta--left { text-align:left; }
 .gkf-msg__meta--right { text-align:right; }
@@ -103,7 +103,7 @@ export const GKF_CSS = `
 .gkf-row__preview { font-size:${TOKENS.font.preview}px; color:${TOKENS.color.text2}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .gkf-row__unread { position:absolute; right:10px; bottom:10px; width:8px; height:8px; border-radius:50%; background:${TOKENS.color.unread}; }
 /* --- TaskCard（浅色卡体，完成态实测；运行态样式 [est] 同构换色）--- */
-.gkf-task { border-radius:${TOKENS.radius.taskCard}px; overflow:hidden; background:${TOKENS.color.taskCard}; color:${TOKENS.color.text1}; max-width:min(100%, 760px); }
+.gkf-task { flex:none; border-radius:${TOKENS.radius.taskCard}px; overflow:hidden; background:${TOKENS.color.taskCard}; color:${TOKENS.color.text1}; max-width:min(100%, 760px); }
 .gkf-task__head { display:flex; align-items:center; gap:8px; padding:12px 16px 4px; }
 .gkf-task__icon { width:18px; height:18px; border-radius:5px; flex:none; display:inline-flex; align-items:center; justify-content:center; font-size:11px; }
 .gkf-task__title { flex:1; min-width:0; font-size:13.5px; font-weight:650; letter-spacing:-.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -127,7 +127,7 @@ export const GKF_CSS = `
 .gkf-task__btn--primary { background:${TOKENS.color.text1}; border-color:${TOKENS.color.text1}; color:#fff; }
 .gkf-task__btn:disabled { opacity:.5; cursor:default; }
 /* --- ArtifactCard --- */
-.gkf-artifact { display:flex; align-items:center; gap:12px; border:1px solid ${TOKENS.color.line}; border-radius:${TOKENS.radius.noticeCard}px; background:#fff; padding:12px 14px; max-width:min(100%, 560px); box-shadow:0 1px 3px rgba(29,29,31,.05); }
+.gkf-artifact { flex:none; display:flex; align-items:center; gap:12px; border:1px solid ${TOKENS.color.line}; border-radius:${TOKENS.radius.noticeCard}px; background:#fff; padding:12px 14px; max-width:min(100%, 560px); box-shadow:0 1px 3px rgba(29,29,31,.05); }
 .gkf-artifact__icon { width:38px; height:38px; border-radius:10px; background:${TOKENS.color.noticeCard}; display:flex; align-items:center; justify-content:center; font-size:18px; flex:none; }
 .gkf-artifact__main { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; }
 .gkf-artifact__name { font-size:13px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }

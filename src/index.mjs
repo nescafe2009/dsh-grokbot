@@ -480,10 +480,16 @@ export function apply(ctx, config = {}) {
             workspace: botWorkspace(stateDir, bot),
             title: params?.title,
           })
-          // 首做即建 user run（此前只在续改回合建 run，首回合产物无 run 归属）
-          const started = await startRun(stateDir, task.id, { botId: bot.id, origin: 'user', note: String(params?.title || '') }).catch(() => null)
+          // 首做即建 user run（此前只在续改回合建 run，首回合产物无 run 归属）；
+          // 同步 botState 供 /state 暴露 run 级取消入口（currentJob/currentRunId）
+          const started = await startRun(stateDir, task.id, { botId: bot.id, origin: 'user', note: String(params?.title || ''), executor: { kind: 'chat', convKey: taskConvKey } }).catch(() => null)
           const ctx = activeTurnCtx.get(taskConvKey) || { conversationId }
           setTurnCtx(taskConvKey, { ...ctx, taskId: task.id, runId: started?.run?.id ?? null, conversationId: conversationId || null, taskWorkspace: task.workspace })
+          const bs = botState(bot.id)
+          if (bs.status === 'working') {
+            bs.currentJob = task.id
+            bs.currentRunId = started?.run?.id ?? null
+          }
           return JSON.stringify({ ok: true, taskId: task.id, note: '本回合及后续 deliver_file 会自动关联此任务；续改入口在成果卡片「继续修改」' })
         },
       },
@@ -570,12 +576,19 @@ export function apply(ctx, config = {}) {
   // 群 A / 群 B / DM 交错时各自回合先后进入，互不读到对方上下文。
   const activeTurnCtx = new Map() // botId -> { taskId, runId, conversationId }
 
+  // R2-B：run 取消意图登记（abort 不一定产生 outcome.error，以意图为准归类终态）
+  const cancelledRunIds = new Set()
+
   // 回合收尾统一：关闭本回合实际活动的 run（入口带来的或回合内 task_begin 新建的）
-  async function closeActiveRun(convKey, fallbackTaskId, fallbackRunId, failed) {
+  async function closeActiveRun(convKey, fallbackTaskId, fallbackRunId, status = 'done') {
     const liveCtx = activeTurnCtx.get(convKey)
     const finTaskId = fallbackRunId ? fallbackTaskId : (liveCtx?.taskId ?? null)
     const finRunId = fallbackRunId ? fallbackRunId : (liveCtx?.runId ?? null)
-    if (finTaskId && finRunId) await endRun(stateDir, finTaskId, finRunId, failed ? 'failed' : 'done').catch(() => null)
+    if (finTaskId && finRunId) {
+      const finalStatus = cancelledRunIds.has(finRunId) ? 'cancelled' : status
+      cancelledRunIds.delete(finRunId)
+      await endRun(stateDir, finTaskId, finRunId, finalStatus).catch(() => null)
+    }
     setTurnCtx(convKey, null)
   }
 
@@ -1353,7 +1366,7 @@ export function apply(ctx, config = {}) {
       if (taskId && existingRunId) {
         runRef = { id: existingRunId } // handoff 已建 run，本回合复用
       } else if (taskId) {
-        const started = await startRun(stateDir, taskId, { botId: bot.id, origin: taskOrigin, note: taskNote || String(text).slice(0, 120) }).catch(() => null)
+        const started = await startRun(stateDir, taskId, { botId: bot.id, origin: taskOrigin, note: taskNote || String(text).slice(0, 120), executor: { kind: 'chat', convKey } }).catch(() => null)
         runRef = started?.run ?? null
       }
       // 上下文按 (会话,bot) 槽隔离（闭包工具读同一 convKey；同 bot 回合被串行化）
@@ -1363,7 +1376,9 @@ export function apply(ctx, config = {}) {
       const prevJob = state.currentJob
       state.status = 'working'
       state.currentJob = taskId || 'chat'
+      state.currentRunId = runRef?.id ?? null
       let failed = false
+      let cancelled = false
       try {
         let session = chatHandles.get(sessionKey)
         if (!session) {
@@ -1396,17 +1411,20 @@ export function apply(ctx, config = {}) {
         }
         const turnText = outcome.text?.trim()
         failed = Boolean(outcome.error) || !turnText
+        cancelled = /cancel/i.test(String(outcome.error || ''))
         if (turnText && writeDm) {
           await appendDm(bot.id, { role: 'bot', text: turnText, activity: outcome.activity }).catch(() => undefined)
         }
         return outcome
       } catch (error) {
         failed = true
+        cancelled = /cancel/i.test(String(error?.message || error))
         throw error
       } finally {
         state.status = prevStatus === 'working' ? 'idle' : prevStatus
         state.currentJob = prevJob ?? null
-        await closeActiveRun(convKey, taskId, runRef?.id ?? null, failed)
+        state.currentRunId = null
+        await closeActiveRun(convKey, taskId, runRef?.id ?? null, cancelled ? 'cancelled' : (failed ? 'failed' : 'done'))
       }
     })
   }
@@ -1691,6 +1709,7 @@ export function apply(ctx, config = {}) {
     const state = botState(bot.id)
     state.status = 'working'
     state.currentJob = job.jobId
+    state.currentRunId = null
     let session = null
     try {
       await claimJob(job, bot.id)
@@ -1719,7 +1738,7 @@ export function apply(ctx, config = {}) {
         }
         const task = jobTaskId ? await getTask(stateDir, jobTaskId).catch(() => null) : null
         if (task) {
-          const started = await startRun(stateDir, task.id, { botId: bot.id, origin: 'handoff', note: String(promptText).slice(0, 200) }).catch(() => null)
+          const started = await startRun(stateDir, task.id, { botId: bot.id, origin: 'handoff', note: String(promptText).slice(0, 200), executor: { kind: 'job', jobId: job.jobId } }).catch(() => null)
           hoRunId = started?.run?.id ?? null
         }
         handoffPreamble = `【接力交接】${ho.fromBotName || '队友'} 把这项工作交给你继续。${artBlock}${task ? `\n【任务】${task.title}（taskId=${task.id}；任务工作区根目录：${task.workspace || botWorkspace(stateDir, bot)}——读写与交付都以它为根）` : ''}\n交接摘要：${promptText}`
@@ -1727,6 +1746,7 @@ export function apply(ctx, config = {}) {
       const jobTask = jobTaskId ? await getTask(stateDir, jobTaskId).catch(() => null) : null
       const jobTaskWs = jobTask?.workspace || null
       setTurnCtx(convKey4Job, { taskId: jobTaskId, runId: hoRunId, conversationId: job.conversationId || null, taskWorkspace: jobTaskWs })
+      if (hoRunId) state.currentRunId = hoRunId
       session = await createBotAgent(bot, { conversationId: job.conversationId || null, cwd: jobTaskWs || undefined })
       timeout = setTimeout(() => session.abort.abort(new Error(`job timeout after ${jobTimeoutMs}ms`)), jobTimeoutMs)
       // 长任务群内心跳：让群里知道成员还活着在干活（不触发幕僚长唤醒）
@@ -1752,8 +1772,9 @@ export function apply(ctx, config = {}) {
         if (timeout) clearTimeout(timeout)
         if (heartbeat) clearInterval(heartbeat)
         const replyProbe = outcome?.text?.trim()
+        const cancelled = /cancel/i.test(String(outcome?.error || ''))
         const jobFailed = Boolean(outcome?.error) || !replyProbe
-        await closeActiveRun(convKey4Job, jobTaskId, hoRunId, jobFailed)
+        await closeActiveRun(convKey4Job, jobTaskId, hoRunId, cancelled ? 'cancelled' : (jobFailed ? 'failed' : 'done'))
       }
       const reply = outcome.text?.trim()
       // 回复回流：群任务 → 发回群里（所有人可见）；无群上下文 → 记入该成员私聊
@@ -1808,6 +1829,7 @@ export function apply(ctx, config = {}) {
       runningJobs.delete(job.jobId)
       state.status = 'idle'
       state.currentJob = null
+      state.currentRunId = null
       state.lastActivity = Date.now()
       pump()
     }
@@ -1990,6 +2012,7 @@ export function apply(ctx, config = {}) {
               lastMessage: last ? String(last.text || '').slice(0, 80) : '',
               lastAt: last?.ts ?? null,
               lastFrom: last?.role === 'user' ? 'user' : 'bot',
+              currentRunId: base.status === 'working' ? (botState(bot.id).currentRunId ?? null) : null,
             })
           }
           respond(res, 200, {
@@ -2013,6 +2036,32 @@ export function apply(ctx, config = {}) {
           }
           await persistUiState()
           respond(res, 200, { ok: true }); return
+        }
+        // R2-B：run 级取消（与 bot 级 stop 区分；仅取消指定 run 的执行）
+        const runCancelMatch = /^\/tasks\/([a-z0-9-]+)\/runs\/([a-z0-9-]+)\/cancel$/.exec(suffix)
+        if (method === 'POST' && runCancelMatch) {
+          const taskId = runCancelMatch[1]
+          const runId = runCancelMatch[2]
+          const task = await getTask(stateDir, taskId)
+          if (!task) throw new HttpError(404, `任务不存在：${taskId}`)
+          const run = task.runs.find((r) => r.id === runId)
+          if (!run) throw new HttpError(404, `run 不存在：${runId}`)
+          if (run.status !== 'running') {
+            respond(res, 200, { ok: true, state: run.status, note: 'run 已结束' }); return
+          }
+          // 会话归属：任务会话存在时，本路由仅作用于该会话上下文（run 与任务已绑定校验过）
+          let aborted = false
+          const exec = run.executor || {}
+          if (exec.kind === 'chat') {
+            const handle = chatHandles.get(exec.convKey)
+            if (handle?.abort) { try { handle.abort.abort(new Error('run cancelled by user')) ; aborted = true } catch { /* 已结束 */ } }
+          } else if (exec.kind === 'job') {
+            const entry = runningJobs.get(exec.jobId)
+            const abortCtl = entry?.abort
+            if (abortCtl) { try { abortCtl.abort(new Error('run cancelled by user')) ; aborted = true } catch { /* 已结束 */ } }
+          }
+          if (aborted) cancelledRunIds.add(runId)
+          respond(res, 200, { ok: true, state: aborted ? 'stopping' : 'unknown', aborted }); return
         }
         if (method === 'GET' && suffix === '/crew') {
           respond(res, 200, { crew: crewState.crew }); return
