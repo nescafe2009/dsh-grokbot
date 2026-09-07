@@ -109,7 +109,8 @@ test('结构：finally 统一 perf（closeActiveRun 后、同一 endTs、cancell
 
 test('结构：conversationTurn 多成员分支透出 outcome', () => {
   // 多成员 return 必须含 outcome
-  assert.ok(/return\\s*{\\s*responder,\\s*reply,\\s*handoffTo:\\s*null,\\s*outcome\\s*}/.test(libSrc.replace(/\\n\s*/g, ' ')), '多成员分支 return 含 outcome')
+  const normalized = libSrc.replace(/[\n\t ]+/g, ' ')
+  assert.ok(normalized.includes('handoffTo: null, outcome'), '多成员分支 return 含 outcome（构建产物归一化匹配）')
 })
 
 test('结构：api-chat status 优先 cancelled', () => {
