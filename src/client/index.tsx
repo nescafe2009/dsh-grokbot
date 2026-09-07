@@ -1103,7 +1103,8 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
     try {
       const outcome = await api(`/conversations/${encodeURIComponent(bot.id)}/chat`, {
         method: 'POST',
-        body: JSON.stringify({ text, requestId, ...(taskForSend ? { taskId: taskForSend } : {}), ...(isRetry ? { retryMode: 'retry' } : {}) }),
+        // retryMode 仅在「查询原结果」时携带；「重新执行」复用原载荷但生成新 ID 走执行路径
+        body: JSON.stringify({ text, requestId, ...(taskForSend ? { taskId: taskForSend } : {}), ...(opts?.retryMode ? { retryMode: opts.retryMode } : {}) }),
       })
       const activity = (outcome?.activity ?? []) as string[]
       if (activity.length > 0) {
@@ -1394,7 +1395,7 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[];
     try {
       const outcome = await api(`/conversations/${encodeURIComponent(room.id)}/chat`, {
         method: 'POST',
-        body: JSON.stringify({ text, requestId, ...(taskForSend ? { taskId: taskForSend } : {}), ...(isRetry ? { retryMode: 'retry' } : {}) }),
+        body: JSON.stringify({ text, requestId, ...(taskForSend ? { taskId: taskForSend } : {}), ...(opts?.retryMode ? { retryMode: opts.retryMode } : {}) }),
       })
       setMessages(((outcome?.messages ?? []) as RoomMessage[]).slice())
       setDraftTask(null)

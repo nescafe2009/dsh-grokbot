@@ -2585,6 +2585,10 @@ export function apply(ctx, config = {}) {
             // 请求去重：第一次副作用（含消息落盘）前登记在途；并发同 ID 共享执行结果
             const requestId = /^[a-zA-Z0-9_-]{6,64}$/.test(String(body?.requestId || '')) ? `${conversationId}:${body.requestId}` : null
             const bodyTaskId = /^[a-z0-9-]+$/i.test(String(body?.taskId || '')) ? String(body.taskId) : null
+            // 查询模式必须有有效 ID：缺失/非法一律 419 拒绝（禁止降级为新执行——任何副作用都不发生）
+            if (String(body?.retryMode || '') === 'retry' && !requestId) {
+              throw new HttpError(419, '查询模式（retryMode=retry）需要有效 requestId；缺失或非法 ID 不可降级为新执行')
+            }
             const handleChatTurn = async () => {
             if (conversation.memberBotIds.length === 1) {
               const memberBot = crewState.crew.bots.find((entry) => entry.id === conversation.memberBotIds[0])

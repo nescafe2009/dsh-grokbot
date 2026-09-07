@@ -25,7 +25,11 @@ export class ChatRequestRegistry {
    * - 载荷冲突：error={status:409,...}
    */
   begin(id, payload, exec, { retryOnly = false } = {}) {
-    if (!id) return { deduped: false, result: null, error: null, unknown: false, run: () => Promise.resolve(exec()) }
+    if (!id) {
+      // 防御：查询模式无 ID 不执行（调用方也应校验；此处兜底）
+      if (retryOnly) return { deduped: false, result: null, error: null, cachedFailure: null, unknown: true, run: null }
+      return { deduped: false, result: null, error: null, unknown: false, run: () => Promise.resolve(exec()) }
+    }
     const t = this.now()
     const cached = this.results.get(id)
     if (cached) {

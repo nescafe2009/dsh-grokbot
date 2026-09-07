@@ -259,3 +259,56 @@ test('协议：模拟重启（新 registry）→ retryOnly unknown', async () =>
   const retry = reg2.begin('p4', { text: 'x' }, async () => { effects += 1; return {} }, { retryOnly: true })
   assert.equal(retry.unknown, true); assert.equal(effects, 1)
 })
+
+/* ---------------- 按钮链路回归（Codex 十七轮：查询 vs 重新执行的发送语义） ---------------- */
+
+test('链路：查询按钮的 body 带 retryMode:retry + 原ID；重新执行按钮 body 带新ID 且无 retryMode', async () => {
+  // 模拟 DM send 的 body 构造逻辑（与 index.tsx 相同规则）
+  const buildBody = (requestId, opts) => ({ requestId, ...(opts?.retryMode ? { retryMode: opts.retryMode } : {}) })
+  const saved = { conversationId: 'c1', requestId: 'ui-orig-1', text: 'x', taskId: 't1', createdAt: 1000 }
+  // 查询按钮
+  const queryBody = buildBody(saved.requestId, { retryMode: 'retry' })
+  assert.equal(queryBody.retryMode, 'retry'); assert.equal(queryBody.requestId, 'ui-orig-1')
+  // 重新执行按钮（新 ID，无 retryMode）
+  const newId = `ui-${Date.now().toString(36)}-re`
+  const execBody = buildBody(newId, undefined)
+  assert.equal(execBody.retryMode, undefined); assert.notEqual(execBody.requestId, saved.requestId)
+})
+
+test('链路：路由语义——查询未知记录=419+0执行；确认重新执行=1次执行；任务身份保持', async () => {
+  let time = 1000
+  const reg = new ChatRequestRegistry({ now: () => time })
+  let execCount = 0
+  const taskId = 't-original'
+  const payloads = []
+  // 重新执行：新 ID、无 retryMode → 执行（与路由 if(requestId)+!retryOnly 分支一致）
+  const execBegin = reg.begin('conv:ui-new-1', { text: 'x', taskId }, async () => { execCount += 1; payloads.push({ text: 'x', taskId }); return { ok: true } })
+  const r1 = await execBegin.run()
+  assert.equal(r1.ok, true); assert.equal(execCount, 1)
+  assert.equal(payloads[0].taskId, 't-original', '任务身份保持')
+  // 查询一个不存在的新 ID → unknown（路由转 419）
+  const q = reg.begin('conv:ui-other-9', { text: 'x', taskId }, async () => { execCount += 1 }, { retryOnly: true })
+  assert.equal(q.unknown, true); assert.equal(execCount, 1, '查询未知记录不执行')
+  // 查询刚执行成功的新 ID（成功缓存内）→ 返回原结果
+  const q2 = reg.begin('conv:ui-new-1', { text: 'x', taskId }, async () => { execCount += 1 }, { retryOnly: true })
+  assert.equal(q2.deduped, true); assert.deepEqual(q2.result, { ok: true })
+  assert.equal(execCount, 1)
+})
+
+test('链路：路由守卫——retryMode=retry 且无有效 requestId → 419 拒绝（消息/执行 0）', async () => {
+  // 与路由守卫同语义：retry 无 ID 直接抛 419（测试模拟守卫行为 + registry 兜底）
+  const guard = (body) => {
+    const ok = /^[a-zA-Z0-9_-]{6,64}$/.test(String(body?.requestId || ''))
+    if (String(body?.retryMode || '') === 'retry' && !ok) return { rejected: true, status: 419 }
+    return { rejected: false }
+  }
+  assert.deepEqual(guard({ text: 'q', retryMode: 'retry' }), { rejected: true, status: 419 })            // 缺失
+  assert.deepEqual(guard({ text: 'q', retryMode: 'retry', requestId: '' }), { rejected: true, status: 419 }) // 空
+  assert.deepEqual(guard({ text: 'q', retryMode: 'retry', requestId: 'ab!' }), { rejected: true, status: 419 }) // 非法
+  assert.deepEqual(guard({ text: 'q', retryMode: 'retry', requestId: 'valid-id-1' }), { rejected: false })
+  // registry 兜底：无 ID retryOnly → unknown 不执行
+  const reg = new ChatRequestRegistry()
+  let n = 0
+  const r = reg.begin(null, {}, async () => { n += 1 }, { retryOnly: true })
+  assert.equal(r.unknown, true); assert.equal(n, 0)
+})
