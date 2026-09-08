@@ -12,9 +12,16 @@ if [ ! -f "$RTE/node_modules/react/package.json" ]; then
   npm install --prefix "$RTE" react@19.1.0 react-dom@19.1.0 happy-dom 2>&1 | tail -1
 fi
 
-# 2. 构建 ESM bundle（不用 pipe——保留完整退出码）
+# 2. 构建 ESM bundle（不用 pipe——保留完整退出码）。
+# external 必须逐个传参：逗号串会被当成单个包名，react 被打进包内——
+# 一旦根 node_modules 可解析 react（如 browser fixture 建过链接），与测试环境的
+# react 形成双实例，23 组件全部 Invalid hook call。
 cd "$PROJ"
-npx tsdown src/client/test-entry.ts --format esm --platform node --outDir "$CTB" --external react,react-dom,react/jsx-runtime > /dev/null 2>&1
+npx tsdown src/client/test-entry.ts --format esm --platform node --outDir "$CTB" \
+  --external react \
+  --external react-dom \
+  --external react/jsx-runtime \
+  > /dev/null 2>&1
 if [ $? -ne 0 ]; then
   echo "BUILD FAILED"
   rm -rf "$CTB"
