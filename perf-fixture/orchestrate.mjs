@@ -256,27 +256,38 @@ export async function runSampling(deps) {
     }
   }
 
-  // ===== 模型参数匹配（冷冷暖暖同模型条件 + 实际有效选项白名单） =====
-  // 基准 = 首个非空模型；白名单（deps.listModels 实际可用选项）不可得或基准不在其中 → 不确定 → unknown
+  // ===== 模型证据三分：ID 匹配 / 目录可用 / 参数确认 =====
+  // 语义澄清：白名单=允许记录的非秘密参数字段；/model-catalog 仅含 ID/name——
+  // 目录成员 + ID 相等不能证明实际采样参数一致。参数未取证 → 明确 unknown，
+  // 真实性能 overall 保持 incomplete（不猜默认值、不新增接口）。
   const models = {}
-  let whitelist = null
+  let catalog = null // 可用性清单（仅 ID 语义）：deps.listModels 不可得 → null
   if (typeof deps.listModels === 'function') {
-    whitelist = await deps.listModels().then((list) => (Array.isArray(list) ? new Set(list.map(String)) : null)).catch(() => null)
+    catalog = await deps.listModels().then((list) => (Array.isArray(list) ? new Set(list.map(String)) : null)).catch(() => null)
   }
   const allModels = results.map((r) => r.model ?? null).filter(Boolean)
   const reference = allModels[0] ?? null
-  const referenceValid = whitelist === null ? false : whitelist.has(String(reference))
   for (const pair of ['cold-qa', 'cold-tool', 'warm-plugin', 'warm-direct']) {
-    const inPair = [...new Set(results.filter((r) => r.pair === pair).map((r) => r.model ?? null))]
     const direct = [...new Set(results.filter((r) => r.pair === pair && r.side === 'direct').map((r) => r.model ?? null))].join('|')
     const plugin = [...new Set(results.filter((r) => r.pair === pair && r.side === 'plugin').map((r) => r.model ?? null))].join('|')
-    const unknown = inPair.includes(null) || inPair.length === 0 || !reference
-    const mismatch = !unknown && inPair.some((m) => m !== reference)
-    const match = (unknown || !referenceValid) ? 'unknown' : (mismatch ? false : true)
-    models[pair] = { direct: direct || 'unknown', plugin: plugin || 'unknown', reference: reference ?? 'unknown', whitelistChecked: whitelist !== null, match }
+    const inPair = [...new Set(results.filter((r) => r.pair === pair).map((r) => r.model ?? null))]
+    const hasUnknown = inPair.includes(null) || inPair.length === 0 || !reference
+    // 1) ID 匹配：同组双侧 ID 相等（与基准一致）
+    const idMatch = hasUnknown ? null : (inPair.every((m) => m === reference) ? true : false)
+    // 2) 目录可用：基准 ID 在 /model-catalog（仅证明 ID 存在，不证明参数）
+    const catalogAvailable = !reference ? null : (catalog === null ? null : catalog.has(String(reference)))
+    // 3) 参数确认：实际采样参数（非秘密字段）是否取证一致——当前未取证（不猜默认值、不新增接口）
+    const paramsConfirmed = false
+    const match = idMatch === false ? false : 'unknown' // 参数未确认 → 完整配对不能 PASS
+    models[pair] = {
+      direct: direct || 'unknown', plugin: plugin || 'unknown', reference: reference ?? 'unknown',
+      idMatch, catalogAvailable, paramsConfirmed,
+      paramsNote: '参数未取证（不猜默认值）——完整配对需参数确认证据',
+      match,
+    }
     if (match !== true) {
-      const why = !reference ? '无样本模型' : (!referenceValid ? `基准 ${reference} 不在实际可用选项${whitelist === null ? '（清单不可得）' : ''}` : `组内不一致（direct=${direct} plugin=${plugin}）`)
-      degrade(`配对 ${pair} 模型参数不匹配或不确定：${why}`)
+      const why = idMatch === null ? '样本模型缺失' : (idMatch === false ? `组内 ID 不一致（direct=${direct} plugin=${plugin}）` : (catalogAvailable === false ? `基准 ${reference} 不在目录` : (catalogAvailable === null ? '目录不可得' : '参数未确认')))
+      degrade(`配对 ${pair} 不能完整判定：${why}`)
     }
   }
 

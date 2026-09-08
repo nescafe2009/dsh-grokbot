@@ -56,7 +56,7 @@ FIXTURE_DIR=<dir> ZAI_API_KEY=<key> TESTED_SHA=<sha> node sample.mjs
 
 ## 采样契约（orchestrate.mjs，测试驱动）
 
-- 模型参数：每样本记录服务端返回的实际 `model`（provider/model）；**冷冷暖暖四组与全局基准一致且基准在 `/model-catalog` 实际有效选项白名单内**才 match=true——清单不可得或基准不在其中 = 不确定 → unknown，均 overall incomplete（输出 `models` 字段含 whitelistChecked）
+- 模型证据三分：每样本记录实际 `model` ID（provider/model，属允许记录的非秘密参数字段）。**ID 匹配**（组内双侧与基准一致）/ **目录可用**（基准 ID 在 /model-catalog——目录仅含 ID/name，不证明参数一致）/ **参数确认**（实际采样参数取证一致——当前未取证）三者分开判定；参数未取证 → `paramsConfirmed=false`、完整配对 `match='unknown'`，**真实性能 overall 恒 incomplete**（不猜默认值、不新增接口）。输出 `models` 含 idMatch/catalogAvailable/paramsConfirmed/paramsNote
 - 时间字段显式：`totalMs`（插件=perf.totalMs / 直连=服务端 ms）、`executionMs`+`queueMs`（插件拆分，直连 null）、`rttMs`（客户端往返，另列）
 - 取消带部分文本 → `status='cancelled'`（非 ok）
 - 预热非 ok/取消/异常 → 该侧停止采样并释放（双侧预热均在 try 内；warm-plugin→finally rmBot；warm-direct→finally close）；**暖配对为同 round 交替先后**（奇数轮 direct 先，order 记录）

@@ -74,11 +74,14 @@ function makeMockDeps(overrides = {}) {
 test('成功全链：模型匹配/时间字段显式/交替顺序/marker 门控/finally close', async () => {
   const d = makeMockDeps()
   const out = await runSampling({ ...d, listModels: async () => ['prov/m-1'], texts: { qaRounds: 2, toolRounds: 1, warmRounds: 2 } })
-  assert.equal(out.overall, 'ok', `overall=ok（${JSON.stringify(out.models)}）`)
-  assert.equal(out.exitCode, 0)
-  // 每配对模型匹配 true（双侧 prov/m-1）
+  // 语义三分后：ID 匹配 + 目录可用可判，但参数未取证 → 完整配对不能 PASS——真实性能 overall 保持 incomplete
+  assert.equal(out.overall, 'incomplete', '参数未取证 → overall incomplete（不猜默认值）')
+  assert.equal(out.exitCode, 1)
   for (const pair of ['cold-qa', 'cold-tool', 'warm-plugin', 'warm-direct']) {
-    assert.equal(out.models[pair].match, true, `${pair} 模型匹配`)
+    assert.equal(out.models[pair].idMatch, true, `${pair} ID 匹配（双侧 prov/m-1）`)
+    assert.equal(out.models[pair].catalogAvailable, true, `${pair} 目录可用`)
+    assert.equal(out.models[pair].paramsConfirmed, false, `${pair} 参数未取证`)
+    assert.equal(out.models[pair].match, 'unknown', `${pair} 完整配对=unknown（参数未确认）`)
   }
   // 时间字段四件套显式（插件有拆分；直连拆分为 null）
   const pluginSample = out.results.find((r) => r.pair === 'cold-qa' && r.side === 'plugin')
@@ -114,11 +117,13 @@ test('模型不匹配 → incomplete 非零；未知（null）→ incomplete', a
   const out1 = await runSampling({ api: d1.api, mkBot: d1.mkBot, rmBot: d1.rmBot, listModels: async () => ['prov/A', 'prov/B'], texts: { qaRounds: 1, toolRounds: 1, warmRounds: 1 } })
   assert.equal(out1.overall, 'incomplete')
   assert.equal(out1.exitCode, 1)
-  assert.equal(out1.models['cold-qa'].match, false, '不匹配 → false 记录')
+  assert.equal(out1.models['cold-qa'].idMatch, false, 'ID 不匹配 → false 记录')
+  assert.equal(out1.models['cold-qa'].match, false, '完整配对 → false')
 
   const d2 = makeMockDeps({ model: null })
   const out2 = await runSampling({ api: d2.api, mkBot: d2.mkBot, rmBot: d2.rmBot, listModels: async () => ['prov/m-1'], texts: { qaRounds: 1, toolRounds: 1, warmRounds: 1 } })
   assert.equal(out2.overall, 'incomplete')
+  assert.equal(out2.models['cold-qa'].idMatch, null, '样本模型缺失 → idMatch null')
   assert.equal(out2.models['cold-qa'].match, 'unknown', '未知 → unknown 记录')
 })
 
@@ -302,17 +307,25 @@ test('暖交替：双侧各预热一次后同 round 交替先后（order 记录�
   // 双侧各恰一次预热且不产生样本
   const warmupCalls = d.state.calls.filter((c) => (c.path === '/__perf/warm/open') || (c.path.endsWith('/chat') && c.body.text?.includes('预热')))
   assert.equal(d.state.calls.filter((c) => c.path === '/__perf/warm/open').length, 1, '直连预热恰一次')
-  assert.equal(out.overall, 'ok')
+  assert.equal(out.models['warm-plugin'].idMatch, true, '暖侧 ID 匹配')
+  assert.equal(out.overall, 'incomplete', '参数未取证 → overall incomplete（语义三分）')
 })
 
-test('模型白名单：基准不在实际可用选项 → unknown + incomplete；在清单 → true（对照）', async () => {
-  const d = makeMockDeps() // 模型 prov/m-1
-  const out1 = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, listModels: async () => ['other/x', 'other/y'], texts: { qaRounds: 1, toolRounds: 1, warmRounds: 1 } })
-  assert.equal(out1.models['cold-qa'].match, 'unknown', '基准不在白名单 → unknown（不确定标 unknown）')
-  assert.equal(out1.models['cold-qa'].whitelistChecked, true)
-  assert.equal(out1.overall, 'incomplete')
-  assert.equal(out1.exitCode, 1)
-  const out2 = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, listModels: async () => ['prov/m-1', 'other/y'], texts: { qaRounds: 1, toolRounds: 1, warmRounds: 1 } })
-  assert.equal(out2.models['cold-qa'].match, true, '基准在白名单 → true（对照）')
-  assert.equal(out2.overall, 'ok')
+test('模型证据三分：同 ID 在目录但参数未知 → 不能完整配对 PASS（overall incomplete）', async () => {
+  const d = makeMockDeps() // 模型 prov/m-1，双侧同 ID
+  // 同 ID 且在目录——但参数未取证：idMatch=true、catalogAvailable=true、paramsConfirmed=false、match=unknown
+  const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, listModels: async () => ['prov/m-1', 'other/y'], texts: { qaRounds: 1, toolRounds: 1, warmRounds: 1 } })
+  const m = out.models['cold-qa']
+  assert.equal(m.idMatch, true, 'ID 匹配成立')
+  assert.equal(m.catalogAvailable, true, '目录可用（仅 ID 语义）')
+  assert.equal(m.paramsConfirmed, false, '参数未取证（不猜默认值）')
+  assert.match(String(m.paramsNote), /参数未取证/, 'paramsNote 明示')
+  assert.equal(m.match, 'unknown', '同 ID 在目录但参数未知 → 完整配对 unknown（不能 PASS）')
+  assert.equal(out.overall, 'incomplete', '真实性能 overall incomplete')
+  assert.equal(out.exitCode, 1)
+  // 目录不可得：catalogAvailable=null → 仍 unknown
+  const out2 = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, listModels: async () => { throw new Error('catalog down') }, texts: { qaRounds: 1, toolRounds: 1, warmRounds: 1 } })
+  assert.equal(out2.models['cold-qa'].catalogAvailable, null, '目录不可得 → null')
+  assert.equal(out2.models['cold-qa'].match, 'unknown')
+  assert.equal(out2.overall, 'incomplete')
 })
