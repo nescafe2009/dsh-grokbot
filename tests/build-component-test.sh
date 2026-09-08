@@ -5,11 +5,11 @@ PROJ="$(cd "$(dirname "$0")/.." && pwd)"
 CTB=/tmp/ctb-$$-$(date +%s) # 每次独立目录（不用共享 /tmp/ctb）
 RTE=/tmp/react-test-env
 
-# 1. 安装 react 测试依赖（明确版本，如果不存在）
+# 1. 安装 react 测试依赖（明确版本，如果不存在）——与实测环境一致：react 19.2.8 / happy-dom 20.14.0
 if [ ! -f "$RTE/node_modules/react/package.json" ]; then
   mkdir -p "$RTE"
   echo '{"name":"react-test-env","private":true}' > "$RTE/package.json"
-  npm install --prefix "$RTE" react@19.1.0 react-dom@19.1.0 happy-dom 2>&1 | tail -1
+  npm install --prefix "$RTE" react@19.2.8 react-dom@19.2.8 happy-dom@20.14.0 2>&1 | tail -1
 fi
 
 # 2. 构建 ESM bundle（不用 pipe——保留完整退出码）。
