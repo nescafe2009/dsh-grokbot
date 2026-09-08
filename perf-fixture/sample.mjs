@@ -123,7 +123,8 @@ function normalizeSample(raw) {
   const outcome = raw.outcome ?? {}
   const isCancelled = raw.cancelled === true || outcome.cancelled === true
   const hasError = raw.error || outcome.error
-  const isEmpty = !raw.reply || raw.reply?.includes('未能给出文本回复')
+  // 直连响应无 reply 字段——replyBytes>0 即非空；插件无 reply → empty
+  const isEmpty = (raw.reply === undefined && (raw.replyBytes ?? 0) > 0) ? false : (!raw.reply || raw.reply?.includes('未能给出文本回复'))
   const isHttpErr = raw.http >= 400
   if (isFetchError || isCancelled || isEmpty || isHttpErr || hasError) {
     return { ...raw, status: isCancelled ? 'cancelled' : 'failed' }
