@@ -431,3 +431,64 @@ test('真实组件 DM：A→B→A 后 A 旧回调不覆盖新一轮', async () =
 
   c.root.unmount(); c.el.remove(); teardownMockFetch()
 })
+
+
+// ===== 10. Codex 探针：离开 A 后失败 → 切回 A 重试记录保留 =====
+test('Codex: late failure preserves original conversation retry', async () => {
+  setupMockFetch(); const c = createContainer(); const a = makeBot('retryLateA')
+  try {
+    await render(React.createElement(BotChatView, { bot: a, state: null }), c)
+    const ta = c.el.querySelector('textarea')
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, 'must retain')
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => [...c.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    const post = deferredQueue.find(d => d.call.url.includes('/retryLateA/chat'))
+    assert.ok(post, 'retryLateA POST pending')
+
+    // 切 B → A 的 POST 失败 → 切回 A
+    await rerender(React.createElement(BotChatView, { bot: makeBot('retryLateB'), state: null }), c)
+    await act(async () => post.reject(new Error('late network failure')))
+    await rerender(React.createElement(BotChatView, { bot: a, state: null }), c)
+
+    assert.ok(
+      [...c.el.querySelectorAll('button')].find(b => b.textContent.includes('重试')),
+      'A must retain late failure retry'
+    )
+  } finally { await act(async () => c.root.unmount()); c.el.remove(); teardownMockFetch() }
+})
+
+// ===== 11. Codex 探针：群 A→B→A 旧 POST 不覆盖新一轮 =====
+test('Codex: group A-B-A old POST cannot overwrite new generation', async () => {
+  setupMockFetch(); const c = createContainer()
+  const bots = [makeBot('cx'), makeBot('cy')]
+  const a = makeConv('genA', ['cx', 'cy'])
+  const input = async (text) => {
+    const ta = c.el.querySelector('textarea')
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text)
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+  }
+  try {
+    await render(React.createElement(GroupChatView, { conversation: a, bots }), c)
+    await input('first')
+    await act(async () => [...c.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    const old = deferredQueue.find(d => d.call.url.includes('/genA/chat'))
+    assert.ok(old, 'genA first POST pending')
+
+    // 切 B 再切回 A → 发第二轮
+    await rerender(React.createElement(GroupChatView, { conversation: makeConv('genB', ['cx','cy']), bots }), c)
+    await rerender(React.createElement(GroupChatView, { conversation: a, bots }), c)
+    await input('second')
+    await act(async () => [...c.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+
+    // 旧 POST 返回
+    await act(async () => old.resolve({
+      ok: true, status: 200,
+      json: async () => ({ messages: [{ ts: 1, role: 'bot', botId: 'cx', text: 'OLD_GENERATION_ONLY' }] })
+    }))
+    assert.ok(!c.el.textContent.includes('OLD_GENERATION_ONLY'), 'old generation must not replace new state')
+  } finally { await act(async () => c.root.unmount()); c.el.remove(); teardownMockFetch() }
+})
