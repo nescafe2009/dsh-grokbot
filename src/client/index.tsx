@@ -1125,8 +1125,10 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
         // retryMode 仅在「查询原结果」时携带；「重新执行」复用原载荷但生成新 ID 走执行路径
         body: JSON.stringify({ text, requestId, ...(taskForSend ? { taskId: taskForSend } : {}), ...(opts?.retryMode ? { retryMode: opts.retryMode } : {}) }),
       })
-      if (sendGen !== botGenRef.current) return // 迟到结果：新轮已发起（含切回同会话的第二轮），丢弃
-      clearPendingRetry(bot.id, sendSeq) // POST 成功即结算水印——不等历史刷新（refetchHistory 窗口内旧失败不得占槽）
+      // 结算必须无条件执行（作用于原会话的 seq 槽，与当前视图无关）：
+      // 切走后到达的成功也要落水印，否则旧迟到失败会合法占据重试槽
+      clearPendingRetry(sendBotId, sendSeq)
+      if (sendGen !== botGenRef.current) return // 迟到结果：新轮已发起（含切回同会话的第二轮），只丢弃 UI 写入
       const activity = (outcome?.activity ?? []) as string[]
       if (activity.length > 0) {
         const counted = activity.reduce<Record<string, number>>((acc, name) => {
@@ -1440,10 +1442,11 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
         method: 'POST',
         body: JSON.stringify({ text, requestId, ...(taskForSend ? { taskId: taskForSend } : {}), ...(opts?.retryMode ? { retryMode: opts.retryMode } : {}) }),
       })
-      if (sendGen !== roomGenRef.current) return // 迟到结果：新轮已发起（含切回同群的第二轮），丢弃
+      // 结算必须无条件执行（作用于原会话的 seq 槽）——切走后到达的成功也要落水印
+      clearPendingRetry(sendRoomId, sendSeq)
+      if (sendGen !== roomGenRef.current) return // 迟到结果：只丢弃 UI 写入
       setMessages(((outcome?.messages ?? []) as RoomMessage[]).slice())
       setDraftTask(null)
-      clearPendingRetry(room.id, sendSeq) // 新成功水印
     } catch (error) {
       // 失败记录始终保存到原会话 store（不丢弃），UI 写入仅当仍是当前代次
       const pending = { conversationId: sendRoomId, requestId, text, taskId: taskForSend, createdAt: isRetry && overrideRequest?.createdAt ? overrideRequest.createdAt : Date.now(), seq: sendSeq }

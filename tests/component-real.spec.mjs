@@ -592,3 +592,149 @@ test('旧失败不覆盖新成功后的重试槽', async () => {
     assert.ok(!retryBtn, `新请求已成功，旧失败不应重新占据重试槽——buttons: ${JSON.stringify(allButtons)}`)
   } finally { await act(async () => c.root.unmount()); c.el.remove(); teardownMockFetch() }
 })
+
+// ===== 14. Codex 探针：切走后到达的新成功也要结算——旧失败不得占槽（DM）=====
+test('Codex: offscreen newer success blocks older failure (DM)', async () => {
+  setupMockFetch(); const c = createContainer(); const a = makeBot('offA'); const b = makeBot('offB')
+  async function send(text) {
+    const ta = c.el.querySelector('textarea')
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text)
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('↑')).click())
+  }
+  try {
+    await render(React.createElement(BotChatView, { bot: a, state: null }), c)
+    await send('OLD')
+    const old = deferredQueue.find(d => d.call.url.includes('/offA/chat'))
+    assert.ok(old, 'OLD POST pending')
+
+    await rerender(React.createElement(BotChatView, { bot: b, state: null }), c)
+    await rerender(React.createElement(BotChatView, { bot: a, state: null }), c)
+    await send('NEW')
+    const newer = deferredQueue.filter(d => d.call.url.includes('/offA/chat'))[1]
+    assert.ok(newer, 'NEW POST pending')
+
+    // 切走：成功/失败都在 B 视图时到达
+    await rerender(React.createElement(BotChatView, { bot: b, state: null }), c)
+    await act(async () => newer.resolve({ ok: true, status: 200, json: async () => ({ reply: 'NEW SUCCESS' }), text: async () => '{}' }))
+    await act(async () => old.reject(new Error('OLD FAILED')))
+
+    await rerender(React.createElement(BotChatView, { bot: a, state: null }), c)
+    assert.ok(![...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('重试')),
+      '切走后到达的新成功也必须结算：旧失败不得占据重试槽')
+  } finally { await act(async () => c.root.unmount()); c.el.remove(); teardownMockFetch() }
+})
+
+// ===== 15. 反方向：切走后新失败先落地、旧成功迟到——不得删除新失败的重试（DM）=====
+test('Codex: offscreen older success must not clear newer failure retry (DM)', async () => {
+  setupMockFetch(); const c = createContainer(); const a = makeBot('off2A'); const b = makeBot('off2B')
+  async function send(text) {
+    const ta = c.el.querySelector('textarea')
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text)
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('↑')).click())
+  }
+  try {
+    await render(React.createElement(BotChatView, { bot: a, state: null }), c)
+    await send('OLD')
+    const old = deferredQueue.find(d => d.call.url.includes('/off2A/chat'))
+    assert.ok(old)
+    await rerender(React.createElement(BotChatView, { bot: b, state: null }), c)
+    await rerender(React.createElement(BotChatView, { bot: a, state: null }), c)
+    await send('NEW')
+    const newer = deferredQueue.filter(d => d.call.url.includes('/off2A/chat'))[1]
+    assert.ok(newer)
+    const newerId = JSON.parse(newer.call.body).requestId
+
+    // 切走：新失败先落地，旧成功迟到
+    await rerender(React.createElement(BotChatView, { bot: b, state: null }), c)
+    await act(async () => newer.reject(new Error('NEW FAILED')))
+    await act(async () => old.resolve({ ok: true, status: 200, json: async () => ({ reply: 'OLD OK' }), text: async () => '{}' }))
+
+    // 切回 A：重试条仍应存在，且属于新请求
+    await rerender(React.createElement(BotChatView, { bot: a, state: null }), c)
+    const retryBtn = [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('重试'))
+    assert.ok(retryBtn, '迟到旧成功不得删除较新失败的重试记录')
+    await act(async () => retryBtn.click())
+    const last = fetchCalls.filter(f => f.url.includes('/off2A/chat')).at(-1)
+    assert.equal(JSON.parse(last.body).requestId, newerId, '重试必须复用新失败的 requestId')
+  } finally { await act(async () => c.root.unmount()); c.el.remove(); teardownMockFetch() }
+})
+
+// ===== 16. 群聊：切走后到达的新成功也要结算——旧失败不得占槽 =====
+test('Codex: offscreen newer success blocks older failure (group)', async () => {
+  setupMockFetch(); const c = createContainer()
+  const bots = [makeBot('cx'), makeBot('cy')]
+  const a = makeConv('offgA', ['cx', 'cy'])
+  async function input(text) {
+    const ta = c.el.querySelector('textarea')
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text)
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+  }
+  try {
+    await render(React.createElement(GroupChatView, { conversation: a, bots }), c)
+    await input('OLD'); await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('↑')).click())
+    const old = deferredQueue.find(d => d.call.url.includes('/offgA/chat'))
+    assert.ok(old)
+
+    await rerender(React.createElement(GroupChatView, { conversation: makeConv('offgB', ['cx', 'cy']), bots }), c)
+    await rerender(React.createElement(GroupChatView, { conversation: a, bots }), c)
+    await input('NEW'); await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('↑')).click())
+    const newer = deferredQueue.filter(d => d.call.url.includes('/offgA/chat'))[1]
+    assert.ok(newer)
+
+    // 切走：新成功 + 旧失败都在 B 群视图时到达
+    await rerender(React.createElement(GroupChatView, { conversation: makeConv('offgB', ['cx', 'cy']), bots }), c)
+    await act(async () => newer.resolve({ ok: true, status: 200, json: async () => ({ messages: [] }), text: async () => '{}' }))
+    await act(async () => old.reject(new Error('OLD FAILED')))
+
+    await rerender(React.createElement(GroupChatView, { conversation: a, bots }), c)
+    assert.ok(![...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('重试')),
+      '群聊：切走后到达的新成功也必须结算，旧失败不得占据重试槽')
+  } finally { await act(async () => c.root.unmount()); c.el.remove(); teardownMockFetch() }
+})
+
+// ===== 17. 群聊反方向：新失败先落地、旧成功迟到——不得删除新失败的重试 =====
+test('Codex: offscreen older success must not clear newer failure retry (group)', async () => {
+  setupMockFetch(); const c = createContainer()
+  const bots = [makeBot('cx'), makeBot('cy')]
+  const a = makeConv('off2gA', ['cx', 'cy'])
+  async function input(text) {
+    const ta = c.el.querySelector('textarea')
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text)
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+  }
+  try {
+    await render(React.createElement(GroupChatView, { conversation: a, bots }), c)
+    await input('OLD'); await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('↑')).click())
+    const old = deferredQueue.find(d => d.call.url.includes('/off2gA/chat'))
+    assert.ok(old)
+    await rerender(React.createElement(GroupChatView, { conversation: makeConv('off2gB', ['cx', 'cy']), bots }), c)
+    await rerender(React.createElement(GroupChatView, { conversation: a, bots }), c)
+    await input('NEW'); await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('↑')).click())
+    const newer = deferredQueue.filter(d => d.call.url.includes('/off2gA/chat'))[1]
+    assert.ok(newer)
+    const newerId = JSON.parse(newer.call.body).requestId
+
+    // 切走：新失败先落地，旧成功迟到
+    await rerender(React.createElement(GroupChatView, { conversation: makeConv('off2gB', ['cx', 'cy']), bots }), c)
+    await act(async () => newer.reject(new Error('NEW FAILED')))
+    await act(async () => old.resolve({ ok: true, status: 200, json: async () => ({ messages: [] }), text: async () => '{}' }))
+
+    // 切回 A 群：重试条仍应存在且属于新请求
+    await rerender(React.createElement(GroupChatView, { conversation: a, bots }), c)
+    const retryBtn = [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('重试'))
+    assert.ok(retryBtn, '群聊：迟到旧成功不得删除较新失败的重试记录')
+    await act(async () => retryBtn.click())
+    const last = fetchCalls.filter(f => f.url.includes('/off2gA/chat')).at(-1)
+    assert.equal(JSON.parse(last.body).requestId, newerId, '群聊重试必须复用新失败的 requestId')
+  } finally { await act(async () => c.root.unmount()); c.el.remove(); teardownMockFetch() }
+})

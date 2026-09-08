@@ -50,11 +50,17 @@ export function allocateSeq(): number {
 }
 
 export function clearPendingRetry(conversationId: string, seq?: number): void {
-  store.delete(conversationId)
-  if (seq !== undefined) {
-    const wm = settledWatermark.get(conversationId) ?? 0
-    settledWatermark.set(conversationId, Math.max(wm, seq))
+  if (seq === undefined) {
+    // 新发送前的预清（无 seq）：此时本次 sendSeq 必然高于一切已有记录，直接清槽且不动水印
+    store.delete(conversationId)
+    return
   }
+  // 成功结算：水印单调提升（此后低于 seq 的旧失败一律拒写）
+  const wm = settledWatermark.get(conversationId) ?? 0
+  settledWatermark.set(conversationId, Math.max(wm, seq))
+  // 迟到旧成功不得删除较新失败已占的槽：仅当槽内记录 seq ≤ 本次成功 seq 才清
+  const existing = store.get(conversationId)
+  if (existing && (existing.seq ?? 0) <= seq) store.delete(conversationId)
 }
 
 export function getPendingRetry(conversationId: string): PendingRetry | null {
