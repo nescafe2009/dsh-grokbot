@@ -5,62 +5,82 @@
 ## 前置条件
 
 - macOS，DSH Desktop.app 已安装（只读引用其 node_modules）
-- 环境变量 `ZAI_API_KEY` 已 export（SDK 支持启动环境变量，见下方认证说明）
+- 环境变量 `ZAI_API_KEY` 已 export（SDK 认证路径见下方）
+- 可选：`TESTED_SHA=<sha>` 显式指定待测版本（不从工作树猜测）
 
-## 认证配置
+## 认证说明（源码核查结论）
 
-DSH `llm-pi-ai` SDK 的 credential 解析顺序（源码 `dsh-llm-pi-ai/lib/index.js:2474`）：
+DSH `llm-pi-ai` SDK 的 credential 解析（`dsh-llm-pi-ai/lib/index.js:2474`）：
 
 ```js
+const credentials = ctx.get("credentials");
 const hit = credentials !== void 0
-  ? (await credentials.resolve(ref))?.value      // ① credentials service（web Models 页写入）
-  : launchEnvironmentOf(ctx).get(ref)?.value    // ② 启动时进程环境变量（process.env）
+  ? (await credentials.resolve(ref))?.value
+  : launchEnvironmentOf(ctx).get(ref)?.value;
 ```
 
-独立 fixture 没有 credentials service 存储，走路径②。
-**所需环境变量名：`ZAI_API_KEY`**（值不含在本仓库中）。
+**注意**：三元表达式判断的是 **credentials 服务是否存在**，不是存储是否有值。
+服务存在但 `resolve(ref)` 未命中时，**不会自动走冒号分支**（环境变量路径）。
+credentials 服务内部是否回退环境变量需引用其 `resolve` 实现——当前未验证。
 
-## 启动
+独立 fixture 中 credentials 服务存在（dsh-base 注册）但 resolve 未命中 → MISSING_CREDENTIAL。
+`ZAI_API_KEY` 环境变量是否被 credentials 服务内部使用取决于其实现，需进一步核查。
+
+## 启动与退出
 
 ```bash
-# 1. 构建 fixture 环境（首次）
+# 1. 构建 fixture（每批唯一目录，输出 FIXTURE_DIR=...）
 ./setup.sh
 
-# 2. 启动独立 harness（本机独立端口，不注册服务）
-ZAI_API_KEY=<your-key> node sample.mjs
-# 采样脚本自带启动和退出（SIGTERM 后自动清理）
+# 2. 采样（传入 fixture 目录 + 认证）
+FIXTURE_DIR=<dir> ZAI_API_KEY=<key> TESTED_SHA=<sha> node sample.mjs
+# 输出: <dir>/paired-results.json
+# 退出: ok → 0; incomplete/failed → 1
+# 生命周期: 统一 try/finally（SIGTERM → 5s → SIGKILL → 确认 exit）
 
-# 3. 退出
-# 采样脚本自动退出（child.kill('SIGTERM')）
+# 3. 清理（仅限有所有权标记的 fixture 目录）
+./cleanup.sh <dir>
 ```
 
-## 预检
+## 认证预检
 
-采样脚本启动后先做认证预检（发送一次直连请求检查 status）：
-- 预检失败（`ZAI_API_KEY` 未设置/无效）→ 脚本以 exit code 1 退出，不记录任何成功时延
-- 预检通过 → 开始交替顺序配对采样
+采样前执行两次预检：
+1. 环境变量 `ZAI_API_KEY` 是否设置（不打印值）
+2. 真实模型调用 `/__perf/direct`，status≠ok → **exit 1 不记任何时延**
 
 ## 配对结果 schema
 
 ```json
 {
-  "commit": "<git SHA>",
-  "timestamp": "<ISO 8601>",
-  "model": "zai/glm-5.3",
+  "commit": "<git SHA 或显式 TESTED_SHA>",
+  "libHash": "<lib/index.mjs SHA-256 前16位>",
+  "overall": "ok | incomplete | failed",
+  "summary": { "total": 0, "ok": 0, "failed": 0, "cancelled": 0, "empty": 0, "blocked": 0 },
   "samples": [
     {
-      "round": 1,              // 第几轮交替
-      "pair": "cold-qa",       // cold-qa | cold-tool | warm-plugin | warm-direct
-      "side": "direct|plugin", // 直连 or 插件
-      "ms": 12345,             // 从请求发起到响应的总耗时
-      "status": "ok|failed|cancelled|empty",
-      "toolCalls": 0,          // 实际工具调用次数
-      "reply": "...",          // 截断的回复文本
-      "error": null             // 失败时的错误信息
+      "round": 1,
+      "pair": "cold-qa | cold-tool | warm-plugin | warm-direct",
+      "side": "direct | plugin",
+      "order": 1,
+      "ms": 12345,
+      "status": "ok | failed | cancelled | empty | blocked | fetch_error",
+      "toolCalls": 0,
+      "toolEvidence": false,
+      "targetMatch": false,
+      "reply": "...",
+      "error": null
     }
   ]
 }
 ```
+
+**判定规则**：`overall=ok` 仅当所有样本 status=ok。任何 failed/cancelled/empty/blocked/fetch_error → incomplete 或 failed。暖直连未实现 → 恒 incomplete。
+
+## 工具证据验证
+
+- 直连侧：`toolCalls > 0`（事件解析真实计数）
+- 插件侧：`activity` 数组含 bash/exec 工具调用 + 回复含目标文本（如 `COLD-TOOL`）
+- 仅回复含文字**不能**证明工具执行——必须两项同时满足
 
 ## 差异披露
 
@@ -73,8 +93,17 @@ ZAI_API_KEY=<your-key> node sample.mjs
 
 "无插件工具"≠"无工具"——直连路径仍有 DSH 自带的 bash/fs 等工具可用。
 
+## 采样设计
+
+| 组 | 方法 |
+|---|---|
+| 冷↔冷 | 每轮交替先后（奇数轮 direct→plugin，偶数轮 plugin→direct） |
+| 暖插件 | 独立 bot 预热 1 次（排除） + 采样 5 次同文本 |
+| 暖直连 | 需 fixture 私有 handle（保留专用 session 多次 followup + finally dispose）——当前未实现，恒 incomplete |
+
 ## 清理
 
 ```bash
-./cleanup.sh  # 删除 /tmp/dsh-perf-fixture 和临时文件
+./cleanup.sh /tmp/dsh-perf-fixture-<run-id>
+# 仅删除有 .dsh-perf-fixture-owner 标记且名称匹配 dsh-perf-fixture-* 的目录
 ```
