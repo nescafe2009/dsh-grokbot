@@ -26,14 +26,14 @@ for want in package.json lib/index.mjs lib/client.js cordis.patch.yml LICENSE RE
   echo "$TAR_LIST" | grep -qx "package/$want" || { echo "MISSING IN TGZ: $want"; exit 1; }
 done
 
-# 4. 私人内容扫描：解包后 grep 机器特定绝对路径（任意用户名）/ 凭据痕迹。
-#    注意：文档中说明状态目录名（.dsh-grokbot）不属私人内容，不做字面匹配
+# 4. 私人内容扫描：机器特定绝对路径（任意用户名）与凭据痕迹。
+#    /home/bot/ 是共享电脑特性的产品常量（VM 内路径），非私人内容
 EXTRACT="$WORK/extract"
 mkdir -p "$EXTRACT"
 tar -xzf "$TGZ" -C "$EXTRACT"
-if grep -rn --exclude-dir=node_modules -E "/Users/[a-z]|/home/[a-z]|ZAI_API|sk-[A-Za-z0-9]{8}" "$EXTRACT" >/dev/null 2>&1; then
+if grep -rn --exclude-dir=node_modules -E "/Users/[a-z]|/home/[a-z]|ZAI_API|sk-[A-Za-z0-9]{8}" "$EXTRACT" 2>/dev/null | grep -v "/home/bot/" >/dev/null; then
   echo "PRIVATE CONTENT DETECTED:"
-  grep -rln --exclude-dir=node_modules -E "/Users/[a-z]|/home/[a-z]|ZAI_API|sk-[A-Za-z0-9]{8}" "$EXTRACT" | head -5
+  grep -rn --exclude-dir=node_modules -E "/Users/[a-z]|/home/[a-z]|ZAI_API|sk-[A-Za-z0-9]{8}" "$EXTRACT" 2>/dev/null | grep -v "/home/bot/" | head -5
   exit 1
 fi
 
