@@ -214,7 +214,7 @@ async function main() {
     const order = alternatingOrder(i + 4)
     for (const side of order) {
       if (side === 'direct') {
-        const d = await api('/__perf/direct', { text: TOOL })
+        const d = await api('/__perf/direct', { text: TOOL, evidenceMarker: 'COLD-TOOL' })
         // 工具证据：真实 shell 工具标识（toolCalls 计数本身不构成 bash 证据）
         const hasTools = bashToolEvidence(d)
         // 直连执行目标证据：实际工具结果包含 COLD-TOOL（口头复述/字节数不算）
@@ -226,7 +226,7 @@ async function main() {
         console.log(`  ${i}D: ${s.ms}ms tools=${d.toolCalls} evidence=${hasTools} status=${s.status}`)
       } else {
         const bid = await mkBot(`工具${i}`)
-        const p = await api(`/conversations/${bid}/chat`, { text: TOOL })
+        const p = await api(`/conversations/${bid}/chat`, { text: TOOL, evidenceMarker: 'COLD-TOOL' })
         // 插件工具证据：outcome.activity 真实 shell 标识
         const hasTools = hasPluginToolEvidence(p)
         const replyText = (p.reply || '').trim()

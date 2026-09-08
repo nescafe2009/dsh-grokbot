@@ -1,45 +1,52 @@
 // 效率证据标准回归——真实路由（lib/index.mjs：/api-chat 与 __perf/direct）+ 生产函数
-// （perf-fixture/evidence.mjs，与采样 fixture 同源），不复制表达式。
-// 覆盖：真实执行 / 口头复述 / 错误输出 / read_file-only / 失败回合——插件与直连同标准。
+// （perf-fixture/evidence.mjs ←→ src/index.mjs shellExecutionEvidence，双侧共用，不复制表达式）。
+// 覆盖（含 Codex 混合工具探针）：真实执行 / 口头复述 / 错误输出 / read_file-only /
+// 混合工具（bash 输错 + read_file 含标记）/ 孤立结果 / 错误结果复述 / not_bash 精确名单 /
+// 失败回合 / 默认 chat 不附原始工具文本（evidence 仅显式 evidenceMarker 才有）。
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdtemp, mkdir, rm } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { bashToolEvidence, targetEvidence } from '../perf-fixture/evidence.mjs'
+import { bashToolEvidence, targetEvidence, SHELL_TOOL_NAMES } from '../perf-fixture/evidence.mjs'
+import { shellExecutionEvidence } from '../src/index.mjs'
 
 const API_ROOT = '/api/plugins/grokbot'
 const HOST_TOKEN = 'evidence-harness-token'
 const MARKER = 'COLD-TOOL'
 
-// 场景 → mock agent 事件流（真实 summarizeTurn/activityOf/toolResultTexts 解析）
-// #EXEC 真实执行（bash + 结果含标记，回复不复述标记）
-// #ECHO 口头复述（无工具，回复含标记）
-// #WRONG 工具跑了但输出不含标记
-// #READFILE read_file-only（工具结果也不含标记）
-// #FAIL 回合报错
-function eventsFor(text) {
-  const reply = text.includes('#EXEC') ? '已执行完成' : (text.includes(MARKER) ? `输出是 ${MARKER}-173` : '收到')
-  const ev = []
-  if (text.includes('#EXEC')) {
-    ev.push({ type: 'tool/call', data: { name: 'bash' } })
-    ev.push({ type: 'tool/result', data: { message: { content: [{ type: 'text', text: `${MARKER}-173\n` }] } } })
-  } else if (text.includes('#WRONG')) {
-    ev.push({ type: 'tool/call', data: { name: 'bash' } })
-    ev.push({ type: 'tool/result', data: { message: { content: [{ type: 'text', text: 'unrelated output' }] } } })
-  } else if (text.includes('#READFILE')) {
-    ev.push({ type: 'tool/call', data: { name: 'read_file' } })
-    ev.push({ type: 'tool/result', data: { message: { content: [{ type: 'text', text: 'file content here' }] } } })
-  }
-  ev.push({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: reply }] } } })
-  ev.push({ type: 'turn/end', data: text.includes('#FAIL') ? { reason: { kind: 'error', error: { message: 'model exploded' } } } : { reason: { kind: 'completed' } } })
-  return { ev, reply }
+// 宿主实际事件形状（dsh-agent-loop）：tool/call {callId,name}；
+// tool/result {message:{source:{callId},content:[{type:'tool-result',toolCallId,content,isError}]},error?}
+function call(callId, name) {
+  return { type: 'tool/call', data: { callId, name, arguments: {} } }
+}
+function result(callId, content, isError = false) {
+  return { type: 'tool/result', data: { message: { source: { kind: 'tool', callId }, content: [{ type: 'tool-result', toolCallId: callId, content, isError }] } } }
+}
+function assistant(reply) {
+  return { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: reply }] } } }
+}
+function turnEnd(kind = 'completed', message) {
+  return { type: 'turn/end', data: { reason: kind === 'error' ? { kind: 'error', error: { message: message ?? 'model exploded' } } : { kind } } }
+}
+
+// 场景 → 事件流
+const SCENARIOS = {
+  EXEC: () => [call('c1', 'bash'), result('c1', `${MARKER}-173\n`), assistant('已执行完成'), turnEnd()],
+  ECHO: () => [assistant(`输出是 ${MARKER}-173`), turnEnd()], // 口头复述，无工具
+  WRONG: () => [call('c1', 'bash'), result('c1', 'unrelated output'), assistant('完成'), turnEnd()],
+  MIXED: () => [call('c1', 'bash'), call('c2', 'read_file'), result('c1', 'wrong shell output'), result('c2', `${MARKER}-173`), assistant('完成'), turnEnd()], // Codex 探针
+  READFILE: () => [call('c2', 'read_file'), result('c2', 'file content'), assistant('完成'), turnEnd()],
+  ISOLATED: () => [call('c1', 'bash'), result('cX', `${MARKER}-173`), assistant('完成'), turnEnd()], // 孤立结果（无对应 call）
+  ERRORED: () => [call('c1', 'bash'), result('c1', `${MARKER}-173`, true), assistant('完成'), turnEnd()], // 错误结果复述标记
+  NOTBASH: () => [call('c3', 'not_bash'), result('c3', `${MARKER}-173`), assistant('完成'), turnEnd()], // /bash/i 泛化回归
+  FAIL: () => [assistant('x'), turnEnd('error')],
 }
 
 async function startInstance() {
   const { default: plugin } = await import('../lib/index.mjs')
-  const stateDir = await mkdtemp(join(tmpdir(), 'evd-'))
+  const stateDir = await mkdtemp(join(tmpdir(), 'evd2-'))
   const disposers = []
   const handlers = []
   const ctx = {
@@ -57,7 +64,8 @@ async function startInstance() {
             whenIdle: async () => {},
             followup(msg) {
               const text = String(msg?.content?.[0]?.text ?? '')
-              for (const e of eventsFor(text).ev) events.push({ seq: seq++, ...e })
+              const key = /#(\w+)/.exec(text)?.[1] ?? 'ECHO'
+              for (const e of (SCENARIOS[key] ?? SCENARIOS.ECHO)()) events.push({ seq: seq++, ...e })
             },
             cancel() {},
           },
@@ -97,63 +105,64 @@ async function startInstance() {
   }
 }
 
-test('真实路由：执行证据标准——插件与直连同源（真实执行/口头复述/错误输出/read_file/失败）', async () => {
+// 双侧同标准矩阵：[场景, 期望 shellOk(bashToolEvidence), 期望 targetMatch(targetEvidence)]
+const MATRIX = [
+  ['EXEC', true, true],
+  ['ECHO', false, false],
+  ['WRONG', true, false],
+  ['MIXED', true, false], // bash 真跑了（shellOk）但其输出无标记；read_file 含标记不算
+  ['READFILE', false, false],
+  ['ISOLATED', true, false], // bash 确被调用（activity 真）；其结果无法关联 call → 目标拒绝
+  ['ERRORED', true, false], // bash 确被调用；结果为错误（复述标记）→ 目标拒绝（非成功结果）
+  ['NOTBASH', false, false], // 显式名单精确匹配：not_bash 不算
+  ['FAIL', false, false],
+]
+
+test('真实路由：callId 关联的 shell 成功结果证据——插件与直连同源同标准', async () => {
   const inst = await startInstance()
   try {
-    // ===== 直连侧（__perf/direct，真实路由响应携带 activity/toolResults）=====
-    const direct = async (text) => (await (await inst.api('/__perf/direct', {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text }),
-    })).json())
+    for (const [key, wantBash, wantTarget] of MATRIX) {
+      // 直连侧（真实 __perf/direct 路由，响应携带 activity + evidence 生产判定）
+      const d = await (await inst.api('/__perf/direct', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text: `#${key} 用 bash echo ${MARKER}`, evidenceMarker: MARKER }),
+      })).json()
+      assert.equal(bashToolEvidence(d), wantBash, `direct ${key}: bashToolEvidence 期望 ${wantBash}`)
+      assert.equal(targetEvidence(d, MARKER), wantTarget, `direct ${key}: targetEvidence 期望 ${wantTarget}`)
+      assert.ok(!('toolResults' in d), `direct ${key}: 不附原始工具文本`)
+      // 插件侧（真实 chat 路由 + evidenceMarker 显式请求）
+      const p = await (await inst.api('/conversations/chief/chat', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text: `#${key} 用 bash echo ${MARKER}`, requestId: `evd-${key}-${Math.random().toString(36).slice(2)}`, evidenceMarker: MARKER }),
+      })).json()
+      assert.equal(bashToolEvidence(p.outcome), wantBash, `plugin ${key}: bashToolEvidence 期望 ${wantBash}`)
+      assert.equal(targetEvidence(p.outcome, MARKER), wantTarget, `plugin ${key}: targetEvidence 期望 ${wantTarget}`)
+      assert.ok(!('toolResults' in p.outcome), `plugin ${key}: 不附原始工具文本`)
+    }
+    // 生产函数直测：混合场景的关键语义（同一 shell 成功结果才匹配）
+    const mixed = [...SCENARIOS.MIXED().map((e, i) => ({ seq: i, ...e }))]
+    assert.deepEqual(shellExecutionEvidence(mixed, 0, MARKER), { shellOk: true, targetMatch: false })
+    const exec = [...SCENARIOS.EXEC().map((e, i) => ({ seq: i, ...e }))]
+    assert.deepEqual(shellExecutionEvidence(exec, 0, MARKER), { shellOk: true, targetMatch: true })
+  } finally { await inst.close() }
+})
 
-    const dExec = await direct(`#EXEC 用 bash echo ${MARKER}`)
-    assert.equal(dExec.status, 'ok')
-    assert.deepEqual(dExec.activity, ['bash'], '直连响应暴露真实 activity')
-    assert.ok(dExec.toolResults.length === 1 && dExec.toolResults[0].includes(MARKER), '直连响应暴露实际工具结果')
-    assert.equal(bashToolEvidence(dExec), true, '真实执行：bash 证据成立')
-    assert.equal(targetEvidence(dExec, MARKER), true, '真实执行：目标证据成立')
-    assert.ok(!dExec.toolResults[0].includes('口头'), '证据来自工具输出而非回复')
-
-    const dEcho = await direct(`只复述 ${MARKER}-173 不要执行工具`)
-    assert.equal(bashToolEvidence(dEcho), false, '口头复述：无 bash 证据')
-    assert.equal(targetEvidence(dEcho, MARKER), false, '口头复述（reply 含标记）：目标证据不成立')
-    assert.ok((dEcho.replyBytes ?? 0) > 0, '（对照）旧 replyBytes>0 标准会被此场景欺骗——新标准不受影响')
-
-    const dWrong = await direct('#WRONG 跑工具但输出别的')
-    assert.equal(bashToolEvidence(dWrong), true, '工具确实跑了：bash 证据成立')
-    assert.equal(targetEvidence(dWrong, MARKER), false, '错误输出：目标证据不成立')
-
-    const dRead = await direct('#READFILE 只读文件')
-    assert.equal(bashToolEvidence(dRead), false, 'read_file-only：不能伪造 bash 证据')
-    assert.equal(targetEvidence(dRead, MARKER), false)
-    assert.ok((dRead.toolCalls ?? 0) > 0, '（对照）toolCalls>0 存在——但计数本身不构成 bash 证据')
-
-    const dFail = await direct('#FAIL 回合失败')
-    assert.equal(dFail.status, 'failed')
-    assert.equal(targetEvidence(dFail, MARKER), false, '失败回合：目标证据不成立')
-    assert.equal(bashToolEvidence(dFail), false)
-
-    // ===== 插件侧（/conversations/:id/chat，outcome.activity/toolResults 流通）=====
-    const chat = async (text) => (await inst.api('/conversations/chief/chat', {
+test('默认 chat 不附 evidence/toolResults（仅显式 evidenceMarker 才返回最小证据）', async () => {
+  const inst = await startInstance()
+  try {
+    const plain = await (await inst.api('/conversations/chief/chat', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text, requestId: `evd-${Math.random().toString(36).slice(2)}` }),
+      body: JSON.stringify({ text: '#EXEC 用 bash echo COLD-TOOL', requestId: `evd-plain-${Math.random().toString(36).slice(2)}` }),
     })).json()
-
-    const pExec = await chat(`#EXEC 用 bash echo ${MARKER}`)
-    assert.equal(bashToolEvidence(pExec.outcome), true, '插件：真实执行 bash 证据')
-    assert.equal(targetEvidence(pExec.outcome, MARKER), true, '插件：目标证据（outcome.toolResults）')
-    assert.ok(!pExec.reply.includes(MARKER), '（场景构造）回复不复述标记——证据只可能来自工具结果')
-
-    const pEcho = await chat(`只复述 ${MARKER}-173 不要执行工具`)
-    assert.ok(pEcho.reply.includes(MARKER), '（场景构造）回复确实复述了标记')
-    assert.equal(bashToolEvidence(pEcho.outcome), false, '插件：口头复述无 bash 证据')
-    assert.equal(targetEvidence(pEcho.outcome, MARKER), false, '插件：口头复述目标证据不成立')
-
-    const pWrong = await chat('#WRONG 跑工具但输出别的')
-    assert.equal(bashToolEvidence(pWrong.outcome), true)
-    assert.equal(targetEvidence(pWrong.outcome, MARKER), false, '插件：错误输出不成立')
-
-    const pRead = await chat('#READFILE 只读文件')
-    assert.equal(bashToolEvidence(pRead.outcome), false, '插件：read_file-only 不能伪造 bash')
-    assert.equal(targetEvidence(pRead.outcome, MARKER), false)
+    assert.ok(!('evidence' in plain.outcome), '默认 chat 不附 evidence')
+    assert.ok(!('toolResults' in plain.outcome), '默认 chat 不附原始工具文本')
+    assert.ok(Array.isArray(plain.outcome.activity), 'activity 照常（工具名，非原文）')
+    // 直连不带 marker：targetMatch 恒 false（未声明验证目标），shellOk 仍按事件
+    const d = await (await inst.api('/__perf/direct', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: '#EXEC 用 bash echo COLD-TOOL' }),
+    })).json()
+    assert.equal(d.evidence.shellOk, true)
+    assert.equal(d.evidence.targetMatch, false, '无 evidenceMarker：不验证目标')
   } finally { await inst.close() }
 })

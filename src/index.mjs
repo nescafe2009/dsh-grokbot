@@ -95,18 +95,43 @@ export function activityOf(events, firstSeq) {
 }
 
 /**
- * 工具结果文本（tool/result 事件的 message.content 文本块，截断）。
- * 效率配对的"执行目标证据"以此为准：真实工具输出 ≠ 口头复述/回复字节数。
+ * shell 工具执行证据（效率配对的判定基础）。
+ * 关联规则（按宿主 dsh-agent-loop 实际事件形状）：tool/call 携带 callId+name；
+ * tool/result 的 callId 在 message.source.callId / content[].toolCallId，isError 在块上。
+ * - shellOk：同一 callId 关联的【显式名单内 shell 工具】的【成功】结果存在
+ * - targetMatch：该同一 shell 成功结果文本包含 marker（口头复述/其他工具结果/错误结果/孤立结果均不成立）
+ * 默认 chat 不附原始工具文本——本函数只产出最小有界布尔证据。
  */
-export function toolResultTexts(events, firstSeq, maxChars = 200) {
-  const texts = []
+export const SHELL_TOOL_NAMES = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh', 'shell'])
+
+export function shellExecutionEvidence(events, firstSeq, marker = '') {
+  const callNameById = new Map()
+  for (const event of events) {
+    if (event.seq < firstSeq) continue
+    if (event.type !== 'tool/call') continue
+    const id = event.data?.callId
+    if (id != null) callNameById.set(String(id), String(event.data?.name ?? ''))
+  }
+  let shellOk = false
+  let targetMatch = false
   for (const event of events) {
     if (event.seq < firstSeq) continue
     if (event.type !== 'tool/result') continue
-    const joined = contentText(event.data?.message?.content)
-    if (joined) texts.push(joined.slice(0, maxChars))
+    if (event.data?.error) continue // 错误结果不构成成功执行
+    const blocks = Array.isArray(event.data?.message?.content) ? event.data.message.content : []
+    for (const block of blocks) {
+      if (block?.type !== 'tool-result') continue
+      if (block.isError) continue
+      const id = block.toolCallId ?? event.data?.message?.source?.callId
+      if (id == null) continue // 孤立结果（无可关联 call）：拒绝
+      const name = callNameById.get(String(id))
+      if (name == null || !SHELL_TOOL_NAMES.has(name)) continue // 其他工具的结果不匹配 shell 证据
+      shellOk = true
+      const text = typeof block.content === 'string' ? block.content : contentText(block.content)
+      if (marker && text.includes(marker)) targetMatch = true
+    }
   }
-  return texts
+  return { shellOk, targetMatch }
 }
 
 export function apply(ctx, config = {}) {
@@ -1396,7 +1421,7 @@ export function apply(ctx, config = {}) {
   }
 
 
-  async function chatTurn(bot, text, { preamble = '', conversationId = null, writeDm = true, taskId = null, taskOrigin = 'continue', taskNote = '', existingRunId = null } = {}) {
+  async function chatTurn(bot, text, { preamble = '', conversationId = null, writeDm = true, taskId = null, taskOrigin = 'continue', taskNote = '', existingRunId = null, evidenceMarker = '' } = {}) {
     // 会话按 (conversationId, botId) 隔离；人格与长期记忆按 bot 共享（#3 A1）
     const convKey = conversationId ? `${conversationId}:${bot.id}` : `${bot.id}:${bot.id}`
     // R2-A 执行前共享校验：任务存在 + 会话归属（失败不启动 run/模型/文件动作）
@@ -1470,7 +1495,8 @@ export function apply(ctx, config = {}) {
         outcome = {
           ...summarizeTurn(session.handle.agent.session.events, firstSeq),
           activity: activityOf(session.handle.agent.session.events, firstSeq),
-          toolResults: toolResultTexts(session.handle.agent.session.events, firstSeq),
+          // 证据最小化：仅显式测试/采样（evidenceMarker）返回有界布尔证据；默认不附原始工具文本
+          ...(evidenceMarker ? { evidence: shellExecutionEvidence(session.handle.agent.session.events, firstSeq, evidenceMarker) } : {}),
         }
         const turnText = outcome.text?.trim()
         failed = Boolean(outcome.error) || !turnText
@@ -1548,11 +1574,11 @@ export function apply(ctx, config = {}) {
 
   const HANDOFF_LINE_RE = /^@([\w\u4e00-\u9fa5]+)[：:\s]+(.+)$/
 
-  async function conversationTurn(conversation, senderText, { mentionTarget, taskId = null } = {}) {
+  async function conversationTurn(conversation, senderText, { mentionTarget, taskId = null, evidenceMarker = '' } = {}) {
     if (conversation.memberBotIds.length === 1) {
       const bot = crewState.crew.bots.find((entry) => entry.id === conversation.memberBotIds[0])
       if (!bot) throw new Error('会话成员不存在')
-      const outcome = await chatTurn(bot, senderText, { conversationId: conversation.id, writeDm: true, taskId, taskOrigin: taskId ? 'continue' : 'user' })
+      const outcome = await chatTurn(bot, senderText, { conversationId: conversation.id, writeDm: true, taskId, taskOrigin: taskId ? 'continue' : 'user', ...(evidenceMarker ? { evidenceMarker } : {}) })
       return { responder: bot, reply: outcome.text?.trim() || `[${bot.name} 未能给出文本回复]`, handoffTo: null, outcome }
     }
     const members = conversation.memberBotIds
@@ -1592,7 +1618,7 @@ export function apply(ctx, config = {}) {
       '\n你现在在群聊中应答。你能看到上方队友的最近发言和交接——可以接着他们的进度干活（共享电脑里的文件直接读），不要重复已完成的步骤。',
       '若你认为某条工作应由其他成员处理，在回复的最后一行单独写「@成员名 交代内容」，系统会异步转交；不要除此行外提交接。',
     ].filter(Boolean).join('\n')
-    const outcome = await chatTurn(responder, senderText, { preamble, conversationId: conversation.id, writeDm: false, taskId, taskOrigin: taskId ? 'continue' : 'user' })
+    const outcome = await chatTurn(responder, senderText, { preamble, conversationId: conversation.id, writeDm: false, taskId, taskOrigin: taskId ? 'continue' : 'user', ...(evidenceMarker ? { evidenceMarker } : {}) })
     let reply = outcome.text?.trim() || `[${responder.name} 未能给出文本回复：${outcome.error || outcome.stopReason}]`
     if (outcome.cancelled) {
       // 取消终态：部分文本明确标记未完成 + 群内持久取消通知（群路径 writeDm=false，DM 通知不适用）
@@ -2379,14 +2405,14 @@ export function apply(ctx, config = {}) {
             const events = handle.agent.session.events
             const turn = summarizeTurn(events, firstSeq)
             const activity = activityOf(events, firstSeq)
-            const toolResults = toolResultTexts(events, firstSeq)
+            const evidence = shellExecutionEvidence(events, firstSeq, String(body?.evidenceMarker ?? ''))
             const toolCalls = (activity ?? []).length
             const reply = turn?.text?.trim() ?? ''
             const turnError = turn?.error ?? null
             const status = turnError ? 'failed' : (reply ? 'ok' : 'empty')
             logPerf({ kind: 'dsh-direct', conversationId: '__perf__', ms, toolCalls, status, replyBytes: reply.length, model: sel ? `${sel.provider}/${sel.model}` : null, error: turnError })
             // activity/toolResults：执行证据（工具名 + 实际输出）——与插件侧同标准
-            respond(res, 200, { ms, sessionId, status, toolCalls, activity, toolResults, replyBytes: reply.length, error: turnError }); return
+            respond(res, 200, { ms, sessionId, status, toolCalls, activity, evidence, replyBytes: reply.length, error: turnError }); return
           } catch (error) {
             logPerf({ kind: 'dsh-direct-error', ms: Date.now() - t0, error: safeError(error) })
             throw new HttpError(500, safeError(error))
@@ -2775,7 +2801,7 @@ export function apply(ctx, config = {}) {
               const wanted = String(body.mentions[0])
               mentionTarget = eligibleBots(conversation).find((bot) => bot.id === wanted) ?? null
             }
-            const result = await conversationTurn(conversation, text, { mentionTarget, taskId: bodyTaskId })
+            const result = await conversationTurn(conversation, text, { mentionTarget, taskId: bodyTaskId, ...(String(body?.evidenceMarker || '')) ? { evidenceMarker: String(body.evidenceMarker) } : {} })
               return {
                 responder: publicBot(result.responder),
                 reply: result.reply,
