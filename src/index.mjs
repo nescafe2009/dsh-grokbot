@@ -134,6 +134,12 @@ export function shellExecutionEvidence(events, firstSeq, marker = '') {
   return { shellOk, targetMatch }
 }
 
+/** 宿主 stopReason 的取消语义（turn/end reason.kind 如 aborted/cancelled）——部分文本也不算 ok */
+export function isCancelStopReason(stopReason) {
+  const v = String(stopReason ?? '')
+  return /abort|cancel/i.test(v)
+}
+
 export function apply(ctx, config = {}) {
   const stateDir = resolve(String(config.stateDir || join(process.cwd(), '.dsh-grokbot')))
   const inboxRoot = resolve(String(config.inboxDir || join(stateDir, 'inbox')))
@@ -1524,7 +1530,7 @@ export function apply(ctx, config = {}) {
         }
         const turnText = outcome.text?.trim()
         failed = Boolean(outcome.error) || !turnText
-        cancelled = runRef ? cancelledRunIds.has(runRef.id) : false
+        cancelled = (runRef ? cancelledRunIds.has(runRef.id) : false) || isCancelStopReason(outcome.stopReason)
         if (cancelled) outcome.cancelled = true
         if (turnText && writeDm) {
           await appendDm(bot.id, { role: 'bot', text: turnText, activity: outcome.activity }).catch(() => undefined)
@@ -2433,10 +2439,11 @@ export function apply(ctx, config = {}) {
             const toolCalls = (activity ?? []).length
             const reply = turn?.text?.trim() ?? ''
             const turnError = turn?.error ?? null
-            const status = turnError ? 'failed' : (reply ? 'ok' : 'empty')
+            const cancelled = isCancelStopReason(turn?.stopReason)
+            const status = cancelled ? 'cancelled' : (turnError ? 'failed' : (reply ? 'ok' : 'empty'))
             logPerf({ kind: 'dsh-direct', conversationId: '__perf__', ms, toolCalls, status, replyBytes: reply.length, model: sel ? `${sel.provider}/${sel.model}` : null, error: turnError })
-            // activity/toolResults：执行证据（工具名 + 实际输出）——与插件侧同标准
-            respond(res, 200, { ms, sessionId, status, toolCalls, activity, evidence, replyBytes: reply.length, error: turnError, model: sel ? `${sel.provider}/${sel.model}` : null }); return
+            // activity/toolResults：执行证据（工具名 + 实际输出）——与插件侧同标准；取消即使有部分文本也非 ok
+            respond(res, 200, { ms, sessionId, status, cancelled, toolCalls, activity, evidence, replyBytes: reply.length, error: turnError, model: sel ? `${sel.provider}/${sel.model}` : null }); return
           } catch (error) {
             logPerf({ kind: 'dsh-direct-error', ms: Date.now() - t0, error: safeError(error) })
             throw new HttpError(500, safeError(error))
@@ -2496,7 +2503,8 @@ export function apply(ctx, config = {}) {
             await handle.agent.whenIdle()
             if (st.terminal) { await releaseOnce('terminal'); return }
             const turn = summarizeTurn(handle.agent.session.events, firstSeq)
-            return { handle, warmupMs: Date.now() - t0, warmupStatus: turn?.error ? 'failed' : (turn?.text?.trim() ? 'ok' : 'empty'), model: sel ? `${sel.provider}/${sel.model}` : null }
+            const cancelled = isCancelStopReason(turn?.stopReason)
+            return { handle, warmupMs: Date.now() - t0, warmupStatus: cancelled ? 'cancelled' : (turn?.error ? 'failed' : (turn?.text?.trim() ? 'ok' : 'empty')), model: sel ? `${sel.provider}/${sel.model}` : null }
           })()
           // work 自身异常（create 失败后的步骤：whenIdle/followup 抛错）：已取得 handle 也必须清理
           work.catch(() => { st.terminal = true; void releaseOnce('work-error') })
@@ -2566,11 +2574,12 @@ export function apply(ctx, config = {}) {
             const evidence = shellExecutionEvidence(events, firstSeq, evidenceMarker)
             const reply = turn?.text?.trim() ?? ''
             const turnError = turn?.error ?? null
-            const status = turnError ? 'failed' : (reply ? 'ok' : 'empty')
+            const cancelled = isCancelStopReason(turn?.stopReason)
+            const status = cancelled ? 'cancelled' : (turnError ? 'failed' : (reply ? 'ok' : 'empty'))
             entry.turns += 1
             const ms = Date.now() - t0
             logPerf({ kind: 'dsh-warm-turn', conversationId: '__perf__', ms, toolCalls: activity.length, status, replyBytes: reply.length, warm: true, turn: entry.turns, error: turnError })
-            respond(res, 200, { ms, sessionId: entry.sessionId, status, toolCalls: activity.length, activity, evidence, replyBytes: reply.length, error: turnError, warm: true, turn: entry.turns, model: entry.model ?? null }); return
+            respond(res, 200, { ms, sessionId: entry.sessionId, status, cancelled, toolCalls: activity.length, activity, evidence, replyBytes: reply.length, error: turnError, warm: true, turn: entry.turns, model: entry.model ?? null }); return
           } catch (error) {
             // 单轮超时/执行异常：释放 handle（下次访问按不存在处理，不复活）
             await disposeWarmHandle(handleId, 'turn-error')
@@ -2965,7 +2974,7 @@ export function apply(ctx, config = {}) {
               const wanted = String(body.mentions[0])
               mentionTarget = eligibleBots(conversation).find((bot) => bot.id === wanted) ?? null
             }
-            const result = await conversationTurn(conversation, text, { mentionTarget, taskId: bodyTaskId, ...(String(body?.evidenceMarker || '')) ? { evidenceMarker: String(body.evidenceMarker) } : {} })
+            const result = await conversationTurn(conversation, text, { mentionTarget, taskId: bodyTaskId, ...(testEndpointsOn && String(body?.evidenceMarker || '')) ? { evidenceMarker: String(body.evidenceMarker) } : {} })
               return {
                 responder: publicBot(result.responder),
                 reply: result.reply,

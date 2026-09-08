@@ -24,7 +24,7 @@ function makeRecordingAgents() {
     if (opts.createDelayMs) await new Promise((r) => setTimeout(r, opts.createDelayMs))
     calls.creates += 1
     const sessionId = String(base.sessionId ?? `sess-${calls.creates}`)
-    const rec = { followups: 0, slowMs: 0, throwOnce: false, throwFollowupOnce: false, throwIdleOnce: 0, idleGate: null }
+    const rec = { followups: 0, slowMs: 0, throwOnce: false, throwFollowupOnce: false, throwIdleOnce: 0, idleGate: null, abortStyle: false }
     bySession.set(sessionId, rec)
     const patch = pendingPatches.get(sessionId) ?? pendingNext.shift()
     if (pendingPatches.has(sessionId)) pendingPatches.delete(sessionId)
@@ -51,7 +51,8 @@ function makeRecordingAgents() {
             events.push({ seq: seq++, type: 'tool/result', data: { message: { source: { kind: 'tool', callId: 'c1' }, content: [{ type: 'tool-result', toolCallId: 'c1', content: 'COLD-TOOL-1\n', isError: false }] } } })
           }
           events.push({ seq: seq++, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: reply }] } } })
-          events.push({ seq: seq++, type: 'turn/end', data: { reason: { kind: 'completed' } } })
+          // abortStyle：aborted stopReason + 部分文本（取消契约场景）
+          events.push({ seq: seq++, type: 'turn/end', data: { reason: rec.abortStyle ? { kind: 'aborted' } : { kind: 'completed' } } })
         },
         cancel() {},
       },
@@ -359,4 +360,80 @@ test('opening 统一持有：work 异常清理 / 终止后不预热 / 永久 gat
       assert.equal(inst.agents.calls.disposes, 1, 'gate 未放行已释放')
     } finally { releaseGate?.(); await inst.close() }
   }
+})
+
+test('真实路由契约：stopReason 取消透传（部分文本非 ok）/ 实际模型参数 / chat marker 二重门控', async () => {
+  const { default: plugin } = await import('../lib/index.mjs')
+  const { mkdtemp, rm: rmDir } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const bootInstance = async (testEndpoints, selection) => {
+    const stateDir = await mkdtemp(join(tmpdir(), 'warmc-'))
+    const agents = makeRecordingAgents()
+    // 场景注入：followup 产生「部分文本 + aborted stopReason」
+    agents.patchNextCreate({ abortStyle: true })
+    const disposers = []
+    const handlers = []
+    const ctx = {
+      effect(fn) { const d = fn(); if (typeof d === 'function') disposers.push(d) },
+      on() { return () => {} },
+      logger: { info() {}, warn() {}, error() {} },
+      webServer: { register(route) { handlers.push(route); return () => {} } },
+      agents,
+      agentDefaultModel: { currentSelection: () => selection ?? null },
+      llm: { listProviders: async () => [], listModels: async () => [] },
+    }
+    plugin.apply(ctx, { stateDir, testEndpoints })
+    const server = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+      if (!url.pathname.startsWith(API_ROOT) || url.searchParams.get('token') !== HOST_TOKEN) { res.writeHead(401); res.end(); return }
+      void handlers[0].handler(req, res)
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const base = `http://127.0.0.1:${server.address().port}${API_ROOT}`
+    const deadline = Date.now() + 8000
+    for (;;) { try { if ((await fetch(`${base}/health?token=${HOST_TOKEN}`)).ok) break } catch {} if (Date.now() > deadline) throw new Error('就绪超时'); await new Promise((r) => setTimeout(r, 100)) }
+    const api = async (path, body) => (await fetch(`${base}${path}?token=${HOST_TOKEN}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body ?? {}) })).json()
+    return { api, agents, close: async () => { for (const d2 of disposers.splice(0).reverse()) { try { await d2() } catch {} }; try { server.closeAllConnections?.() } catch {}; await new Promise((r) => server.close(r)); await rmDir(stateDir, { recursive: true, force: true }).catch(() => undefined) } }
+  }
+  try {
+    // 1) 冷直连与 warm open/turn：aborted + 部分文本 → cancelled（非 ok）
+    const inst = await bootInstance(true, { provider: 't', model: 'm' })
+    inst.agents.patchNextCreate({ abortStyle: true }) // 第二个会话 = warm open（其 turn 复用同 session）
+    try {
+      const d = await inst.api('/__perf/direct', { text: 'x' })
+      assert.equal(d.status, 'cancelled', '冷直连：aborted+部分文本 → cancelled')
+      assert.equal(d.cancelled, true)
+      assert.ok(d.replyBytes > 0, '（场景构造）有部分文本')
+      assert.equal(d.model, 't/m', '冷直连：实际模型参数透出（fallback selection）')
+      const open = await inst.api('/__perf/warm/open', {})
+      assert.equal(open.warmupStatus, 'cancelled', 'warm open：预热取消 → cancelled（停组依据）')
+      assert.equal(open.model, 't/m', 'warm open：实际模型参数')
+      const turn = await inst.api('/__perf/warm/turn', { handleId: open.handleId, text: 'y' })
+      assert.equal(turn.status, 'cancelled', 'warm turn：取消透传')
+      assert.equal(turn.cancelled, true)
+      await inst.api('/__perf/warm/close', { handleId: open.handleId })
+    } finally { await inst.close() }
+    // 2) chat outcome：aborted stopReason → outcome.cancelled（部分文本非 ok）+ 模型透出
+    const inst2 = await bootInstance(true, { provider: 't', model: 'm' })
+    try {
+      const chat = await inst2.api('/conversations/chief/chat', { text: 'x', requestId: 'cancel-probe-1' })
+      assert.equal(chat.outcome.cancelled, true, 'chat：stopReason 取消 → outcome.cancelled')
+      assert.ok(chat.reply && chat.reply.length > 0, '（场景构造）部分文本存在')
+      assert.equal(chat.outcome.model, 't/m', 'chat outcome：实际模型参数（selection → session.model）')
+    } finally { await inst2.close() }
+    // 3) chat marker 二重门控：testEndpoints=false → 显式 evidenceMarker 不产生 evidence
+    const inst3 = await bootInstance(false, null)
+    try {
+      const chat = await inst3.api('/conversations/chief/chat', { text: '#TOOLEV 用 bash', requestId: 'gate-probe-1', evidenceMarker: 'COLD-TOOL' })
+      assert.ok(!('evidence' in (chat.outcome ?? {})), '默认关闭：显式 marker 请求也不返回 evidence（二重门控）')
+    } finally { await inst3.close() }
+    // 4) 对照：testEndpoints=true → evidence 存在（同请求）
+    const inst4 = await bootInstance(true, null)
+    try {
+      inst4.agents.patchNextCreate({ abortStyle: false })
+      const chat = await inst4.api('/conversations/chief/chat', { text: '#TOOLEV 用 bash', requestId: 'gate-probe-2', evidenceMarker: 'COLD-TOOL' })
+      assert.ok('evidence' in (chat.outcome ?? {}), '测试模式：evidence 返回（对照）')
+    } finally { await inst4.close() }
+  } finally { /* instances self-closed */ }
 })

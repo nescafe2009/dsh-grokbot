@@ -3,6 +3,7 @@
 // 退出：统一 finally；任何 incomplete/failed → exit 1
 import { spawn, execSync } from 'node:child_process'
 import { runSampling } from './orchestrate.mjs'
+import { makeClient } from './client.mjs'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { realpathSync } from 'node:fs'
@@ -68,37 +69,8 @@ let token = ''
 const results = []
 let overallStatus = 'ok' // ok | incomplete | failed
 
-// 有界 fetch 超时：覆盖完整请求周期（含响应体读取/解析）
-async function fetchWithTimeout(url, opts, timeoutMs = 120000) {
-  const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
-  try {
-    const r = await fetch(url, { ...opts, signal: ctrl.signal })
-    // 超时覆盖到 body 读取完成——不在 fetch 返回后清 timer
-    // 标记 body 已消费
-    const text = await r.text() // text() 会等待完整 body——AbortSignal 仍有效
-    clearTimeout(timer) // body 读取完成才清
-    return { response: r, text, parsed: null }
-  } catch (e) {
-    clearTimeout(timer)
-    throw e
-  }
-}
-
-async function api(path, body, timeoutMs = 120000) {
-  const t0 = Date.now()
-  try {
-    const { response, text } = await fetchWithTimeout(`http://127.0.0.1:${PORT}/api/plugins/grokbot${path}?token=${token}`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
-    }, timeoutMs)
-    let j
-    try { j = JSON.parse(text) } catch { j = { error: 'invalid JSON response' } }
-    return { ms: Date.now() - t0, http: response.status, ...j }
-  } catch (e) {
-    const isAbort = e.name === 'AbortError'
-    return { ms: Date.now() - t0, status: 'fetch_error', error: isAbort ? `timeout after ${timeoutMs}ms` : e.message }
-  }
-}
+// 采样客户端：rttMs 独立字段（客户端往返），响应体字段原样合入不覆盖
+const { api, fetchWithTimeout } = makeClient({ baseUrl: `http://127.0.0.1:${PORT}/api/plugins/grokbot`, token: () => token })
 
 async function mkBot(name) {
   try {

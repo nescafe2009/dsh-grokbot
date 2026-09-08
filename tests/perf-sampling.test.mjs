@@ -27,40 +27,42 @@ function makeMockDeps(overrides = {}) {
   })
   const api = async (path, body = {}) => {
     state.calls.push({ path, body })
+    const t0 = Date.now()
     await new Promise((r) => setTimeout(r, 1))
+    const wrap = (j) => ({ rttMs: Date.now() - t0 + 10, http: 200, ...j }) // rttMs 独立（>服务端 ms）
     if (path === '/__perf/direct') {
       const isTool = String(body?.text ?? '').includes('bash')
       const ok = body?.text?.includes('预热') || !isTool || cfg.toolOk
-      return { ms: 90, http: 200, status: ok ? 'ok' : 'failed', toolCalls: isTool && cfg.toolOk ? 1 : 0,
+      return wrap({ ms: 90, status: ok ? 'ok' : 'failed', toolCalls: isTool && cfg.toolOk ? 1 : 0,
         activity: isTool && cfg.toolOk ? ['bash'] : [], evidence: isTool && cfg.toolOk ? { shellOk: true, targetMatch: true } : { shellOk: false, targetMatch: false },
-        replyBytes: 8, error: null, model: cfg.model }
+        replyBytes: 8, error: null, model: cfg.model })
     }
     if (path === '/__perf/warm/open') {
-      if (cfg.warmupFailDirect) return { ms: 5, http: 200, handleId: 'h-warm', warmupStatus: 'failed', model: cfg.warmModel ?? cfg.model }
+      if (cfg.warmupFailDirect) return wrap({ ms: 5, handleId: 'h-warm', warmupStatus: 'failed', model: cfg.warmModel ?? cfg.model })
       const id = `h-${state.warmHandles.size + 1}`
       state.warmHandles.set(id, true)
-      return { ms: 5, http: 200, handleId: id, warmupStatus: 'ok', warmupMs: 50, model: cfg.warmModel ?? cfg.model }
+      return wrap({ ms: 5, handleId: id, warmupStatus: 'ok', warmupMs: 50, model: cfg.warmModel ?? cfg.model })
     }
     if (path === '/__perf/warm/turn') {
-      return { ms: 70, http: 200, status: 'ok', toolCalls: 0, activity: [], evidence: { shellOk: false, targetMatch: false }, replyBytes: 4, error: null, warm: true, model: cfg.warmModel ?? cfg.model }
+      return wrap({ ms: 70, status: 'ok', toolCalls: 0, activity: [], evidence: { shellOk: false, targetMatch: false }, replyBytes: 4, error: null, warm: true, model: cfg.warmModel ?? cfg.model })
     }
     if (path === '/__perf/warm/close') {
-      if (cfg.closeFail) return { ms: 1, http: 404, error: 'handle 不存在' }
+      if (cfg.closeFail) return wrap({ ms: 1, http: 404, error: 'handle 不存在' })
       state.closed.push(body.handleId)
-      return { ms: 1, http: 200, ok: true }
+      return wrap({ ms: 1, ok: true })
     }
     if (path.endsWith('/chat')) {
       state.chatCount = (state.chatCount ?? 0) + 1
       const isWarmup = body?.text?.includes('预热')
       const isTool = body?.text?.includes('bash')
       if (isWarmup && cfg.warmupFailPlugin) {
-        return { ms: 30, http: 200, reply: '', outcome: chatOutcome(false, { error: 'warmup boom' }) }
+        return wrap({ ms: 30, reply: '', outcome: chatOutcome(false, { error: 'warmup boom' }) })
       }
       if (state.chatCount === cfg.cancelOnceAt) {
-        return { ms: 40, http: 200, reply: '部分文', outcome: chatOutcome(false, { cancelled: true, perf: { totalMs: 40, executionMs: 30, queueMs: 10 } }) }
+        return wrap({ ms: 40, reply: '部分文', outcome: chatOutcome(false, { cancelled: true, perf: { totalMs: 40, executionMs: 30, queueMs: 10 } }) })
       }
       const ok = !isTool || cfg.toolOk
-      return { ms: 60, http: 200, reply: ok ? 'OK' : '', outcome: chatOutcome(ok) }
+      return wrap({ ms: 60, reply: ok ? 'OK' : '', outcome: chatOutcome(ok) })
     }
     throw new Error(`mock api 未实现 ${path}`)
   }
@@ -83,7 +85,7 @@ test('成功全链：模型匹配/时间字段显式/交替顺序/marker 门控/
   assert.deepEqual({ totalMs: pluginSample.totalMs, executionMs: pluginSample.executionMs, queueMs: pluginSample.queueMs }, { totalMs: 100, executionMs: 80, queueMs: 20 })
   assert.ok(Number.isFinite(pluginSample.rttMs), 'rttMs 另列（客户端往返）')
   const directSample = out.results.find((r) => r.pair === 'cold-qa' && r.side === 'direct')
-  assert.deepEqual({ executionMs: directSample.executionMs, queueMs: directSample.queueMs }, { executionMs: null, queueMs: null }, '直连拆分显式 null')
+  assert.deepEqual({ totalMs: directSample.totalMs, executionMs: directSample.executionMs, queueMs: directSample.queueMs }, { totalMs: 90, executionMs: 90, queueMs: 0 }, '直连按定义补齐：total=exec=服务端 ms，queue=0')
   assert.ok(Number.isFinite(directSample.totalMs) && Number.isFinite(directSample.rttMs))
   // marker：仅工具轮与（无）——QA 轮不带 evidenceMarker
   const qaCalls = d.state.calls.filter((c) => c.path === '/__perf/direct' && !c.body.text.includes('bash'))
@@ -172,4 +174,66 @@ test('pairModelMatch 单元：相等 true / 不等 false / 任一空 unknown', (
   assert.equal(pairModelMatch(null, 'a/b'), 'unknown')
   assert.equal(pairModelMatch('a/b', null), 'unknown')
   assert.equal(pairModelMatch(null, null), 'unknown')
+})
+
+test('客户端契约：rttMs 为真实 HTTP 往返（独立于服务端 ms）；直连时间按定义补齐', async () => {
+  // 真实 HTTP：本机 server 人为延迟 40ms，响应体携带 ms=5（服务端耗时）——rtt 不得被覆盖
+  const { createServer } = await import('node:http')
+  const srv = createServer((req, res) => {
+    setTimeout(() => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ms: 5, status: 'ok', replyBytes: 2 }))
+    }, 40)
+  })
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+  try {
+    const { makeClient } = await import('../perf-fixture/client.mjs')
+    const { api } = makeClient({ baseUrl: `http://127.0.0.1:${srv.address().port}/api/plugins/grokbot`, token: 't' })
+    const r = await api('/__perf/direct', { text: 'x' })
+    assert.equal(r.ms, 5, '服务端 ms 原样保留')
+    assert.ok(r.rttMs >= 35, `rttMs 为真实客户端往返（${r.rttMs}ms ≥ 35ms）`)
+    // normalize：直连时间按定义补齐（total=exec=ms，queue=0）
+    const s = normalizeSample(r)
+    assert.deepEqual({ totalMs: s.totalMs, executionMs: s.executionMs, queueMs: s.queueMs }, { totalMs: 5, executionMs: 5, queueMs: 0 })
+    assert.ok(Number.isFinite(s.rttMs) && s.rttMs >= 35)
+  } finally {
+    srv.closeAllConnections?.(); await new Promise((r) => srv.close(r))
+  }
+})
+
+test('warm turn 异常（api reject）：真实 finally close 仍执行，closed≥1，incomplete 非零且留证据', async () => {
+  const d = makeMockDeps()
+  const origApi = d.api
+  let openHandle = null
+  d.api = async (path, body) => {
+    if (path === '/__perf/warm/open') { const r = await origApi(path, body); openHandle = r.handleId; return r }
+    if (path === '/__perf/warm/turn') { d.state.turnTry = (d.state.turnTry ?? 0) + 1; if (d.state.turnTry >= 2) throw new Error('connection reset') }
+    return origApi(path, body)
+  }
+  const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, texts: { qaRounds: 1, toolRounds: 1, warmRounds: 3 } })
+  assert.equal(d.state.closed.length, 1, 'finally close 恰执行一次（handle 释放）')
+  assert.ok(out.results.some((r) => r.reason === 'turn exception'), '异常样本留证')
+  assert.ok(out.results.some((r) => r.pair === 'warm-direct' && r.round), '异常前的 turn 样本仍在')
+  assert.equal(out.overall, 'incomplete')
+  assert.equal(out.exitCode, 1)
+})
+
+test('暖 round 配对：warm-plugin 与 warm-direct 同 round 同任务文本、预热排除在样本外', async () => {
+  const d = makeMockDeps()
+  const warmRounds = 3
+  const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, texts: { qaRounds: 1, toolRounds: 1, warmRounds } })
+  // mock 记录请求文本：按 round 提取暖侧任务文本
+  const warmBotId = out.results.find((r) => r.pair === 'warm-plugin')?.botId
+  const warmPluginTexts = d.state.calls.filter((c) => c.path === `/conversations/${warmBotId}/chat` && !c.body.text?.includes('预热')).map((c) => c.body.text)
+  const warmTurnCalls = d.state.calls.filter((c) => c.path === '/__perf/warm/turn')
+  assert.equal(warmTurnCalls.length, warmRounds, '暖直连恰 warmRounds 轮')
+  assert.ok(warmTurnCalls.every((c) => c.body.text === '配对冷A：只回复 OK。'), '暖直连每轮同任务文本')
+  assert.equal(warmPluginTexts.length, warmRounds, '暖插件恰 warmRounds 轮（预热文本不计入）')
+  const wp = out.results.filter((r) => r.pair === 'warm-plugin')
+  const wd = out.results.filter((r) => r.pair === 'warm-direct')
+  assert.deepEqual(wp.map((r) => r.round), wd.map((r) => r.round), 'round 对齐')
+  // 预热请求存在但不产生样本
+  const warmupCalls = d.state.calls.filter((c) => (c.path.endsWith('/chat') || c.path === '/__perf/warm/open') && c.body.text?.includes('预热'))
+  assert.ok(warmupCalls.length >= 2, '双侧各一次预热')
+  assert.ok(!out.results.some((r) => r.warmupMs !== undefined && r.round), '预热不计入样本')
 })
