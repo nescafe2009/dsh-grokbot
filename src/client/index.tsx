@@ -406,6 +406,8 @@ function useNativeSidebarVisible(): boolean {
 
 const histories = new Map<string, ChatMessage[]>()
 const loadedHistoryFor = new Set<string>()
+// 每会话历史拉取代次：卸载视图的旧实例/旧一轮响应不得覆盖较新历史（latest-wins）
+const historyFetchGen = new Map<string, number>()
 
 function historyOf(botId: string): ChatMessage[] {
   let list = histories.get(botId)
@@ -1067,12 +1069,16 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
   const messages = useMemo(() => historyOf(bot.id), [bot.id, sending, historyRefresh])
   const pending = (state?.approvals ?? []).filter((approval) => approval.botId === bot.id)
 
-  // 服务端 DM 历史拉取：保留 artifact 等透传字段（原件卡片不能在历史加载时丢失）
+  // 服务端 DM 历史拉取：保留 artifact 等透传字段（原件卡片不能在历史加载时丢失）。
+  // 写入按会话 latest-wins：旧实例（已卸载视图）或旧一轮的迟到响应不得覆盖较新历史
   const refetchHistory = useCallback(async (): Promise<void> => {
     try {
+      const gen = (historyFetchGen.get(bot.id) ?? 0) + 1
+      historyFetchGen.set(bot.id, gen)
       const outcome = await api(`/conversations/${encodeURIComponent(bot.id)}`)
       const list = (outcome?.messages ?? []) as { ts: number; role: string; text: string; artifact?: ArtifactInfo | null }[]
       if (list.length === 0) return
+      if (historyFetchGen.get(bot.id) !== gen) return // 迟到旧响应：新历史已落（或新一轮在途），丢弃
       histories.set(bot.id, list.map((message, index) => ({
         id: `h${index}`,
         role: message.role === 'user' ? ('user' as const) : ('bot' as const),

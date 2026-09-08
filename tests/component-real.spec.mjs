@@ -383,9 +383,11 @@ test('真实组件 DM：A 发送中 B 也发送 → A 迟到完成 → B 状态�
   // B 的 POST 正常完成——resolve POST + 后续 history GET（BotChatView send 内 await refetchHistory）
   await act(async () => {
     await resolveFor('/multiB/chat', 'POST', { reply: 'B reply' })
-    // refetchHistory 的 GET 也需要 resolve（否则组件卡在 await）
-    const histIdx = deferredQueue.findIndex(d => d.call.url.includes('/multiB') && d.call.method === 'GET')
-    if (histIdx >= 0) {
+    await new Promise(r => setTimeout(r, 10))
+    // 放行 B 的全部挂起 GET（初始加载 + send 后 refetch——latest-wins 下只有最新代次会写历史）
+    for (;;) {
+      const histIdx = deferredQueue.findIndex(d => d.call.url.includes('/multiB') && d.call.method === 'GET')
+      if (histIdx < 0) break
       const hd = deferredQueue.splice(histIdx, 1)[0]
       hd.resolve({ ok: true, status: 200, json: async () => ({ messages: [{ ts: Date.now(), role: 'user', text: 'B msg' }, { ts: Date.now(), role: 'bot', text: 'B reply' }] }), text: async () => '{}' })
     }
@@ -938,6 +940,101 @@ test('卸载时挂起：迟到失败后重挂出现重试条，重试复用原 r
     })
     assert.ok(![...c3.el.querySelectorAll('button')].find(b => b.textContent.includes('重试')), '重试成功后重试条消失')
     assert.ok(c3.el.textContent.includes('RETRY_OK'), '重试回复可见')
+  } finally {
+    for (const c of mounts.splice(0)) { try { await act(async () => c.root.unmount()) } catch {} c.el.remove() }
+    teardownMockFetch()
+  }
+})
+
+// ===== 22. Codex 探针：卸载旧实例的迟到历史 GET 不得覆盖重挂后的新历史 =====
+test('Codex: unmounted old history GET cannot replace remounted newer history', async () => {
+  setupMockFetch()
+  const a = makeBot('umHistA', 'A')
+  const typeInto = async (c, text) => act(async () => {
+    const t = c.el.querySelector('textarea')
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(t, text)
+    t.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+  const mounts = []
+  try {
+    // 首挂：初始历史 GET 挂起 → 立即卸载
+    const c1 = createContainer(); mounts.push(c1)
+    await render(React.createElement(BotChatView, { bot: a, state: null }), c1)
+    const oldIdx = deferredQueue.findIndex(d => d.call.method === 'GET' && d.call.url.includes('/conversations/umHistA'))
+    assert.ok(oldIdx >= 0, '首挂 GET 在队')
+    const old = deferredQueue.splice(oldIdx, 1)[0]
+    await act(async () => c1.root.unmount()); c1.el.remove()
+
+    // 重挂 A → 发新请求 → 新 POST 与新历史 GET 返回（NEW_CURRENT_RESULT 落缓存）
+    const c2 = createContainer(); mounts.push(c2)
+    await render(React.createElement(BotChatView, { bot: a, state: null }), c2)
+    await typeInto(c2, 'NEW_REQUEST')
+    await act(async () => [...c2.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    await act(async () => resolveFor('/umHistA/chat', 'POST', { reply: 'NEW_CURRENT_RESULT' }))
+    await act(async () => resolveFor('/conversations/umHistA', 'GET', { messages: [{ ts: 2, role: 'bot', text: 'NEW_CURRENT_RESULT' }] }))
+    assert.ok(c2.el.textContent.includes('NEW_CURRENT_RESULT'), '新历史可见')
+
+    // 旧实例的 GET 此时才返回陈旧数据
+    await act(async () => old.resolve({ ok: true, status: 200, json: async () => ({ messages: [{ ts: 1, role: 'bot', text: 'OLD_STALE_HISTORY' }] }), text: async () => '{}' }))
+    await act(async () => c2.root.unmount()); c2.el.remove()
+
+    // 再卸载重挂：新历史必须仍在，旧数据不得覆盖
+    const c3 = createContainer(); mounts.push(c3)
+    await render(React.createElement(BotChatView, { bot: a, state: null }), c3)
+    assert.ok(c3.el.textContent.includes('NEW_CURRENT_RESULT'), '旧实例迟到 GET 不得覆盖重挂后的新历史')
+    assert.ok(!c3.el.textContent.includes('OLD_STALE_HISTORY'), '陈旧历史不得出现')
+  } finally {
+    for (const c of mounts.splice(0)) { try { await act(async () => c.root.unmount()) } catch {} c.el.remove() }
+    teardownMockFetch()
+  }
+})
+
+// ===== 23. 群视图卸载重挂：带 taskId 的任务引用恢复并在发送时携带 =====
+test('卸载重挂：群任务引用（带 taskId）恢复，发送携带且不串 DM', async () => {
+  setupMockFetch()
+  const bots = [makeBot('cx3'), makeBot('cy3')]
+  const g = makeConv('umG3', ['cx3', 'cy3'])
+  const roomHist = { messages: [{ ts: 1, role: 'bot', botId: 'cx3', text: 'group card', artifact: { id: 'art-g3', name: 'group-report.html', size: 12, mime: 'text/html', sha256: 'y'.repeat(64), taskId: 'task-g3' } }] }
+  const typeInto = async (el, text) => {
+    const ta = el.querySelector('textarea')
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text)
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+  }
+  const mounts = []
+  try {
+    const c1 = createContainer(); mounts.push(c1)
+    await render(React.createElement(GroupChatView, { conversation: g, bots }), c1)
+    await act(async () => {
+      const hi = deferredQueue.findIndex(d => d.call.url.includes('/umG3') && d.call.method === 'GET')
+      if (hi >= 0) deferredQueue.splice(hi, 1)[0].resolve({ ok: true, status: 200, json: async () => roomHist, text: async () => '{}' })
+      await new Promise(r => setTimeout(r, 20))
+    })
+    const contBtn = [...c1.el.querySelectorAll('button')].find(b => b.textContent.includes('继续修改'))
+    assert.ok(contBtn, '群交付卡「继续修改」入口存在')
+    await act(async () => contBtn.click())
+    await typeInto(c1.el, 'group-draft-with-task')
+    await act(async () => c1.root.unmount()); c1.el.remove()
+
+    // 卸载后群轮询 GET（旧实例）陆续返回：alive 守卫已防 setState，不影响
+    await act(async () => {
+      for (;;) {
+        const hi = deferredQueue.findIndex(d => d.call.url.includes('/umG3') && d.call.method === 'GET')
+        if (hi < 0) break
+        deferredQueue.splice(hi, 1)[0].resolve({ ok: true, status: 200, json: async () => roomHist, text: async () => '{}' })
+      }
+    })
+
+    // 重挂原群：草稿+任务引用恢复；发送携带原 taskId
+    const c2 = createContainer(); mounts.push(c2)
+    await render(React.createElement(GroupChatView, { conversation: g, bots }), c2)
+    assert.equal(c2.el.querySelector('textarea').value, 'group-draft-with-task', '群草稿卸载重挂保留')
+    assert.ok(c2.el.textContent.includes('继续修改：group-report.html'), '群任务引用恢复')
+    await act(async () => [...c2.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    const post = fetchCalls.filter(f => f.url.includes('/umG3/chat')).at(-1)
+    assert.equal(JSON.parse(post.body).taskId, 'task-g3', '群发送携带恢复的任务引用')
+    assert.equal(JSON.parse(post.body).text, 'group-draft-with-task')
   } finally {
     for (const c of mounts.splice(0)) { try { await act(async () => c.root.unmount()) } catch {} c.el.remove() }
     teardownMockFetch()
