@@ -50,6 +50,20 @@ async function resolveLatest(data, raw) {
     text: async () => JSON.stringify(data),
   })
 }
+// 精确选择：按 URL 子串 + method 找请求（避免 shift 到历史 GET）
+function resolveFor(urlSubstr, method, data) {
+  const idx = deferredQueue.findIndex(d => d.call.url.includes(urlSubstr) && d.call.method === method)
+  assert.ok(idx >= 0, `no pending ${method} ${urlSubstr} in queue of ${deferredQueue.length}`)
+  const d = deferredQueue.splice(idx, 1)[0]
+  d.resolve({ ok: true, status: 200, json: async () => data, text: async () => JSON.stringify(data) })
+  return d
+}
+function rejectFor(urlSubstr, method, err) {
+  const idx = deferredQueue.findIndex(d => d.call.url.includes(urlSubstr) && d.call.method === method)
+  if (idx < 0) throw new Error(`no pending ${method} ${urlSubstr}`)
+  const d = deferredQueue.splice(idx, 1)[0]
+  d.reject(err ?? new Error('mock network fail'))
+}
 function rejectLatest(err) {
   const d = deferredQueue.shift()
   if (!d) throw new Error('no pending fetch')
@@ -110,9 +124,9 @@ test('真实组件 DM→DM：A 发送中切 B → A 迟到不污染 B', async ()
   // 切换到 B（同一父级——React 同位置 re-render，组件 state 复用）
   await rerender(React.createElement(BotChatView, { bot: botB, state: null }), c)
 
-  // A 的 fetch 现在返回
+  // A 的 chat POST 现在返回（精确选择，不误 resolve 历史 GET）
   await act(async () => {
-    await resolveLatest({ reply: '这是 A 的迟到回复' })
+    await resolveFor('/botA/chat', 'POST', { reply: '这是 A 的迟到回复' })
   })
 
   // 验证：B 的消息流不应包含 A 的回复
@@ -158,8 +172,8 @@ test('真实组件 DM→DM：A 发送失败 → B 无错误/重试条', async ()
 
   // B 不应显示 A 的错误消息
   const allText = c.el.textContent
-  assert.ok(!allText.includes('mock network fail') || !allText.includes('发送失败') || allText.includes('botB'),
-    'B 不应显示 A 的发送错误')
+  assert.ok(!allText.includes('mock network fail'), 'B 不显示 A 的错误消息（mock network fail）')
+  assert.ok(!allText.includes('发送失败'), 'B 不显示发送失败提示')
 
   // B 不应有 A 的重试条（retryRequest 按会话隔离）
   const retryBtn = [...c.el.querySelectorAll('button')].find(b => b.textContent?.includes('重试'))
@@ -275,4 +289,145 @@ test('真实组件：重试按钮复用原 requestId', async () => {
   c.root.unmount()
   c.el.remove()
   teardownMockFetch()
+})
+
+
+// ===== 6. Codex 探针：A 未发送草稿切 B → B 不继承 =====
+test('真实组件 DM：A 未发送草稿 → 切 B → B 草稿为空（切回 A 恢复）', async () => {
+  setupMockFetch()
+  const c = createContainer()
+  const botA = makeBot('draftA', 'A')
+  await render(React.createElement(BotChatView, { bot: botA, state: null }), c)
+  const ta = c.el.querySelector('textarea')
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, 'A PRIVATE DRAFT')
+    ta.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+  assert.equal(ta.value, 'A PRIVATE DRAFT')
+
+  // 切 B
+  await rerender(React.createElement(BotChatView, { bot: makeBot('draftB'), state: null }), c)
+  assert.equal(c.el.querySelector('textarea').value, '', 'B 不继承 A 的草稿')
+
+  // 切回 A → 草稿恢复
+  await rerender(React.createElement(BotChatView, { bot: botA, state: null }), c)
+  assert.equal(c.el.querySelector('textarea').value, 'A PRIVATE DRAFT', '切回 A 恢复草稿')
+
+  c.root.unmount(); c.el.remove(); teardownMockFetch()
+})
+
+// ===== 7. Codex 探针：群 A POST 迟到不覆盖 B =====
+test('真实组件 群→群：A POST 迟到不覆盖群 B', async () => {
+  setupMockFetch(); const c = createContainer()
+  const bots = [makeBot('ga'), makeBot('gb')]
+  await render(React.createElement(GroupChatView, { conversation: makeConv('lateA', ['ga','gb']), bots }), c)
+  const ta = c.el.querySelector('textarea')
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, 'A work')
+    ta.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+  await act(async () => {
+    [...c.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click()
+  })
+  // 精确找到 lateA 的 POST
+  const idx = deferredQueue.findIndex(d => d.call.url.includes('/lateA/chat') && d.call.method === 'POST')
+  assert.ok(idx >= 0, 'lateA chat POST pending')
+
+  // 切 lateB
+  await rerender(React.createElement(GroupChatView, { conversation: makeConv('lateB', ['ga','gb']), bots }), c)
+
+  // A 的 POST 返回
+  await act(async () => {
+    const d = deferredQueue.splice(idx, 1)[0]
+    d.resolve({ ok: true, status: 200, json: async () => ({ messages: [{ ts: 1, role: 'bot', botId: 'ga', text: 'A_ONLY_LATE_RESULT' }] }) })
+  })
+  assert.ok(!c.el.textContent.includes('A_ONLY_LATE_RESULT'), 'B 不显示 A 的迟到结果')
+
+  c.root.unmount(); c.el.remove(); teardownMockFetch()
+})
+
+// ===== 8. A 发送 → B 发送 → A 迟到完成/失败 → B 不受影响 =====
+test('真实组件 DM：A 发送中 B 也发送 → A 迟到完成 → B 状态不受影响', async () => {
+  setupMockFetch(); const c = createContainer()
+  const botA = makeBot('multiA', 'A')
+  const botB = makeBot('multiB', 'B')
+
+  // A 发送
+  await render(React.createElement(BotChatView, { bot: botA, state: null }), c)
+  let ta = c.el.querySelector('textarea')
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, 'A msg')
+    ta.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+  await act(async () => { [...c.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click() })
+
+  // 切 B → B 也发送
+  await rerender(React.createElement(BotChatView, { bot: botB, state: null }), c)
+  ta = c.el.querySelector('textarea')
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, 'B msg')
+    ta.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+  const bBtn = [...c.el.querySelectorAll('button')].find(b => b.textContent.includes('↑'))
+  assert.ok(!bBtn.disabled, 'B 可发送（不被 A 阻塞）')
+  await act(async () => { bBtn.click() })
+
+  // A 的 POST 迟到完成
+  await act(async () => {
+    await resolveFor('/multiA/chat', 'POST', { reply: 'A late reply' })
+  })
+
+  // B 的消息流不含 A 的回复
+  assert.ok(!c.el.textContent.includes('A late reply'), 'B 不显示 A 迟到回复')
+
+  // B 的 POST 正常完成——resolve POST + 后续 history GET（BotChatView send 内 await refetchHistory）
+  await act(async () => {
+    await resolveFor('/multiB/chat', 'POST', { reply: 'B reply' })
+    // refetchHistory 的 GET 也需要 resolve（否则组件卡在 await）
+    const histIdx = deferredQueue.findIndex(d => d.call.url.includes('/multiB') && d.call.method === 'GET')
+    if (histIdx >= 0) {
+      const hd = deferredQueue.splice(histIdx, 1)[0]
+      hd.resolve({ ok: true, status: 200, json: async () => ({ messages: [{ ts: Date.now(), role: 'user', text: 'B msg' }, { ts: Date.now(), role: 'bot', text: 'B reply' }] }), text: async () => '{}' })
+    }
+  })
+  // Give component a tick to flush
+  await act(async () => { await new Promise(r => setTimeout(r, 10)) })
+  assert.ok(c.el.textContent.includes('B reply'), 'B 显示自己的回复')
+
+  c.root.unmount(); c.el.remove(); teardownMockFetch()
+})
+
+// ===== 9. A→B→A：A 的旧回调不覆盖新一轮状态 =====
+test('真实组件 DM：A→B→A 后 A 旧回调不覆盖新一轮', async () => {
+  setupMockFetch(); const c = createContainer()
+  const botA = makeBot('cycleA', 'A')
+  await render(React.createElement(BotChatView, { bot: botA, state: null }), c)
+  let ta = c.el.querySelector('textarea')
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, '第一轮消息')
+    ta.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+  await act(async () => { [...c.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click() })
+  const firstPostIdx = deferredQueue.findIndex(d => d.call.url.includes('/cycleA/chat') && d.call.method === 'POST')
+
+  // 切 B 再切回 A
+  await rerender(React.createElement(BotChatView, { bot: makeBot('cycleB'), state: null }), c)
+  await rerender(React.createElement(BotChatView, { bot: botA, state: null }), c)
+
+  // A 第一轮的 POST 迟到完成
+  await act(async () => {
+    const d = deferredQueue.splice(firstPostIdx, 1)[0]
+    d.resolve({ ok: true, status: 200, json: async () => ({ reply: '第一轮迟到回复' }) })
+  })
+
+  // A 可以发送第二轮
+  ta = c.el.querySelector('textarea')
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, '第二轮消息')
+    ta.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+  const btn2 = [...c.el.querySelectorAll('button')].find(b => b.textContent.includes('↑'))
+  assert.ok(!btn2?.disabled, '切回 A 后可发送新消息（旧回调不阻塞）')
+
+  c.root.unmount(); c.el.remove(); teardownMockFetch()
 })

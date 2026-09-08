@@ -1036,10 +1036,21 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
   const [detailsOpen, setDetailsOpen] = useState(false)
   // 失败/结果未知时的逻辑请求（按会话隔离存储；重试仅作用于原会话）
   const [retryRequest, setRetryRequest] = useState<{ conversationId: string; requestId: string; text: string; taskId: string | null; createdAt: number } | null>(null)
+  const botRef = useRef(bot.id)
+  // 按会话保存未发送草稿/任务引用（切走不丢，切回恢复，新会话不继承）
+  const draftsRef = useRef<Map<string, { draft: string; draftTask: { taskId: string; name: string } | null }>>(new Map())
   useEffect(() => {
-    // 切换会话（同类视图复用 state）：从会话存储恢复本会话记录，其他会话的记录不串
+    if (botRef.current !== bot.id) {
+      // 离开旧会话：保存其未发送草稿/任务
+      draftsRef.current.set(botRef.current, { draft, draftTask })
+      botRef.current = bot.id
+      // 恢复新会话的草稿/任务（无则空）
+      const saved = draftsRef.current.get(bot.id)
+      setDraft(saved?.draft ?? '')
+      setDraftTask(saved?.draftTask ?? null)
+    }
     setRetryRequest(getPendingRetry(bot.id))
-    // 切换时重置发送/编辑状态：旧会话的发送中/编辑中不阻塞新会话
+    // 切换会话（同类视图复用 state）：从会话存储恢复本会话记录，其他会话的记录不串
     setSending(false)
     setEditing(false)
   }, [bot.id])
@@ -1099,6 +1110,7 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
     if (!text || sending) return
     const requestId = isRetry ? overrideRequest!.requestId : `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
     const taskForSend = isRetry ? overrideRequest!.taskId : (draftTask?.taskId ?? null)
+    const sendBotId = bot.id // 会话守卫：await 后只写入仍是当前会话的状态
     if (!isRetry) setDraft('')
     setRetryRequest(null); clearPendingRetry(bot.id)
     appendLocal(bot.id, { id: `${Date.now()}-u`, role: 'user', text, at: Date.now() })
@@ -1109,6 +1121,7 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
         // retryMode 仅在「查询原结果」时携带；「重新执行」复用原载荷但生成新 ID 走执行路径
         body: JSON.stringify({ text, requestId, ...(taskForSend ? { taskId: taskForSend } : {}), ...(opts?.retryMode ? { retryMode: opts.retryMode } : {}) }),
       })
+      if (sendBotId !== botRef.current) return // 切会话后丢弃迟到结果
       const activity = (outcome?.activity ?? []) as string[]
       if (activity.length > 0) {
         const counted = activity.reduce<Record<string, number>>((acc, name) => {
@@ -1127,6 +1140,7 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
       await refetchHistory()
       setDraftTask(null)
     } catch (error) {
+      if (sendBotId !== botRef.current) return // 切会话后错误不写入新会话
       appendLocal(bot.id, {
         id: `${Date.now()}-e`,
         role: 'error' as const,
@@ -1137,7 +1151,7 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
       const pending = { conversationId: bot.id, requestId, text, taskId: taskForSend, createdAt: isRetry && overrideRequest?.createdAt ? overrideRequest.createdAt : Date.now() }
       setPendingRetry(pending); setRetryRequest(pending)
     } finally {
-      setSending(false)
+      if (sendBotId === botRef.current) setSending(false)
     }
   }, [draft, sending, bot.id, refetchHistory, draftTask])
 
@@ -1347,11 +1361,21 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
   const [sending, setSending] = useState(false)
   const [cancellingRuns, setCancellingRuns] = useState<Map<string, string>>(new Map())
   const [retryRequest, setRetryRequest] = useState<{ conversationId: string; requestId: string; text: string; taskId: string | null; createdAt: number } | null>(null)
+  const roomRef = useRef(room.id)
+  const draftsRef = useRef<Map<string, { draft: string; draftTask: { taskId: string; name: string } | null }>>(new Map())
   useEffect(() => {
+    if (roomRef.current !== room.id) {
+      // 离开旧群：保存未发送草稿/任务
+      draftsRef.current.set(roomRef.current, { draft, draftTask })
+      roomRef.current = room.id
+      // 恢复新群草稿
+      const saved = draftsRef.current.get(room.id)
+      setDraft(saved?.draft ?? '')
+      setDraftTask(saved?.draftTask ?? null)
+    }
     setRetryRequest(getPendingRetry(room.id))
-    // 切换群：重置发送/重试/取消状态（旧群不阻塞新群）
+    // 切换群：重置发送/取消状态（旧群不阻塞新群）
     setSending(false)
-    setDraftTask(null)
     setCancellingRuns(new Map())
   }, [room.id])
   const queued = props.queued ?? []
@@ -1396,6 +1420,7 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
     if (!text || sending) return
     const requestId = isRetry ? overrideRequest!.requestId : `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
     const taskForSend = isRetry ? overrideRequest!.taskId : (draftTask?.taskId ?? null)
+    const sendRoomId = room.id // 会话守卫：await 后只写入仍是当前群的状态
     if (!isRetry) setDraft('')
     setRetryRequest(null); clearPendingRetry(room.id)
     setSending(true)
@@ -1404,14 +1429,16 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
         method: 'POST',
         body: JSON.stringify({ text, requestId, ...(taskForSend ? { taskId: taskForSend } : {}), ...(opts?.retryMode ? { retryMode: opts.retryMode } : {}) }),
       })
+      if (sendRoomId !== roomRef.current) return // 切群后丢弃迟到结果
       setMessages(((outcome?.messages ?? []) as RoomMessage[]).slice())
       setDraftTask(null)
     } catch (error) {
+      if (sendRoomId !== roomRef.current) return // 切群后错误不写入新群
       setMessages((prev) => [...prev, { ts: Date.now(), role: 'system', text: `发送失败：${String((error as Error)?.message ?? error)}（可重试本次，复用原请求）` }])
       const pending = { conversationId: room.id, requestId, text, taskId: taskForSend, createdAt: isRetry && overrideRequest?.createdAt ? overrideRequest.createdAt : Date.now() }
       setPendingRetry(pending); setRetryRequest(pending)
     } finally {
-      setSending(false)
+      if (sendRoomId === roomRef.current) setSending(false)
     }
   }, [draft, sending, room.id, draftTask])
 
