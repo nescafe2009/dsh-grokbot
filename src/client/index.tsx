@@ -4,7 +4,7 @@ import { AvatarView, MarkdownView, splitChips, SidebarRow, MessageView, Composer
 import { GKF_CSS } from './tokens'
 import { getPendingRetry, setPendingRetry, clearPendingRetry, retryMatches, retryRiskLevel } from './retry-store'
 
-const API_ROOT = '/api/plugins/grokbot'
+export const API_ROOT = '/api/plugins/grokbot'
 const POLL_MS = 2000
 
 interface BotInfo {
@@ -1025,7 +1025,7 @@ function ApprovalCard(props: { approval: ApprovalInfo }): ReactNode {
   )
 }
 
-function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): ReactNode {
+export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): ReactNode {
   const { bot, state } = props
   const propsBots = state?.bots ?? []
   const [draft, setDraft] = useState('')
@@ -1039,6 +1039,9 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
   useEffect(() => {
     // 切换会话（同类视图复用 state）：从会话存储恢复本会话记录，其他会话的记录不串
     setRetryRequest(getPendingRetry(bot.id))
+    // 切换时重置发送/编辑状态：旧会话的发送中/编辑中不阻塞新会话
+    setSending(false)
+    setEditing(false)
   }, [bot.id])
   const [newRoutine, setNewRoutine] = useState(false)
   const [catalog, setCatalog] = useState<CatalogProvider[]>([])
@@ -1334,7 +1337,7 @@ function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): React
 
 /* ---------------- 群聊视图 ---------------- */
 
-function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[]; queued?: { jobId: string; botId: string; text: string }[] }): ReactNode {
+export function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[]; queued?: { jobId: string; botId: string; text: string }[] }): ReactNode {
   const room = { id: props.conversation.id, name: props.conversation.name || props.conversation.memberBotIds.map((botId) => props.bots.find((bot) => bot.id === botId)?.name ?? botId).join('、'), memberBotIds: props.conversation.memberBotIds }
   const bots = props.bots
   const [detailsOpen, setDetailsOpen] = useState(false)
@@ -1346,6 +1349,10 @@ function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[];
   const [retryRequest, setRetryRequest] = useState<{ conversationId: string; requestId: string; text: string; taskId: string | null; createdAt: number } | null>(null)
   useEffect(() => {
     setRetryRequest(getPendingRetry(room.id))
+    // 切换群：重置发送/重试/取消状态（旧群不阻塞新群）
+    setSending(false)
+    setDraftTask(null)
+    setCancellingRuns(new Map())
   }, [room.id])
   const queued = props.queued ?? []
   const logRef = useRef<HTMLDivElement | null>(null)
