@@ -146,6 +146,7 @@ export function apply(ctx, config = {}) {
 
   // 暖直连专用 handle 注册表（效率配对；仅 testEndpoints 开启时可达）
   const warmHandles = new Map() // handleId -> { handle, sessionId, busy, createdAt, expiresAt, timer, turns }
+  const warmPending = new Map() // handleId -> { aborted }：opening 预占配额（同步原子段），卸载时置 aborted
   const WARM_MAX_ACTIVE = 2
   const WARM_TTL_MS = 5 * 60_000
   const WARM_TURN_TIMEOUT_MS = Math.min(jobTimeoutMs, 10 * 60_000)
@@ -2450,21 +2451,31 @@ export function apply(ctx, config = {}) {
         // close/turn 异常/单轮超时/插件 dispose 均释放；未知或已关 handle 一律 404 且零会话创建。
         if (testEndpointsOn && method === 'POST' && suffix === '/__perf/warm/open') {
           const body = await readJsonBody(req)
-          if (warmHandles.size >= WARM_MAX_ACTIVE) throw new HttpError(409, `活跃暖直连 handle已达上限 ${WARM_MAX_ACTIVE}`)
           const handleId = randomUUID()
+          // 同步预占配额（此段无 await，检查+登记原子）：opening + ready 合计 ≤ 上限——
+          // 并发 open 不能在异步 create/预热期间绕过上限
+          if (warmHandles.size + warmPending.size >= WARM_MAX_ACTIVE) throw new HttpError(409, `活跃暖直连 handle已达上限 ${WARM_MAX_ACTIVE}`)
+          warmPending.set(handleId, { aborted: false })
+          const quotaRelease = () => { warmPending.delete(handleId) } // 配额恢复（失败/超时/卸载路径统一）
           const sessionId = randomUUID() // 专用会话：与用户会话命名空间无关，fixture 无法指定
           const warmText = String(body?.text ?? '预热：只回复 OK。')
           const ttlMs = Math.max(1_000, Math.min(WARM_TTL_MS, Number(body?.ttlMs) || WARM_TTL_MS))
+          const openTimeoutMs = Math.max(200, Math.min(60_000, Number(body?.openTimeoutMs) || 30_000))
           const t0 = Date.now()
-          let handle = null
-          let warmupMs = null
-          let warmupStatus = 'skipped'
-          try {
+          // 迟到 handle（超时后 create/预热才完成 / 卸载后到达）：恰释放一次，不登记不返回
+          let lateReleased = false
+          const releaseLate = async (r) => {
+            if (!r?.handle || lateReleased) return
+            lateReleased = true
+            try { r.handle.agent.cancel({ kind: 'user' }, { keepInbox: true }) } catch { /* best effort */ }
+            try { await r.handle.dispose() } catch { /* best effort */ }
+          }
+          const work = (async () => {
             const fallbackSel = typeof ctx.agentDefaultModel?.currentSelection === 'function' ? ctx.agentDefaultModel.currentSelection() : null
             const sel = crewState.crew.defaultModel?.provider && crewState.crew.defaultModel?.model
               ? crewState.crew.defaultModel
               : (fallbackSel?.provider && fallbackSel?.model ? fallbackSel : null)
-            handle = await ctx.agents.create({
+            const handle = await ctx.agents.create({
               sessionId,
               meta: { cwd: join(stateDir, 'workspace') },
               ...(sel ? { agentOptions: sel } : {}),
@@ -2475,18 +2486,35 @@ export function apply(ctx, config = {}) {
             handle.agent.followup(userMessage(warmText))
             await handle.agent.whenIdle()
             const turn = summarizeTurn(handle.agent.session.events, firstSeq)
-            warmupMs = Date.now() - t0
-            warmupStatus = turn?.error ? 'failed' : (turn?.text?.trim() ? 'ok' : 'empty')
+            return { handle, warmupMs: Date.now() - t0, warmupStatus: turn?.error ? 'failed' : (turn?.text?.trim() ? 'ok' : 'empty') }
+          })()
+          let openTimer = null
+          const openTimeout = new Promise((_, reject) => {
+            openTimer = setTimeout(() => reject(new Error(`warm open timeout after ${openTimeoutMs}ms`)), openTimeoutMs)
+            openTimer.unref?.()
+          })
+          try {
+            const result = await Promise.race([work, openTimeout])
+            if (warmPending.get(handleId)?.aborted) {
+              // 卸载发生在 create/预热期间：迟到 handle 恰释放一次，不登记不返回可用
+              await releaseLate(result)
+              throw new HttpError(503, '插件正在卸载：暖直连 open 已取消')
+            }
+            const entry = { handle: result.handle, sessionId, busy: false, createdAt: Date.now(), expiresAt: Date.now() + ttlMs, timer: null, turns: 0 }
+            entry.timer = setTimeout(() => { void disposeWarmHandle(handleId, 'ttl') }, ttlMs)
+            entry.timer.unref?.()
+            warmHandles.set(handleId, entry)
+            quotaRelease()
+            logPerf({ kind: 'dsh-warm-open', conversationId: '__perf__', ms: result.warmupMs, status: result.warmupStatus })
+            respond(res, 200, { handleId, sessionId, warmupMs: result.warmupMs, warmupStatus: result.warmupStatus, ttlMs, maxActive: WARM_MAX_ACTIVE }); return
           } catch (error) {
-            if (handle) { try { await handle.dispose() } catch { /* best effort */ } }
-            throw new HttpError(500, `暖直连 open 失败：${safeError(error)}`)
+            quotaRelease() // 配额恢复：不预热登记、不返回可用 handle
+            // work 仍在途（超时）或已完成但被拒：迟到结果恰释放一次
+            void work.then((r) => releaseLate(r), () => { /* create/预热自身失败：handle 由 work 内已抛出，无迟到 */ })
+            throw error instanceof HttpError ? error : new HttpError(500, `暖直连 open 失败：${safeError(error)}`)
+          } finally {
+            if (openTimer) clearTimeout(openTimer)
           }
-          const entry = { handle, sessionId, busy: false, createdAt: Date.now(), expiresAt: Date.now() + ttlMs, timer: null, turns: 0 }
-          entry.timer = setTimeout(() => { void disposeWarmHandle(handleId, 'ttl') }, ttlMs)
-          entry.timer.unref?.()
-          warmHandles.set(handleId, entry)
-          logPerf({ kind: 'dsh-warm-open', conversationId: '__perf__', ms: warmupMs, status: warmupStatus })
-          respond(res, 200, { handleId, sessionId, warmupMs, warmupStatus, ttlMs, maxActive: WARM_MAX_ACTIVE }); return
         }
         if (testEndpointsOn && method === 'POST' && suffix === '/__perf/warm/turn') {
           const body = await readJsonBody(req)
@@ -3096,6 +3124,7 @@ export function apply(ctx, config = {}) {
 
   ctx.effect(() => () => {
     disposed = true
+    for (const pending of warmPending.values()) pending.aborted = true // opening 中的 open：迟到 handle 将被拒并恰释放一次
     for (const handleId of [...warmHandles.keys()]) void disposeWarmHandle(handleId, 'plugin-dispose')
     for (const probe of busyProbes.values()) clearInterval(probe)
     busyProbes.clear()

@@ -15,18 +15,21 @@ const HOST_TOKEN = 'warm-harness-token'
 function makeRecordingAgents() {
   const calls = { creates: 0, disposes: 0, followups: 0 }
   const bySession = new Map() // sessionId -> { followups, slowMs, throwOnce }
+  const opts = { createDelayMs: 0, idleDelayMs: 0 }
+  let createGate = null // { promise, resolve }：可选 create 门闸（精确控制 in-flight 时点）
   const create = async (base = {}) => {
+    if (createGate) await createGate.promise
+    if (opts.createDelayMs) await new Promise((r) => setTimeout(r, opts.createDelayMs))
     calls.creates += 1
     const sessionId = String(base.sessionId ?? `sess-${calls.creates}`)
     const rec = { followups: 0, slowMs: 0, throwOnce: false }
     bySession.set(sessionId, rec)
     let seq = 0
     const events = []
-    let busyGate = Promise.resolve()
     return {
       agent: {
         session: { get seq() { return seq }, events },
-        whenIdle: async () => { if (rec.slowMs) await new Promise((r) => setTimeout(r, rec.slowMs)) },
+        whenIdle: async () => { if (rec.slowMs || opts.idleDelayMs) await new Promise((r) => setTimeout(r, rec.slowMs || opts.idleDelayMs)) },
         followup(msg) {
           calls.followups += 1
           rec.followups += 1
@@ -45,7 +48,13 @@ function makeRecordingAgents() {
       dispose: async () => { calls.disposes += 1 },
     }
   }
-  return { create, resume: create, calls, bySession, control: (sessionId, patch) => Object.assign(bySession.get(sessionId) ?? {}, patch) }
+  return {
+    create, resume: create, calls, bySession,
+    control: (sessionId, patch) => Object.assign(bySession.get(sessionId) ?? {}, patch),
+    set createDelayMs(ms) { opts.createDelayMs = ms },
+    set idleDelayMs(ms) { opts.idleDelayMs = ms },
+    blockCreate: () => { let resolve; const promise = new Promise((r) => { resolve = r }); createGate = { promise, resolve }; return () => { createGate = null; resolve() } },
+  }
 }
 
 async function startInstance({ testEndpoints = true } = {}) {
@@ -79,6 +88,7 @@ async function startInstance({ testEndpoints = true } = {}) {
     if (Date.now() > deadline) throw new Error('就绪超时')
     await new Promise((r) => setTimeout(r, 100))
   }
+  const disposePlugin = async () => { for (const d of disposers.splice(0).reverse()) { try { await d() } catch { /* best effort */ } } }
   const api = async (path, body) => {
     const r = await fetch(`${base}${path}?token=${HOST_TOKEN}`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body ?? {}),
@@ -86,7 +96,7 @@ async function startInstance({ testEndpoints = true } = {}) {
     return { status: r.status, body: await r.json().catch(() => ({})) }
   }
   return {
-    api, agents,
+    api, agents, disposePlugin,
     close: async () => {
       for (const d of disposers.splice(0).reverse()) { try { await d() } catch { /* best effort */ } }
       try { server.closeAllConnections?.() } catch {}
@@ -189,4 +199,72 @@ test('默认关闭：warm/* 路由 404 且零会话创建；冷直连一次创�
     assert.equal((await on.api('/__perf/warm/turn', { handleId: 'unknown-handle', text: 'x' })).status, 404)
     assert.equal(on.agents.calls.creates, 1, '未知 handle 零创建')
   } finally { await on.close() }
+})
+
+test('opening 阶段：并发预占上限 / create 等待中卸载 / 预热等待中卸载 / open 超时迟到恰释放一次', async () => {
+  // ===== 并发 open：三个并发（create 延迟 180ms）→ 恰 2×200 + 1×409，creates=2 =====
+  {
+    const inst = await startInstance()
+    try {
+      inst.agents.createDelayMs = 180
+      const rs = await Promise.all([inst.api('/__perf/warm/open', {}), inst.api('/__perf/warm/open', {}), inst.api('/__perf/warm/open', {})])
+      const ok = rs.filter((r) => r.status === 200)
+      const conflict = rs.filter((r) => r.status === 409)
+      assert.equal(ok.length, 2, '并发 open：恰 2 个成功（预占配额生效）')
+      assert.equal(conflict.length, 1, '并发 open：第 3 个 409')
+      assert.equal(inst.agents.calls.creates, 2, '并发 open：恰创建 2 个会话（绕过上限已闭合）')
+    } finally { await inst.close() }
+  }
+  // ===== create 等待中插件 dispose：迟到 handle 恰释放一次、不登记、503 =====
+  {
+    const inst = await startInstance()
+    try {
+      const release = inst.agents.blockCreate()
+      const openPromise = inst.api('/__perf/warm/open', {})
+      await new Promise((r) => setTimeout(r, 80)) // open 进入 create 等待
+      await inst.disposePlugin() // 插件卸载（opening 通知 aborted）
+      release() // 迟到的 create 完成
+      const r = await openPromise
+      assert.equal(r.status, 503, '卸载后 open 拒绝（503）')
+      assert.equal(inst.agents.calls.creates, 1, 'create 恰发生一次')
+      await new Promise((r2) => setTimeout(r2, 100))
+      assert.equal(inst.agents.calls.disposes, 1, '迟到 handle 恰释放一次（不复活、不登记）')
+      assert.equal((await inst.api('/__perf/warm/close', { handleId: r.body?.handleId ?? 'x' })).status, 404)
+    } finally { await inst.close() }
+  }
+  // ===== 预热等待中卸载（create 已完成、whenIdle 慢）：同样 503 + 恰释放一次 =====
+  {
+    const inst = await startInstance()
+    try {
+      inst.agents.idleDelayMs = 400 // whenIdle 慢（create 后预热等待期）
+      const openPromise = inst.api('/__perf/warm/open', {})
+      await new Promise((r) => setTimeout(r, 120)) // create 已完成、预热在途
+      await inst.disposePlugin()
+      const r = await openPromise
+      assert.equal(r.status, 503, '预热等待中卸载 → 503')
+      await new Promise((r2) => setTimeout(r2, 500))
+      assert.equal(inst.agents.calls.disposes, 1, '预热中的迟到 handle 恰释放一次')
+    } finally { await inst.close() }
+  }
+  // ===== open 超时：不预热登记/不返回可用；迟到 create 恰释放一次；配额恢复 =====
+  {
+    const inst = await startInstance()
+    try {
+      const release = inst.agents.blockCreate()
+      const openPromise = inst.api('/__perf/warm/open', { openTimeoutMs: 300 })
+      const t0 = Date.now()
+      const r = await openPromise
+      assert.equal(r.status, 500, 'open 超时 → 500')
+      assert.ok(Date.now() - t0 < 900, '在超时上限附近返回（非等 create）')
+      release() // 迟到 create 完成
+      await new Promise((r2) => setTimeout(r2, 150))
+      assert.equal(inst.agents.calls.creates, 1)
+      assert.equal(inst.agents.calls.disposes, 1, '迟到 handle 恰释放一次')
+      // 配额恢复：随后两个 open 可成功
+      inst.agents.createDelayMs = 0
+      assert.equal((await inst.api('/__perf/warm/open', {})).status, 200, '配额恢复（1/2）')
+      assert.equal((await inst.api('/__perf/warm/open', {})).status, 200, '配额恢复（2/2）')
+      assert.equal((await inst.api('/__perf/warm/open', {})).status, 409, '上限仍生效')
+    } finally { await inst.close() }
+  }
 })
