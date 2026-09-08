@@ -2647,6 +2647,34 @@ export function apply(ctx, config = {}) {
           }
           respond(res, 405, { error: 'method not allowed' }); return
         }
+        // 共享电脑工作区概览（R-UI）：默认原生 Mac 视图数据——工作区路径 + 最近成果快照；
+        // 远程桌面仅在 computer.json 显式配置 vncUrl 时提供入口（不默认依赖 VNC）
+        if (method === 'GET' && suffix === '/workspace') {
+          const artifacts = []
+          try {
+            const { readdir } = await import('node:fs/promises')
+            for (const id of await readdir(join(stateDir, 'artifacts')).catch(() => [])) {
+              try {
+                const meta = JSON.parse(await readFile(join(stateDir, 'artifacts', id, 'meta.json'), 'utf8'))
+                if (meta?.name) artifacts.push({ id, name: meta.name, size: meta.size ?? 0, mime: meta.mime ?? '', taskId: meta.taskId ?? null, createdAt: meta.createdAt ?? null })
+              } catch { /* 跳过损坏 meta */ }
+            }
+          } catch { /* 无成果目录 */ }
+          artifacts.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
+          const comp = await loadComputerConfig()
+          respond(res, 200, {
+            workspace: join(stateDir, 'workspace'),
+            computer: { enabled: comp?.enabled === true, local: comp?.local === true, vncUrl: typeof comp?.vncUrl === 'string' ? comp.vncUrl : null },
+            artifacts: artifacts.slice(0, 12),
+          }); return
+        }
+        if (method === 'POST' && suffix === '/workspace/reveal') {
+          const ws = join(stateDir, 'workspace')
+          const real = await realpath(ws).catch(() => null)
+          if (!real) throw new HttpError(409, '工作区目录不存在')
+          await new Promise((ok, err) => spawn('open', ['-R', real], { stdio: 'ignore' }).on('exit', (code) => code === 0 ? ok() : err(new Error(`open exited ${code}`))))
+          respond(res, 200, { ok: true, path: real }); return
+        }
         // 静态素材：/assets/avatars/chief → assets-design/avatars/chief.svg
         const assetMatch = /^\/assets\/([a-z]+)\/([a-z0-9-]+)$/.exec(suffix)
         if (method === 'GET' && assetMatch) {

@@ -6,13 +6,13 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { renderAvatarSVG, renderLevelRing, ROLE_DEFS } from './avatars'
+import { renderAvatarSVG, renderLevelRing, ROLE_DEFS, resolveGlyph } from './avatars'
 import { TOKENS } from './tokens'
 
 /* ---------------- 头像 ---------------- */
 
 export function AvatarView(props: { seed: string; name?: string; glyph?: string; size: number; fontSize?: number; level?: number }): ReactNode {
-  const roleKey = props.glyph
+  const roleKey = resolveGlyph(props.glyph)
   const size = props.size
   const isKnown = roleKey && ROLE_DEFS[roleKey] !== undefined
   const ring = props.level !== undefined && props.level >= 4 ? renderLevelRing(props.level) : ''
@@ -248,7 +248,7 @@ export function MessageView(props: MessageViewProps): ReactNode {
     return (
       <div className="gkf-msg gkf-msg--bot">
         {props.senderName
-          ? <div className="gkf-msg__sender">{props.senderGlyph ? `${props.senderGlyph} ` : ''}{props.senderName}{time ? <span style={{ fontWeight: 400, color: TOKENS.color.text3, fontSize: TOKENS.font.time, marginLeft: 8 }}>{time}</span> : null}</div>
+          ? <div className="gkf-msg__sender" style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>{props.senderGlyph ? <AvatarView seed={props.senderName ?? 'bot'} name={props.senderName} glyph={props.senderGlyph} size={15} /> : null}{props.senderName}{time ? <span style={{ fontWeight: 400, color: TOKENS.color.text3, fontSize: TOKENS.font.time, marginLeft: 8 }}>{time}</span> : null}</div>
           : time ? <div className="gkf-msg__meta gkf-msg__meta--left">{time}</div> : null}
         <div className="gkf-msg__bubble">{props.markdown === false ? props.text : <MarkdownView text={props.text} />}</div>
         {props.artifact
@@ -381,7 +381,7 @@ export function TaskCard(props: TaskCardProps): ReactNode {
             {(props.members ?? []).map((member) => (
               <div key={member.name} className="gkf-task__member">
                 <span className="gkf-task__member-dot" style={{ background: dotColor(member.state) }} />
-                <span className="gkf-task__member-name">{member.glyph ? `${member.glyph} ` : ''}{member.name}</span>
+                <span className="gkf-task__member-name" style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>{member.glyph ? <AvatarView seed={member.name ?? 'bot'} name={member.name} glyph={member.glyph} size={15} /> : null}{member.name}</span>
                 <span className="gkf-task__member-desc">{member.desc}</span>
               </div>
             ))}

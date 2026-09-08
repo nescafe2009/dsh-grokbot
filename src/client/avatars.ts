@@ -199,3 +199,31 @@ export function renderStateIcon(state: 'thinking' | 'working' | 'success' | 'err
       return `<svg viewBox="0 0 24 24" width="${size}" height="${size}"><circle cx="12" cy="12" r="8" fill="none" stroke="rgba(29,29,31,.15)" stroke-width="2"/></svg>`
   }
 }
+
+
+/* ---------- 头像兼容解析（assets-design 统一入口） ----------
+ * 历史数据中 bot.avatar 存的是模板 emoji；显示层统一走 AvatarView：
+ * roleTemplate 优先；emoji 经 EMOJI_GLYPH 映射到 assets-design 角色；
+ * 未知值回退按名字哈希的果冻豆。不修改用户 bot 数据，仅显示层解析。 */
+export const EMOJI_GLYPH: Record<string, string> = {
+  '\u{1F916}': 'blank',      // 🤖
+  '\u{1F396}\uFE0F': 'chief', // 🎖️
+  '\u{1F6E0}\uFE0F': 'coder', // 🛠️
+  '\u{1F50E}': 'researcher', // 🔎
+  '\u{270D}\uFE0F': 'writer', // ✍️ (per templates ✍️)
+  '\u{1F4CA}': 'analyst',    // 📊
+  '\u{1F4CB}': 'pm',         // 📋
+  '\u{1F5A5}\uFE0F': 'ops',  // 🖥️
+  '\u{1F310}': 'translator', // 🌐
+  '\u{1F5C2}\uFE0F': 'secretary', // 🗂️
+  '\u{1F6E1}\uFE0F': 'reviewer',  // 🛡️
+}
+
+/** 显示层统一解析：已知角色键原样；emoji 映射到角色；其余 undefined（果冻豆回退） */
+export function resolveGlyph(glyph?: string | null): string | undefined {
+  if (!glyph) return undefined
+  const key = String(glyph).trim()
+  if (ROLE_DEFS[key] !== undefined) return key
+  const mapped = EMOJI_GLYPH[key]
+  return mapped !== undefined ? mapped : undefined
+}

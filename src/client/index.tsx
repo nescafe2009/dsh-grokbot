@@ -164,6 +164,9 @@ const GROKBOT_CSS = `
 .grokbot-sidebar__computer:hover { background:rgba(29,29,31,.06); }
 .grokbot-sidebar__computer-status { width:8px; height:8px; border-radius:50%; background:var(--gk-green); }
 .grokbot-sidebar__foot { border-top:1px solid var(--gk-line); padding:10px 14px; display:flex; align-items:center; gap:8px; }
+.gk-ico { display:inline-flex; align-items:center; justify-content:center; width:26px; height:26px; font-size:16px; line-height:1; flex:none; }
+.gk-lbl { flex:1; text-align:left; }
+.gk-foot-ico { width:34px; height:34px; padding:0; display:inline-flex; align-items:center; justify-content:center; }
 /* 窄窗 rail 模式：宿主折叠侧栏列（~79px）时只保留头像/图标列 */
 .grokbot-sidebar.gk-rail { overflow:hidden; }
 .gk-rail .grokbot-sidebar__search, .gk-rail .grokbot-sidebar__section, .gk-rail .gkf-row__main,
@@ -172,6 +175,9 @@ const GROKBOT_CSS = `
 .gk-rail .grokbot-sidebar__list { padding:0 4px 8px; }
 .gk-rail .gkf-row { justify-content:center; padding:10px 2px; min-height:52px; }
 .gk-rail .grokbot-sidebar__foot { flex-direction:column; padding:8px 0; gap:10px; }
+.gk-rail .grokbot-sidebar__computer { width:auto; padding:4px; justify-content:center; }
+.gk-rail .gk-lbl, .gk-rail .grokbot-sidebar__computer-status { display:none !important; }
+.gk-rail .grokbot-routinemenu { display:none !important; }
 .gk-rail .grokbot-sidebar__computer { padding:6px; font-size:0; }
 .gk-rail .grokbot-sidebar__computer-status { display:none; }
 .grokbot-sidebar__user { display:flex; align-items:center; gap:8px; flex:1; min-width:0; font-size:12.5px; font-weight:600; color:var(--gk-text-2); }
@@ -616,7 +622,8 @@ function RoomForm(props: {
       {props.bots.map((bot) => (
         <label key={bot.id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5, cursor: 'pointer' }}>
           <input type="checkbox" style={{ width: 'auto', flex: 'none' }} checked={selected.includes(bot.id)} onChange={() => toggle(bot.id)} />
-          <span>{bot.avatar} {bot.name}</span>
+          <AvatarView seed={bot.id} name={bot.name} glyph={bot.roleTemplate || bot.avatar} size={17} />
+          <span>{bot.name}</span>
         </label>
       ))}
       {error ? <span style={{ color: '#cf1322', fontSize: 11.5 }}>{error}</span> : null}
@@ -669,6 +676,8 @@ export function GrokbotSidebarCrew(): ReactNode {
   const nativeVisible = useNativeSidebarVisible()
   const [grouping, setGrouping] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
+  const [routinesOpen, setRoutinesOpen] = useState(false)
+  const [routineList, setRoutineList] = useState<{ id: string; botId: string; prompt: string; schedule: { everyMinutes?: number; time?: string }; enabled: boolean }[] | null>(null)
   const [creatingBot, setCreatingBot] = useState(false)
   const [filter, setFilter] = useState('')
   const rootRef = useRef<HTMLDivElement | null>(null)
@@ -806,7 +815,7 @@ export function GrokbotSidebarCrew(): ReactNode {
               {allBots.filter((bot) => !bot.hidden).length > 0 ? <div className="grokbot-newmenu__divider" /> : null}
               {allBots.filter((bot) => !bot.hidden).map((bot) => (
                 <button key={bot.id} type="button" className="grokbot-newmenu__item" onClick={() => { setMenuOpen(false); openBot(bot.id) }}>
-                  <span className="grokbot-newmenu__icon">{bot.avatar}</span>{bot.name}
+                  <span className="grokbot-newmenu__icon"><AvatarView seed={bot.id} name={bot.name} glyph={bot.roleTemplate || bot.avatar} size={22} /></span>{bot.name}
                 </button>
               ))}
             </div>
@@ -822,7 +831,7 @@ export function GrokbotSidebarCrew(): ReactNode {
           const stack = isGroup
             ? conversation.memberBotIds.slice(0, 2).map((botId) => {
                 const member = botOf(botId)
-                return { seed: botId, name: member?.name, glyph: member?.roleTemplate || undefined }
+                return { seed: botId, name: member?.name, glyph: member?.roleTemplate || member?.avatar }
               })
             : undefined
           return (
@@ -830,7 +839,7 @@ export function GrokbotSidebarCrew(): ReactNode {
               key={conversation.id}
               seed={isGroup ? conversation.id : (bot?.id ?? conversation.id)}
               name={rowTitle(conversation)}
-              glyph={isGroup ? 'group' : (bot?.roleTemplate || undefined)}
+              glyph={isGroup ? 'group' : (bot?.roleTemplate || bot?.avatar)}
               stack={stack && stack.length > 1 ? stack : undefined}
               preview={rowPreview(conversation)}
               time={timeLabel(conversation.lastAt)}
@@ -842,14 +851,88 @@ export function GrokbotSidebarCrew(): ReactNode {
           )
         })}
       </div>
+      {routinesOpen ? (
+        <div className="grokbot-routinemenu" role="dialog" aria-label="例行任务" style={{ borderTop: '1px solid var(--gk-line, rgba(29,29,31,.1))', padding: '10px 12px', maxHeight: 220, overflowY: 'auto' }}>
+          <div style={{ fontSize: 12, fontWeight: 650, marginBottom: 6 }}>例行任务{routineList ? `（${routineList.length}）` : ''}</div>
+          {routineList === null ? <div style={{ fontSize: 12, opacity: .5 }}>加载中…</div> : null}
+          {routineList?.length === 0 ? (
+            <div style={{ fontSize: 11.5, opacity: .6, lineHeight: 1.6 }}>
+              还没有例行任务。进入任意助手 → 右上角 ⚙ 详情 → 「例行任务」可创建定时执行。
+            </div>
+          ) : null}
+          {routineList?.map((r) => (
+            <button key={r.id} type="button" className="grokbot-newmenu__item" style={{ padding: '7px 8px' }} onClick={() => { setRoutinesOpen(false); openBot(r.botId) }}>
+              <span className="grokbot-newmenu__icon" aria-hidden>⏱</span>
+              <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+                <span style={{ fontSize: 12.5, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.prompt.slice(0, 26) || '例行任务'}</span>
+                <span style={{ fontSize: 10.5, opacity: .55 }}>{botOf(r.botId)?.name ?? r.botId} · {r.schedule.time ? `每天 ${r.schedule.time}` : `每 ${r.schedule.everyMinutes ?? '?'} 分钟`}{r.enabled ? '' : ' · 已停用'}</span>
+              </span>
+            </button>
+          ))}
+        </div>
+      ) : null}
       <div className="grokbot-sidebar__foot">
-        <button type="button" className="grokbot-sidebar__computer" onClick={() => openComputer()}>
-          <span>🖥️ 电脑</span>
-          <span className="grokbot-sidebar__computer-status" />
+        <button type="button" className="grokbot-sidebar__computer" aria-label="共享电脑：本机工作区与任务成果" title="共享电脑：本机工作区与任务成果" onClick={() => openComputer()}>
+          <span className="gk-ico" aria-hidden>🖥️</span>
+          <span className="gk-lbl">电脑</span>
+          <span className="grokbot-sidebar__computer-status" aria-hidden />
         </button>
-        <span className="grokbot-sidebar__user"><span className="uavatar">B</span>bo zhao</span>
-        <button type="button" className="grokbot-iconbtn" title={routines.length > 0 ? `${routines.length} 个例行任务` : '例行任务'}>⏱</button>
+        <button type="button" className="grokbot-iconbtn gk-foot-ico" aria-label={routines.length > 0 ? `例行任务（${routines.length} 个）` : '例行任务（暂无）'} title={routines.length > 0 ? `${routines.length} 个例行任务` : '例行任务（暂无）'} onClick={() => { const next = !routinesOpen; setRoutinesOpen(next); if (next && routineList === null) { api('/routines').then((r) => setRoutineList(r?.routines ?? [])).catch(() => setRoutineList([])) } }}>
+          <span className="gk-ico" aria-hidden>⏱</span>
+        </button>
       </div>
+    </div>
+  )
+}
+
+
+/* ---------------- 共享电脑 · 本机工作区（R-UI） ---------------- */
+
+function ComputerView(): ReactNode {
+  const [data, setData] = useState<{ workspace: string; computer: { enabled: boolean; local: boolean; vncUrl: string | null }; artifacts: { id: string; name: string; size: number; mime: string; taskId: string | null; createdAt: number | null }[] } | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [revealing, setRevealing] = useState(false)
+  useEffect(() => {
+    let alive = true
+    api('/workspace').then((r) => { if (alive) setData(r) }).catch((e) => { if (alive) setError(String(e?.message ?? e)) })
+    return () => { alive = false }
+  }, [])
+  const fmtSize = (n: number) => n > 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : n > 1024 ? `${(n / 1024).toFixed(0)} KB` : `${n} B`
+  const fmtTime = (ts: number | null) => ts ? new Date(ts).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : ''
+  return (
+    <div className="grokbot-computer" style={{ padding: '28px 32px', overflowY: 'auto', height: '100%', boxSizing: 'border-box' }}>
+      <div style={{ fontSize: 19, fontWeight: 700, marginBottom: 4 }}>🖥️ 共享电脑 · 本机工作区</div>
+      <div style={{ fontSize: 12.5, color: 'var(--gk-text-2, #6b6b70)', marginBottom: 20 }}>团队成员在本机 Mac 工作区直接执行任务；任务交付的成果原件保存在下方，可预览或保存副本。</div>
+      {error ? <div style={{ fontSize: 13, color: '#cf1322' }}>加载失败：{error}</div> : null}
+      {data ? (
+        <>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 14px', border: '1px solid rgba(29,29,31,.12)', borderRadius: 12, marginBottom: 22, background: 'rgba(255,255,255,.7)' }}>
+            <span aria-hidden style={{ fontSize: 22 }}>📁</span>
+            <span style={{ flex: 1, minWidth: 0 }}>
+              <span style={{ display: 'block', fontSize: 13, fontWeight: 600 }}>工作区目录</span>
+              <span style={{ display: 'block', fontSize: 11.5, opacity: .6, fontFamily: 'ui-monospace,Menlo,monospace', overflowWrap: 'anywhere' }}>{data.workspace}</span>
+            </span>
+            <button type="button" disabled={revealing} onClick={() => { setRevealing(true); api('/workspace/reveal', { method: 'POST' }).catch((e) => window.alert(`打开失败：${String(e)}`)).finally(() => setRevealing(false)) }} style={{ border: '1px solid rgba(29,29,31,.18)', background: '#fff', borderRadius: 9, padding: '7px 14px', fontSize: 12.5, cursor: 'pointer' }}>{revealing ? '打开中…' : '在 Finder 中显示'}</button>
+          </div>
+          <div style={{ fontSize: 14, fontWeight: 650, margin: '0 0 10px' }}>最近成果</div>
+          {data.artifacts.length === 0
+            ? <div style={{ fontSize: 12.5, opacity: .55, padding: '18px 14px', border: '1px dashed rgba(29,29,31,.15)', borderRadius: 12 }}>还没有成果——给助手派个任务，让它交付文件后会出现在这里。</div>
+            : (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(190px, 1fr))', gap: 10 }}>
+                {data.artifacts.map((a) => (
+                  <button key={a.id} type="button" onClick={() => window.open(`/api/plugins/grokbot/artifacts/${a.id}`, '_blank')} style={{ textAlign: 'left', border: '1px solid rgba(29,29,31,.12)', borderRadius: 12, padding: '12px 13px', background: '#fff', cursor: 'pointer' }}>
+                    <span style={{ display: 'block', fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.name}</span>
+                    <span style={{ display: 'block', fontSize: 11, opacity: .55, marginTop: 4 }}>{fmtSize(a.size)}{a.createdAt ? ` · ${fmtTime(a.createdAt)}` : ''}</span>
+                    <span style={{ display: 'inline-block', marginTop: 8, fontSize: 11, color: '#1f6feb' }}>预览 / 保存副本 ↗</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          {data.computer.vncUrl
+            ? <div style={{ marginTop: 22 }}><a href={data.computer.vncUrl} target="_blank" rel="noreferrer" style={{ fontSize: 12.5, color: '#1f6feb' }}>打开远程桌面（已在 computer.json 显式配置）↗</a></div>
+            : null}
+        </>
+      ) : !error ? <div style={{ fontSize: 13, opacity: .5 }}>加载中…</div> : null}
     </div>
   )
 }
@@ -980,7 +1063,7 @@ function MembersPanel(props: { conversation: { id: string; name: string; memberB
       {members.map((member) => (
         <div key={member.id} className="grokbot-member" style={{ justifyContent: 'space-between' }}>
           <span style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <span className="mavatar" style={{ display:'inline-flex' }}><AvatarView seed={member.id} name={member.name} glyph={member.roleTemplate || undefined} size={30} /></span>{member.name}
+            <span className="mavatar" style={{ display:'inline-flex' }}><AvatarView seed={member.id} name={member.name} glyph={member.roleTemplate || member.avatar} size={30} /></span>{member.name}
           </span>
           {members.length > 1 ? (
             <button type="button" className="grokbot-iconbtn" title="移出会话" disabled={busy} onClick={() => void mutate(member.id, true)}>✕</button>
@@ -993,7 +1076,7 @@ function MembersPanel(props: { conversation: { id: string; name: string; memberB
             {candidates.length === 0 ? <div style={{ fontSize: 12, opacity: .55 }}>没有可添加的 Bot（先创建更多专家）</div> : null}
             {candidates.map((candidate) => (
               <button key={candidate.id} type="button" className="grokbot-newmenu__item" disabled={busy} onClick={() => { setAdding(false); void mutate(candidate.id, false) }}>
-                <span className="grokbot-newmenu__icon">{candidate.avatar}</span>{candidate.name}
+                <span className="grokbot-newmenu__icon"><AvatarView seed={candidate.id} name={candidate.name} glyph={candidate.roleTemplate || candidate.avatar} size={22} /></span>{candidate.name}
               </button>
             ))}
             <button type="button" className="grokbot-form__cancel" onClick={() => setAdding(false)}>取消</button>
@@ -1236,7 +1319,7 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
               <TaskCard
                 title={bot.currentJob ? `任务 ${bot.currentJob.slice(0, 24)}` : `${bot.name} 正在执行`}
                 status="running"
-                members={[{ name: bot.name, glyph: bot.avatar, desc: bot.title || '正在使用本机工具执行任务', state: 'running' }]}
+                members={[{ name: bot.name, glyph: bot.roleTemplate || bot.avatar, desc: bot.title || '正在使用本机工具执行任务', state: 'running' }]}
                 time={null}
                 executor="本机"
                 actions={bot.currentRunId && bot.currentTaskId
@@ -1480,7 +1563,10 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
         <span className="grokbot-chat__title" onClick={() => setDetailsOpen((v) => !v)}>
           <span className="grokbot-chat__name">{room.name}</span>
           <span className="grokbot-chat__meta">
-            {room.memberBotIds.map((botId) => `${botOf(botId)?.avatar ?? '🤖'}${botOf(botId)?.name ?? botId}`).join('　')}
+            {room.memberBotIds.map((botId) => {
+              const m = botOf(botId)
+              return <span key={botId} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, marginRight: 10 }}><AvatarView seed={botId} name={m?.name} glyph={m?.roleTemplate || m?.avatar} size={17} /><span>{m?.name ?? botId}</span></span>
+            })}
           </span>
         </span>
         <button type="button" className="grokbot-chat__close" onClick={closeTarget} aria-label="关闭">✕</button>
@@ -1509,7 +1595,7 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
                   text={splitChips(message.text).body}
                   at={message.ts}
                   senderName={bot?.name ?? message.botId}
-                  senderGlyph={bot?.avatar}
+                  senderGlyph={bot?.roleTemplate || bot?.avatar}
                   artifact={message.artifact}
                   onContinueArtifact={(a) => { if (a.taskId) setDraftTask({ taskId: a.taskId, name: a.name }) }}
                 />
@@ -1521,7 +1607,7 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
             key={q.jobId}
             title={`排队中：${String(q.text).slice(0, 30) || '任务'}`}
             status="queued"
-            members={[{ name: bots.find((b) => b.id === q.botId)?.name ?? q.botId, glyph: bots.find((b) => b.id === q.botId)?.avatar, desc: '等待执行（当前有任务占用）', state: 'idle' }]}
+            members={[{ name: bots.find((b) => b.id === q.botId)?.name ?? q.botId, glyph: (bots.find((b) => b.id === q.botId)?.roleTemplate || bots.find((b) => b.id === q.botId)?.avatar), desc: '等待执行（当前有任务占用）', state: 'idle' }]}
             actions={[{ label: '取消排队', onClick: () => {
               void api(`/queue/${encodeURIComponent(q.jobId)}/cancel`, { method: 'POST' })
                 .catch((e: unknown) => window.alert(`取消排队失败：${String(e)}`))
@@ -1536,7 +1622,7 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
               key={b.id}
               title={stopping ? `${b.name} 停止确认中…` : `${b.name} 正在执行任务`}
               status={stopping ? 'confirm-stop' : 'running'}
-              members={[{ name: b.name, glyph: b.avatar, desc: b.title || '使用本机工具执行', state: 'running' }]}
+              members={[{ name: b.name, glyph: b.roleTemplate || b.avatar, desc: b.title || '使用本机工具执行', state: 'running' }]}
               executor="本机"
               actions={cancellable
                 ? [{ label: stopping ? '停止确认中…' : '取消本次', disabled: stopping, onClick: () => {
@@ -1742,7 +1828,7 @@ export function GrokbotMainView(): ReactNode {
       style={{ position: 'fixed', left: box.left, top: box.top, width: box.width, height: box.height, zIndex: 900 }}
     >
       {(() => {
-        if (isComputer) return <iframe src="http://127.0.0.1:6080/vnc.html?autoconnect=true" style={{ width: '100%', height: '100%', border: 'none' }} />
+        if (isComputer) return <ComputerView />
         if (bot) return <BotChatView bot={bot} state={state} />
         if (conversation && isGroup) return <GroupChatView conversation={conversation} bots={state?.bots ?? []} queued={(state?.queued ?? []).filter((q) => q.conversationId === conversation.id)} />
         if (creatingUi || entering) {
