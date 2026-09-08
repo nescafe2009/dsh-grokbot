@@ -15,6 +15,8 @@ const HOST_TOKEN = 'warm-harness-token'
 function makeRecordingAgents() {
   const calls = { creates: 0, disposes: 0, followups: 0 }
   const bySession = new Map() // sessionId -> { followups, slowMs, throwOnce }
+  const pendingPatches = new Map() // sessionId -> patch（会话创建前预置，创建时消费）
+  const pendingNext = [] // 下一个创建的会话消费（服务端 sessionId 为随机值，请求前无法预知）
   const opts = { createDelayMs: 0, idleDelayMs: 0 }
   let createGate = null // { promise, resolve }：可选 create 门闸（精确控制 in-flight 时点）
   const create = async (base = {}) => {
@@ -22,18 +24,26 @@ function makeRecordingAgents() {
     if (opts.createDelayMs) await new Promise((r) => setTimeout(r, opts.createDelayMs))
     calls.creates += 1
     const sessionId = String(base.sessionId ?? `sess-${calls.creates}`)
-    const rec = { followups: 0, slowMs: 0, throwOnce: false }
+    const rec = { followups: 0, slowMs: 0, throwOnce: false, throwFollowupOnce: false, throwIdleOnce: 0, idleGate: null }
     bySession.set(sessionId, rec)
+    const patch = pendingPatches.get(sessionId) ?? pendingNext.shift()
+    if (pendingPatches.has(sessionId)) pendingPatches.delete(sessionId)
+    if (patch) { typeof patch === 'function' ? patch(rec) : Object.assign(rec, patch) }
     let seq = 0
     const events = []
     return {
       agent: {
         session: { get seq() { return seq }, events },
-        whenIdle: async () => { if (rec.slowMs || opts.idleDelayMs) await new Promise((r) => setTimeout(r, rec.slowMs || opts.idleDelayMs)) },
+        whenIdle: async () => {
+          if (rec.idleGate) await rec.idleGate.promise
+          if (rec.throwIdleOnce > 0) { rec.throwIdleOnce -= 1; throw new Error('whenIdle exploded') }
+          if (rec.slowMs || opts.idleDelayMs) await new Promise((r) => setTimeout(r, rec.slowMs || opts.idleDelayMs))
+        },
         followup(msg) {
           calls.followups += 1
           rec.followups += 1
           if (rec.throwOnce) { rec.throwOnce = false; throw new Error('agent exploded') }
+          if (rec.throwFollowupOnce) { rec.throwFollowupOnce = false; throw new Error('followup exploded') }
           const text = String(msg?.content?.[0]?.text ?? '')
           const reply = text.includes('bash') ? 'done' : 'OK'
           if (text.includes('#TOOLEV')) {
@@ -50,10 +60,15 @@ function makeRecordingAgents() {
   }
   return {
     create, resume: create, calls, bySession,
-    control: (sessionId, patch) => Object.assign(bySession.get(sessionId) ?? {}, patch),
+    control: (sessionId, patch) => {
+      const rec = bySession.get(sessionId)
+      if (rec) { typeof patch === 'function' ? patch(rec) : Object.assign(rec, patch) }
+      else pendingPatches.set(sessionId, patch)
+    },
     set createDelayMs(ms) { opts.createDelayMs = ms },
     set idleDelayMs(ms) { opts.idleDelayMs = ms },
     blockCreate: () => { let resolve; const promise = new Promise((r) => { resolve = r }); createGate = { promise, resolve }; return () => { createGate = null; resolve() } },
+    patchNextCreate: (patch) => pendingNext.push(patch),
   }
 }
 
@@ -266,5 +281,82 @@ test('opening 阶段：并发预占上限 / create 等待中卸载 / 预热等�
       assert.equal((await inst.api('/__perf/warm/open', {})).status, 200, '配额恢复（2/2）')
       assert.equal((await inst.api('/__perf/warm/open', {})).status, 409, '上限仍生效')
     } finally { await inst.close() }
+  }
+})
+
+test('opening 统一持有：work 异常清理 / 终止后不预热 / 永久 gate 不等待即释放 / 迟到不二次释放', async () => {
+  // (a) followup 抛错（create 已成功）：500 + 已取得 handle 恰释放（此前 rejection 丢弃泄漏 disposes=0）
+  {
+    const inst = await startInstance()
+    try {
+      inst.agents.patchNextCreate({ throwFollowupOnce: true }) // 本次 open 的会话
+      const r = await inst.api('/__perf/warm/open', {})
+      assert.equal(r.status, 500, 'followup 异常 → 500')
+      await new Promise((r2) => setTimeout(r2, 80))
+      assert.equal(inst.agents.calls.creates, 1)
+      assert.equal(inst.agents.calls.disposes, 1, '已取得 handle 必须释放（不再随 rejection 丢弃）')
+    } finally { await inst.close() }
+  }
+  // (b) whenIdle 抛错（第二次，预热等待）：同样释放
+  {
+    const inst = await startInstance()
+    try {
+      inst.agents.patchNextCreate({ throwIdleOnce: 2 }) // 前两次 whenIdle 中第二次抛（预热等待处）
+      const r = await inst.api('/__perf/warm/open', {})
+      assert.equal(r.status, 500)
+      await new Promise((r2) => setTimeout(r2, 80))
+      assert.equal(inst.agents.calls.disposes, 1, 'whenIdle 异常：handle 释放')
+    } finally { await inst.close() }
+  }
+  // (c) create 等待中卸载：503 + 迟到 create 清理，且终止后【零预热】
+  {
+    const inst = await startInstance()
+    try {
+      const release = inst.agents.blockCreate()
+      const openPromise = inst.api('/__perf/warm/open', {})
+      await new Promise((r) => setTimeout(r, 80))
+      await inst.disposePlugin()
+      const r = await openPromise // abortSignal 立即唤醒：不等 create
+      assert.equal(r.status, 503, '卸载立即 503（不等 create）')
+      release() // create 迟到完成
+      await new Promise((r2) => setTimeout(r2, 150))
+      assert.equal(inst.agents.calls.creates, 1)
+      assert.equal(inst.agents.calls.followups, 0, '终止后不得预热（followups=0）')
+      assert.equal(inst.agents.calls.disposes, 1, '迟到 create 恰释放一次')
+    } finally { await inst.close() }
+  }
+  // (d) 预热永久 gate + 超时：无需等 gate 即释放已取得 handle；gate 放行后不二次释放
+  {
+    const inst = await startInstance()
+    let releaseGate = null
+    try {
+      inst.agents.patchNextCreate((rec) => { let resolve; rec.idleGate = { promise: new Promise((r) => { resolve = r }) }; releaseGate = () => resolve() })
+      const t0 = Date.now()
+      const r = await inst.api('/__perf/warm/open', { openTimeoutMs: 300 })
+      assert.equal(r.status, 500, '超时 → 500')
+      assert.ok(Date.now() - t0 < 900, '不等永久 gate 即返回')
+      assert.equal(inst.agents.calls.creates, 1, 'create 已取得 handle')
+      await new Promise((r2) => setTimeout(r2, 120))
+      assert.equal(inst.agents.calls.disposes, 1, 'gate 未放行也已释放（取消在途 whenIdle）')
+      releaseGate?.() // 迟到放行
+      await new Promise((r2) => setTimeout(r2, 120))
+      assert.equal(inst.agents.calls.disposes, 1, '迟到不二次释放')
+      assert.equal(inst.agents.calls.followups, 0, '首 whenIdle 永挂：未进入预热')
+    } finally { releaseGate?.(); await inst.close() }
+  }
+  // (e) 预热永久 gate + 卸载：503 立即（不等 gate），handle 释放
+  {
+    const inst = await startInstance()
+    let releaseGate = null
+    try {
+      inst.agents.patchNextCreate((rec) => { let resolve; rec.idleGate = { promise: new Promise((r) => { resolve = r }) }; releaseGate = () => resolve() })
+      const openPromise = inst.api('/__perf/warm/open', {})
+      await new Promise((r) => setTimeout(r, 100)) // create 完成，whenIdle 挂起中
+      await inst.disposePlugin()
+      const r = await openPromise
+      assert.equal(r.status, 503, '卸载立即 503（不等 gate）')
+      await new Promise((r2) => setTimeout(r2, 120))
+      assert.equal(inst.agents.calls.disposes, 1, 'gate 未放行已释放')
+    } finally { releaseGate?.(); await inst.close() }
   }
 })

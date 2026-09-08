@@ -2455,20 +2455,23 @@ export function apply(ctx, config = {}) {
           // 同步预占配额（此段无 await，检查+登记原子）：opening + ready 合计 ≤ 上限——
           // 并发 open 不能在异步 create/预热期间绕过上限
           if (warmHandles.size + warmPending.size >= WARM_MAX_ACTIVE) throw new HttpError(409, `活跃暖直连 handle已达上限 ${WARM_MAX_ACTIVE}`)
-          warmPending.set(handleId, { aborted: false })
+          const pending = { aborted: false, wake: null } // 卸载即唤醒（不等待 work/create/预热完成）
+          warmPending.set(handleId, pending)
           const quotaRelease = () => { warmPending.delete(handleId) } // 配额恢复（失败/超时/卸载路径统一）
           const sessionId = randomUUID() // 专用会话：与用户会话命名空间无关，fixture 无法指定
           const warmText = String(body?.text ?? '预热：只回复 OK。')
           const ttlMs = Math.max(1_000, Math.min(WARM_TTL_MS, Number(body?.ttlMs) || WARM_TTL_MS))
           const openTimeoutMs = Math.max(200, Math.min(60_000, Number(body?.openTimeoutMs) || 30_000))
           const t0 = Date.now()
-          // 迟到 handle（超时后 create/预热才完成 / 卸载后到达）：恰释放一次，不登记不返回
-          let lateReleased = false
-          const releaseLate = async (r) => {
-            if (!r?.handle || lateReleased) return
-            lateReleased = true
-            try { r.handle.agent.cancel({ kind: 'user' }, { keepInbox: true }) } catch { /* best effort */ }
-            try { await r.handle.dispose() } catch { /* best effort */ }
+          // 统一持有 + 终止状态 + 一次释放守卫：handle 一经 create 取得立即发布到 st；
+          // 超时/卸载/异常任一路径触发 terminal 后，work 在每个异步边界检查并停止（不再预热/等待）
+          const st = { handle: null, terminal: false, released: false }
+          const releaseOnce = async (reason) => {
+            if (st.released || !st.handle) return
+            st.released = true
+            try { st.handle.agent.cancel({ kind: 'user' }, { keepInbox: true }) } catch { /* best effort */ }
+            try { await st.handle.dispose() } catch { /* best effort */ }
+            ctx.logger?.info?.(`grokbot 暖直连 opening handle 释放（${reason}）`)
           }
           const work = (async () => {
             const fallbackSel = typeof ctx.agentDefaultModel?.currentSelection === 'function' ? ctx.agentDefaultModel.currentSelection() : null
@@ -2481,23 +2484,32 @@ export function apply(ctx, config = {}) {
               ...(sel ? { agentOptions: sel } : {}),
               setup: () => { /* 不注册任何插件工具——纯 DSH */ },
             })
+            st.handle = handle // 已取得：立即发布到统一持有（此后任何异常路径都可释放，不再随 rejection 丢弃）
+            if (st.terminal) { await releaseOnce('late-create'); return } // create 迟到：立即清理，不预热
             await handle.agent.whenIdle()
+            if (st.terminal) { await releaseOnce('terminal'); return }
             const firstSeq = handle.agent.session.seq
-            handle.agent.followup(userMessage(warmText))
+            handle.agent.followup(userMessage(warmText)) // 若抛错：work.catch 统一释放
+            if (st.terminal) { await releaseOnce('terminal'); return }
             await handle.agent.whenIdle()
+            if (st.terminal) { await releaseOnce('terminal'); return }
             const turn = summarizeTurn(handle.agent.session.events, firstSeq)
             return { handle, warmupMs: Date.now() - t0, warmupStatus: turn?.error ? 'failed' : (turn?.text?.trim() ? 'ok' : 'empty') }
           })()
+          // work 自身异常（create 失败后的步骤：whenIdle/followup 抛错）：已取得 handle 也必须清理
+          work.catch(() => { st.terminal = true; void releaseOnce('work-error') })
           let openTimer = null
           const openTimeout = new Promise((_, reject) => {
             openTimer = setTimeout(() => reject(new Error(`warm open timeout after ${openTimeoutMs}ms`)), openTimeoutMs)
             openTimer.unref?.()
           })
+          const abortSignal = new Promise((_, reject) => { pending.wake = () => reject(new HttpError(503, '插件正在卸载：暖直连 open 已取消')) })
           try {
-            const result = await Promise.race([work, openTimeout])
-            if (warmPending.get(handleId)?.aborted) {
-              // 卸载发生在 create/预热期间：迟到 handle 恰释放一次，不登记不返回可用
-              await releaseLate(result)
+            const result = await Promise.race([work, openTimeout, abortSignal])
+            if (pending.aborted) {
+              // 卸载恰在 work 完成同刻：拒收（handle 恰释放一次，不登记）
+              st.terminal = true
+              void releaseOnce('aborted-race')
               throw new HttpError(503, '插件正在卸载：暖直连 open 已取消')
             }
             const entry = { handle: result.handle, sessionId, busy: false, createdAt: Date.now(), expiresAt: Date.now() + ttlMs, timer: null, turns: 0 }
@@ -2508,9 +2520,10 @@ export function apply(ctx, config = {}) {
             logPerf({ kind: 'dsh-warm-open', conversationId: '__perf__', ms: result.warmupMs, status: result.warmupStatus })
             respond(res, 200, { handleId, sessionId, warmupMs: result.warmupMs, warmupStatus: result.warmupStatus, ttlMs, maxActive: WARM_MAX_ACTIVE }); return
           } catch (error) {
+            // 超时/卸载/异常统一：立即 terminal + 释放已取得 handle（不等 work；create 迟到由 work 边界清理）
+            st.terminal = true
+            void releaseOnce('open-failed')
             quotaRelease() // 配额恢复：不预热登记、不返回可用 handle
-            // work 仍在途（超时）或已完成但被拒：迟到结果恰释放一次
-            void work.then((r) => releaseLate(r), () => { /* create/预热自身失败：handle 由 work 内已抛出，无迟到 */ })
             throw error instanceof HttpError ? error : new HttpError(500, `暖直连 open 失败：${safeError(error)}`)
           } finally {
             if (openTimer) clearTimeout(openTimer)
@@ -3124,7 +3137,10 @@ export function apply(ctx, config = {}) {
 
   ctx.effect(() => () => {
     disposed = true
-    for (const pending of warmPending.values()) pending.aborted = true // opening 中的 open：迟到 handle 将被拒并恰释放一次
+    for (const pending of warmPending.values()) {
+      pending.aborted = true
+      pending.wake?.() // 立即唤醒等待中的 open（不等 create/预热完成）；已取得 handle 随 terminal 释放，迟到 create 由 work 边界清理
+    }
     for (const handleId of [...warmHandles.keys()]) void disposeWarmHandle(handleId, 'plugin-dispose')
     for (const probe of busyProbes.values()) clearInterval(probe)
     busyProbes.clear()
