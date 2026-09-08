@@ -738,3 +738,208 @@ test('Codex: offscreen older success must not clear newer failure retry (group)'
     assert.equal(JSON.parse(last.body).requestId, newerId, '群聊重试必须复用新失败的 requestId')
   } finally { await act(async () => c.root.unmount()); c.el.remove(); teardownMockFetch() }
 })
+
+// ===== 18. 跨视图卸载/重挂：DM 草稿+任务引用保留且归属正确 =====
+test('卸载重挂：DM A 草稿+任务引用保留，群视图不继承，重挂后发送带原 taskId', async () => {
+  setupMockFetch()
+  const a = makeBot('umA', 'A')
+  const bots = [makeBot('cx'), makeBot('cy')]
+  const g = makeConv('umG', ['cx', 'cy'])
+  const histData = { messages: [{ ts: 1, role: 'bot', text: 'card', artifact: { id: 'art-um1', name: 'report.html', size: 10, mime: 'text/html', sha256: 'x'.repeat(64), taskId: 'task-um1' } }] }
+  const typeInto = async (el, text) => {
+    const ta = el.querySelector('textarea')
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text)
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+  }
+  const mounts = []
+  try {
+    // 挂载 A：历史带交付卡（taskId）
+    const c1 = createContainer(); mounts.push(c1)
+    await render(React.createElement(BotChatView, { bot: a, state: null }), c1)
+    await act(async () => {
+      const hi = deferredQueue.findIndex(d => d.call.url.includes('/umA') && d.call.method === 'GET')
+      if (hi >= 0) deferredQueue.splice(hi, 1)[0].resolve({ ok: true, status: 200, json: async () => histData, text: async () => '{}' })
+      await new Promise(r => setTimeout(r, 20))
+    })
+    const contBtn = [...c1.el.querySelectorAll('button')].find(b => b.textContent.includes('继续修改'))
+    assert.ok(contBtn, '交付卡「继续修改」入口存在')
+    await act(async () => contBtn.click())
+    await typeInto(c1.el, 'um-draft-A')
+    // 卸载 A（父级切到群视图：互斥渲染）
+    await act(async () => c1.root.unmount()); c1.el.remove()
+
+    // 挂载群：不继承 A 的草稿/任务引用
+    const c2 = createContainer(); mounts.push(c2)
+    await render(React.createElement(GroupChatView, { conversation: g, bots }), c2)
+    assert.equal(c2.el.querySelector('textarea').value, '', '群视图不继承 A 草稿')
+    assert.ok(!c2.el.textContent.includes('继续修改：'), '群视图不继承 A 任务引用')
+    await act(async () => c2.root.unmount()); c2.el.remove()
+
+    // 重挂 A：草稿与任务引用恢复且归属正确
+    const c3 = createContainer(); mounts.push(c3)
+    await render(React.createElement(BotChatView, { bot: a, state: null }), c3)
+    assert.equal(c3.el.querySelector('textarea').value, 'um-draft-A', '卸载重挂后 DM 草稿保留')
+    assert.ok(c3.el.textContent.includes('继续修改：report.html'), '任务引用（附件选择）恢复')
+    await act(async () => [...c3.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    const post = fetchCalls.filter(f => f.url.includes('/umA/chat')).at(-1)
+    assert.equal(JSON.parse(post.body).taskId, 'task-um1', '发送携带恢复的任务引用')
+    assert.equal(JSON.parse(post.body).text, 'um-draft-A', '发送内容为恢复的草稿')
+  } finally {
+    for (const c of mounts.splice(0)) { try { await act(async () => c.root.unmount()) } catch {} c.el.remove() }
+    teardownMockFetch()
+  }
+})
+
+// ===== 19. 跨视图卸载/重挂：群草稿保留（群→DM→原群） =====
+test('卸载重挂：群草稿保留，DM 视图不继承', async () => {
+  setupMockFetch()
+  const bots = [makeBot('cx2'), makeBot('cy2')]
+  const g = makeConv('umG2', ['cx2', 'cy2'])
+  const a = makeBot('umB2', 'B')
+  const typeInto = async (el, text) => {
+    const ta = el.querySelector('textarea')
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text)
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+  }
+  const mounts = []
+  try {
+    const c1 = createContainer(); mounts.push(c1)
+    await render(React.createElement(GroupChatView, { conversation: g, bots }), c1)
+    await typeInto(c1.el, 'um-draft-G')
+    await act(async () => c1.root.unmount()); c1.el.remove()
+
+    const c2 = createContainer(); mounts.push(c2)
+    await render(React.createElement(BotChatView, { bot: a, state: null }), c2)
+    assert.equal(c2.el.querySelector('textarea').value, '', 'DM 视图不继承群草稿')
+    await act(async () => c2.root.unmount()); c2.el.remove()
+
+    const c3 = createContainer(); mounts.push(c3)
+    await render(React.createElement(GroupChatView, { conversation: g, bots }), c3)
+    assert.equal(c3.el.querySelector('textarea').value, 'um-draft-G', '卸载重挂后群草稿保留')
+    // 发送：无任务引用时不携带 taskId（引用归属正确）
+    await act(async () => [...c3.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    const post = fetchCalls.filter(f => f.url.includes('/umG2/chat')).at(-1)
+    assert.equal(JSON.parse(post.body).taskId, undefined, '群草稿无任务引用：不携带 taskId')
+  } finally {
+    for (const c of mounts.splice(0)) { try { await act(async () => c.root.unmount()) } catch {} c.el.remove() }
+    teardownMockFetch()
+  }
+})
+
+// ===== 20. 挂起请求时卸载 → 迟到成功：不复活 sending/不重复 POST/无重试条 =====
+test('卸载时挂起：迟到成功不污染重挂视图、不复活 sending、不重复 POST', async () => {
+  setupMockFetch()
+  const a = makeBot('umPendA', 'A')
+  const typeInto = async (el, text) => {
+    const ta = el.querySelector('textarea')
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text)
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+  }
+  const mounts = []
+  try {
+    const c1 = createContainer(); mounts.push(c1)
+    await render(React.createElement(BotChatView, { bot: a, state: null }), c1)
+    await typeInto(c1.el, 'pending-msg')
+    await act(async () => [...c1.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    const post = deferredQueue.find(d => d.call.url.includes('/umPendA/chat'))
+    assert.ok(post, 'POST 挂起中')
+    // 卸载（挂起未决）
+    await act(async () => c1.root.unmount()); c1.el.remove()
+
+    // 迟到成功到达（无组件实例）：结算 + 历史落盘（模块级 histories）
+    await act(async () => {
+      post.resolve({ ok: true, status: 200, json: async () => ({ reply: 'LATE_OK' }), text: async () => '{}' })
+      await new Promise(r => setTimeout(r, 30))
+    })
+    // 卸载后的 refetchHistory GET：全部放行（含首挂 GET）
+    await act(async () => {
+      for (;;) {
+        const hi = deferredQueue.findIndex(d => d.call.url.includes('/umPendA') && d.call.method === 'GET')
+        if (hi < 0) break
+        deferredQueue.splice(hi, 1)[0].resolve({ ok: true, status: 200, json: async () => ({ messages: [] }), text: async () => '{}' })
+      }
+    })
+
+    // 重挂 A：sending 不复活、迟到回复可见、无重试条
+    const c3 = createContainer(); mounts.push(c3)
+    await render(React.createElement(BotChatView, { bot: a, state: null }), c3)
+    assert.ok(c3.el.textContent.includes('LATE_OK'), '迟到成功已落历史（可见）')
+    assert.ok(![...c3.el.querySelectorAll('button')].find(b => b.textContent.includes('重试')), '成功已结算：无重试条')
+    // sending 未复活：可立即再发（若 sending 卡 true，send 早退不产生 POST）
+    await typeInto(c3.el, 'next-msg')
+    await act(async () => [...c3.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    const posts = fetchCalls.filter(f => f.url.includes('/umPendA/chat'))
+    assert.equal(posts.length, 2, '恰两次 POST（原始+新发）：卸载/重挂不产生重复 POST')
+    const body2 = JSON.parse(posts[1].body)
+    assert.equal(body2.text, 'next-msg')
+    assert.notEqual(body2.requestId, JSON.parse(posts[0].body).requestId, '新发是新请求 ID')
+  } finally {
+    for (const c of mounts.splice(0)) { try { await act(async () => c.root.unmount()) } catch {} c.el.remove() }
+    teardownMockFetch()
+  }
+})
+
+// ===== 21. 挂起请求时卸载 → 迟到失败：重试条按 store 规则，点击复用原 requestId =====
+test('卸载时挂起：迟到失败后重挂出现重试条，重试复用原 requestId', async () => {
+  setupMockFetch()
+  const a = makeBot('umPendB', 'A')
+  const typeInto = async (el, text) => {
+    const ta = el.querySelector('textarea')
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text)
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+  }
+  const mounts = []
+  try {
+    const c1 = createContainer(); mounts.push(c1)
+    await render(React.createElement(BotChatView, { bot: a, state: null }), c1)
+    await typeInto(c1.el, 'fail-msg')
+    await act(async () => [...c1.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    const post = deferredQueue.find(d => d.call.url.includes('/umPendB/chat'))
+    const origId = JSON.parse(post.call.body).requestId
+    await act(async () => c1.root.unmount()); c1.el.remove()
+
+    // 迟到失败（无组件实例）：store 记录保留
+    await act(async () => {
+      post.reject(new Error('late failure after unmount'))
+      await new Promise(r => setTimeout(r, 30))
+    })
+
+    // 重挂：sending 不复活、重试条出现（store 规则）
+    const c3 = createContainer(); mounts.push(c3)
+    await render(React.createElement(BotChatView, { bot: a, state: null }), c3)
+    assert.ok(!c3.el.querySelector('textarea').disabled, 'sending 未复活（输入可用）')
+    const retryBtn = [...c3.el.querySelectorAll('button')].find(b => b.textContent.includes('重试'))
+    assert.ok(retryBtn, '迟到失败在重挂后提供重试条（store 记录）')
+    await act(async () => retryBtn.click())
+    const posts = fetchCalls.filter(f => f.url.includes('/umPendB/chat'))
+    assert.equal(posts.length, 2, '重试恰产生一次新 POST')
+    assert.equal(JSON.parse(posts[1].body).requestId, origId, '重试复用原 requestId（store 规则）')
+    // 重试成功 → 重试条消失（结算）
+    // 注意：被 reject 的原始 deferred 仍留在队列（reject 不出队）——重试 POST 是队列中最后一个
+    const retryPost = deferredQueue.filter(d => d.call.url.includes('/umPendB/chat')).at(-1)
+    await act(async () => {
+      retryPost.resolve({ ok: true, status: 200, json: async () => ({ reply: 'RETRY_OK' }), text: async () => '{}' })
+      await new Promise(r => setTimeout(r, 30))
+    })
+    await act(async () => {
+      for (;;) {
+        const hi = deferredQueue.findIndex(d => d.call.url.includes('/umPendB') && d.call.method === 'GET')
+        if (hi < 0) break
+        deferredQueue.splice(hi, 1)[0].resolve({ ok: true, status: 200, json: async () => ({ messages: [] }), text: async () => '{}' })
+      }
+    })
+    assert.ok(![...c3.el.querySelectorAll('button')].find(b => b.textContent.includes('重试')), '重试成功后重试条消失')
+    assert.ok(c3.el.textContent.includes('RETRY_OK'), '重试回复可见')
+  } finally {
+    for (const c of mounts.splice(0)) { try { await act(async () => c.root.unmount()) } catch {} c.el.remove() }
+    teardownMockFetch()
+  }
+})

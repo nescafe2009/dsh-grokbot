@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 import { AvatarView, MarkdownView, splitChips, SidebarRow, MessageView, Composer, TaskCard } from './components'
 import { GKF_CSS } from './tokens'
 import { getPendingRetry, setPendingRetry, clearPendingRetry, retryMatches, retryRiskLevel, allocateSeq } from './retry-store'
+import { saveDraft, loadDraft } from './draft-store'
 
 export const API_ROOT = '/api/plugins/grokbot'
 const POLL_MS = 2000
@@ -1038,24 +1039,27 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
   const [retryRequest, setRetryRequest] = useState<{ conversationId: string; requestId: string; text: string; taskId: string | null; createdAt: number } | null>(null)
   const botRef = useRef(bot.id)
   const botGenRef = useRef(0) // 执行代次：每次切换递增——旧回调只能匹配自己的代次
-  // 按会话保存未发送草稿/任务引用（切走不丢，切回恢复，新会话不继承）
-  const draftsRef = useRef<Map<string, { draft: string; draftTask: { taskId: string; name: string } | null }>>(new Map())
+  // 按会话保存未发送草稿/任务引用：模块级 store（切走/卸载不丢，重挂恢复，新会话不继承）
+  const liveDraftRef = useRef({ draft, draftTask })
+  liveDraftRef.current = { draft, draftTask }
   useEffect(() => {
     if (botRef.current !== bot.id) {
       // 离开旧会话：保存其未发送草稿/任务
-      draftsRef.current.set(botRef.current, { draft, draftTask })
+      saveDraft(botRef.current, liveDraftRef.current)
       botRef.current = bot.id
       botGenRef.current += 1 // 切换会话 = 新代次（旧回调全部失效）
-      // 恢复新会话的草稿/任务（无则空）
-      const saved = draftsRef.current.get(bot.id)
-      setDraft(saved?.draft ?? '')
-      setDraftTask(saved?.draftTask ?? null)
     }
+    // 挂载（含跨视图卸载后重挂）与切换统一恢复本会话草稿
+    const saved = loadDraft(bot.id)
+    setDraft(saved.draft)
+    setDraftTask(saved.draftTask)
     setRetryRequest(getPendingRetry(bot.id))
     // 切换会话（同类视图复用 state）：从会话存储恢复本会话记录，其他会话的记录不串
     setSending(false)
     setEditing(false)
   }, [bot.id])
+  // 卸载（父级切换到群/工作区等互斥视图）也保存当前会话草稿——useRef Map 会随卸载销毁
+  useEffect(() => () => { saveDraft(botRef.current, liveDraftRef.current) }, [])
   const [newRoutine, setNewRoutine] = useState(false)
   const [catalog, setCatalog] = useState<CatalogProvider[]>([])
   const [historyRefresh, forceRefresh] = useState(0)
@@ -1372,23 +1376,27 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
   const [retryRequest, setRetryRequest] = useState<{ conversationId: string; requestId: string; text: string; taskId: string | null; createdAt: number } | null>(null)
   const roomRef = useRef(room.id)
   const roomGenRef = useRef(0) // 执行代次
-  const draftsRef = useRef<Map<string, { draft: string; draftTask: { taskId: string; name: string } | null }>>(new Map())
+  // 按群保存未发送草稿/任务引用：模块级 store（切走/卸载不丢，重挂恢复，新群不继承）
+  const liveDraftRef = useRef({ draft, draftTask })
+  liveDraftRef.current = { draft, draftTask }
   useEffect(() => {
     if (roomRef.current !== room.id) {
       // 离开旧群：保存未发送草稿/任务
-      draftsRef.current.set(roomRef.current, { draft, draftTask })
+      saveDraft(roomRef.current, liveDraftRef.current)
       roomRef.current = room.id
       roomGenRef.current += 1 // 切换群 = 新代次
-      // 恢复新群草稿
-      const saved = draftsRef.current.get(room.id)
-      setDraft(saved?.draft ?? '')
-      setDraftTask(saved?.draftTask ?? null)
     }
+    // 挂载（含跨视图卸载后重挂）与切换统一恢复本群草稿
+    const saved = loadDraft(room.id)
+    setDraft(saved.draft)
+    setDraftTask(saved.draftTask)
     setRetryRequest(getPendingRetry(room.id))
     // 切换群：重置发送/取消状态（旧群不阻塞新群）
     setSending(false)
     setCancellingRuns(new Map())
   }, [room.id])
+  // 卸载（父级切换到 DM/工作区等互斥视图）也保存当前群草稿
+  useEffect(() => () => { saveDraft(roomRef.current, liveDraftRef.current) }, [])
   const queued = props.queued ?? []
   const logRef = useRef<HTMLDivElement | null>(null)
 
