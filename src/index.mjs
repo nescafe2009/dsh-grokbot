@@ -1235,6 +1235,7 @@ export function apply(ctx, config = {}) {
     const session = {
       handle,
       abort,
+      model: selection ? `${selection.provider}/${selection.model}` : null,
       dispose: async () => {
         activeSessions.delete(session)
         approvalBotByAgent.delete(String(handle.agent.id))
@@ -1516,6 +1517,7 @@ export function apply(ctx, config = {}) {
         await session.handle.agent.whenIdle()
         outcome = {
           ...summarizeTurn(session.handle.agent.session.events, firstSeq),
+          model: session.model ?? null,
           activity: activityOf(session.handle.agent.session.events, firstSeq),
           // 证据最小化：仅显式测试/采样（evidenceMarker）返回有界布尔证据；默认不附原始工具文本
           ...(evidenceMarker ? { evidence: shellExecutionEvidence(session.handle.agent.session.events, firstSeq, evidenceMarker) } : {}),
@@ -2434,7 +2436,7 @@ export function apply(ctx, config = {}) {
             const status = turnError ? 'failed' : (reply ? 'ok' : 'empty')
             logPerf({ kind: 'dsh-direct', conversationId: '__perf__', ms, toolCalls, status, replyBytes: reply.length, model: sel ? `${sel.provider}/${sel.model}` : null, error: turnError })
             // activity/toolResults：执行证据（工具名 + 实际输出）——与插件侧同标准
-            respond(res, 200, { ms, sessionId, status, toolCalls, activity, evidence, replyBytes: reply.length, error: turnError }); return
+            respond(res, 200, { ms, sessionId, status, toolCalls, activity, evidence, replyBytes: reply.length, error: turnError, model: sel ? `${sel.provider}/${sel.model}` : null }); return
           } catch (error) {
             logPerf({ kind: 'dsh-direct-error', ms: Date.now() - t0, error: safeError(error) })
             throw new HttpError(500, safeError(error))
@@ -2494,7 +2496,7 @@ export function apply(ctx, config = {}) {
             await handle.agent.whenIdle()
             if (st.terminal) { await releaseOnce('terminal'); return }
             const turn = summarizeTurn(handle.agent.session.events, firstSeq)
-            return { handle, warmupMs: Date.now() - t0, warmupStatus: turn?.error ? 'failed' : (turn?.text?.trim() ? 'ok' : 'empty') }
+            return { handle, warmupMs: Date.now() - t0, warmupStatus: turn?.error ? 'failed' : (turn?.text?.trim() ? 'ok' : 'empty'), model: sel ? `${sel.provider}/${sel.model}` : null }
           })()
           // work 自身异常（create 失败后的步骤：whenIdle/followup 抛错）：已取得 handle 也必须清理
           work.catch(() => { st.terminal = true; void releaseOnce('work-error') })
@@ -2512,13 +2514,13 @@ export function apply(ctx, config = {}) {
               void releaseOnce('aborted-race')
               throw new HttpError(503, '插件正在卸载：暖直连 open 已取消')
             }
-            const entry = { handle: result.handle, sessionId, busy: false, createdAt: Date.now(), expiresAt: Date.now() + ttlMs, timer: null, turns: 0 }
+            const entry = { handle: result.handle, sessionId, busy: false, createdAt: Date.now(), expiresAt: Date.now() + ttlMs, timer: null, turns: 0, model: result.model ?? null }
             entry.timer = setTimeout(() => { void disposeWarmHandle(handleId, 'ttl') }, ttlMs)
             entry.timer.unref?.()
             warmHandles.set(handleId, entry)
             quotaRelease()
             logPerf({ kind: 'dsh-warm-open', conversationId: '__perf__', ms: result.warmupMs, status: result.warmupStatus })
-            respond(res, 200, { handleId, sessionId, warmupMs: result.warmupMs, warmupStatus: result.warmupStatus, ttlMs, maxActive: WARM_MAX_ACTIVE }); return
+            respond(res, 200, { handleId, sessionId, warmupMs: result.warmupMs, warmupStatus: result.warmupStatus, ttlMs, maxActive: WARM_MAX_ACTIVE, model: entry.model }); return
           } catch (error) {
             // 超时/卸载/异常统一：立即 terminal + 释放已取得 handle（不等 work；create 迟到由 work 边界清理）
             st.terminal = true
@@ -2568,7 +2570,7 @@ export function apply(ctx, config = {}) {
             entry.turns += 1
             const ms = Date.now() - t0
             logPerf({ kind: 'dsh-warm-turn', conversationId: '__perf__', ms, toolCalls: activity.length, status, replyBytes: reply.length, warm: true, turn: entry.turns, error: turnError })
-            respond(res, 200, { ms, sessionId: entry.sessionId, status, toolCalls: activity.length, activity, evidence, replyBytes: reply.length, error: turnError, warm: true, turn: entry.turns }); return
+            respond(res, 200, { ms, sessionId: entry.sessionId, status, toolCalls: activity.length, activity, evidence, replyBytes: reply.length, error: turnError, warm: true, turn: entry.turns, model: entry.model ?? null }); return
           } catch (error) {
             // 单轮超时/执行异常：释放 handle（下次访问按不存在处理，不复活）
             await disposeWarmHandle(handleId, 'turn-error')

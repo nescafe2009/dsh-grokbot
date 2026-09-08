@@ -2,7 +2,7 @@
 // 用法：FIXTURE_DIR=<dir> ZAI_API_KEY=<key> [TESTED_SHA=<sha>] node sample.mjs
 // 退出：统一 finally；任何 incomplete/failed → exit 1
 import { spawn, execSync } from 'node:child_process'
-import { bashToolEvidence, targetEvidence } from './evidence.mjs'
+import { runSampling } from './orchestrate.mjs'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { realpathSync } from 'node:fs'
@@ -115,43 +115,6 @@ async function rmBot(id) {
   } catch { /* best effort */ }
 }
 
-// ===== 采样结果归一化（统一规范） =====
-// 插件 chat API 实际返回 { reply, ..., outcome } 其中 cancelled/error/perf/activity 在 outcome 里
-// 直连 /__perf/direct 返回顶层 { status, toolCalls, replyBytes, error }
-function normalizeSample(raw) {
-  const isFetchError = raw.status === 'fetch_error' || raw.error?.includes?.('timeout')
-  // 插件侧：cancelled/error 在 outcome 里（不在顶层）
-  const outcome = raw.outcome ?? {}
-  const isCancelled = raw.cancelled === true || outcome.cancelled === true
-  const hasError = raw.error || outcome.error
-  // 直连响应无 reply 字段——replyBytes>0 即非空；插件无 reply → empty
-  const isEmpty = (raw.reply === undefined && (raw.replyBytes ?? 0) > 0) ? false : (!raw.reply || raw.reply?.includes('未能给出文本回复'))
-  const isHttpErr = raw.http >= 400
-  if (isFetchError || isCancelled || isEmpty || isHttpErr || hasError) {
-    return { ...raw, status: isCancelled ? 'cancelled' : 'failed' }
-  }
-  return { ...raw, status: raw.status || 'ok' }
-}
-
-// 插件工具证据：从 outcome.activity 检查（不在顶层 activity）
-// 插件工具证据：显式检验 outcome.activity 真实 shell 工具标识（共享标准；read_file-only/纯 toolCalls 不算）
-function hasPluginToolEvidence(sample) {
-  return bashToolEvidence(sample?.outcome ?? sample)
-}
-
-// 直连工具证据：toolCalls > 0（在顶层）
-function hasDirectToolEvidence(sample) {
-  return (sample.toolCalls ?? 0) > 0
-}
-
-// 冷暖交替
-function alternatingOrder(round) {
-  return round % 2 === 1 ? ['direct', 'plugin'] : ['plugin', 'direct']
-}
-
-const QA = '配对冷A：只回复 OK。'
-const TOOL = '配对冷B：用 bash 执行 echo COLD-TOOL 并回复输出。'
-
 // ===== 主流程 =====
 async function main() {
   // 等待启动（有界）
@@ -178,134 +141,14 @@ async function main() {
   }
   console.log(`[preflight] model call OK (${preflight.ms}ms)`)
 
-  // ===== 冷↔冷 问答 ×4（交替先后） =====
-  console.log('\n== 冷↔冷 问答（交替先后） ==')
-  for (let i = 1; i <= 4; i++) {
-    const order = alternatingOrder(i)
-    for (const side of order) {
-      if (side === 'direct') {
-        const d = await api('/__perf/direct', { text: QA })
-        const s = normalizeSample({ ...d, round: i, pair: 'cold-qa', side: 'direct', order: order.indexOf('direct')+1 })
-        results.push(s)
-        console.log(`  ${i}D: ${s.ms}ms status=${s.status} tools=${d.toolCalls ?? 'N/A'}`)
-      } else {
-        const bid = await mkBot(`冷${i}`)
-        const p = await api(`/conversations/${bid}/chat`, { text: QA })
-        // 插件侧：normalizeSample 从 outcome 读取 cancelled/error（不在顶层）
-        const replyText = (p.reply || '').trim()
-        const isPlaceholder = replyText.startsWith('[') && replyText.includes('未能给出')
-        // 不再显式覆盖 status——让 normalizeSample 基于 outcome 归一化
-        const s = normalizeSample({ round: i, pair: 'cold-qa', side: 'plugin', order: order.indexOf('plugin')+1, botId: bid,
-          reply: replyText || undefined, // undefined → normalizeSample 判 empty
-          ...p,
-          status: undefined, // 清除 ...p 可能带的状态，让 normalizeSample 重新计算
-          reply: replyText.slice(0, 20),
-          ms: p.ms, http: p.http, outcome: p.outcome, error: p.error, cancelled: p.outcome?.cancelled })
-        results.push(s)
-        console.log(`  ${i}P: ${p.ms}ms status=${s.status}`)
-        await rmBot(bid)
-      }
-    }
-  }
-
-  // ===== 冷↔冷 工具 ×2（交替先后） =====
-  console.log('\n== 冷↔冷 工具（交替先后） ==')
-  for (let i = 1; i <= 2; i++) {
-    const order = alternatingOrder(i + 4)
-    for (const side of order) {
-      if (side === 'direct') {
-        const d = await api('/__perf/direct', { text: TOOL, evidenceMarker: 'COLD-TOOL' })
-        // 工具证据：真实 shell 工具标识（toolCalls 计数本身不构成 bash 证据）
-        const hasTools = bashToolEvidence(d)
-        // 直连执行目标证据：实际工具结果包含 COLD-TOOL（口头复述/字节数不算）
-        const directTarget = targetEvidence(d, 'COLD-TOOL')
-        const s = normalizeSample({ ...d, round: i, pair: 'cold-tool', side: 'direct', order: order.indexOf('direct')+1,
-          status: d.status === 'ok' && hasTools && directTarget ? 'ok' : (d.status === 'ok' ? 'failed' : d.status),
-          toolEvidence: hasTools, targetMatch: directTarget })
-        results.push(s)
-        console.log(`  ${i}D: ${s.ms}ms tools=${d.toolCalls} evidence=${hasTools} status=${s.status}`)
-      } else {
-        const bid = await mkBot(`工具${i}`)
-        const p = await api(`/conversations/${bid}/chat`, { text: TOOL, evidenceMarker: 'COLD-TOOL' })
-        // 插件工具证据：outcome.activity 真实 shell 标识
-        const hasTools = hasPluginToolEvidence(p)
-        const replyText = (p.reply || '').trim()
-        // 插件执行目标证据：与直连同标准——outcome.toolResults 实际结果包含 COLD-TOOL（口头复述不算）
-        const targetMatch = targetEvidence(p.outcome, 'COLD-TOOL')
-        const outcome = p.outcome ?? {}
-        const s = normalizeSample({ round: i, pair: 'cold-tool', side: 'plugin', order: order.indexOf('plugin')+1, botId: bid,
-          ms: p.ms, http: p.http, reply: replyText || undefined,
-          outcome, error: outcome.error, cancelled: outcome.cancelled,
-          toolEvidence: hasTools, targetMatch,
-          status: hasTools && targetMatch && !outcome.cancelled && !outcome.error ? 'ok' : 'failed',
-          replyText: replyText.slice(0, 30) })
-        results.push(s)
-        console.log(`  ${i}P: ${p.ms}ms tools=${hasTools} target=${targetMatch} status=${s.status}`)
-        await rmBot(bid)
-      }
-    }
-  }
-
-  // ===== 暖插件 ×5（独立 bot 预热 + 连续同 session、同文本） =====
-  console.log('\n== 暖插件（预热1次 + 采样5次同文本） ==')
-  const warmBot = await mkBot('暖采样')
-  const warmup = await api(`/conversations/${warmBot}/chat`, { text: '预热：只回复 OK。' })
-  const warmupOutcome = warmup.outcome ?? {}
-  const warmupOk = warmup.reply && !warmup.reply.includes('未能给出') && !warmupOutcome.cancelled && !warmupOutcome.error
-  console.log(`  warmup: ${warmup.ms}ms ok=${warmupOk} (excluded)`)
-  if (!warmupOk) {
-    console.log('  WARNING: warmup failed — warm samples may be unreliable')
-    overallStatus = 'incomplete'
-    process.exitCode = 1 // Failed warmup → non-zero exit
-  }
-  for (let i = 1; i <= 5; i++) {
-    const p = await api(`/conversations/${warmBot}/chat`, { text: QA })
-    const replyText = (p.reply || '').trim()
-    const wOutcome = p.outcome ?? {}
-    const s = normalizeSample({ round: i, pair: 'warm-plugin', side: 'plugin', botId: warmBot,
-      ms: p.ms, http: p.http, reply: replyText || undefined,
-      outcome: wOutcome, error: wOutcome.error, cancelled: wOutcome.cancelled,
-      status: replyText && !replyText.includes('未能给出') && !wOutcome.cancelled && !wOutcome.error ? 'ok' : 'empty',
-      replyDisplay: replyText.slice(0, 20) })
-    results.push(s)
-    console.log(`  ${i}: ${p.ms}ms status=${s.status}`)
-  }
-  await rmBot(warmBot)
-
-  // ===== 暖直连 ×5（专用 handle：open 预热一次 + 同 session 多轮 + finally close） =====
-  // 与暖插件匹配：同模型参数（同一宿主默认/crew 配置）、同任务文本（QA）、预热一次排除
-  console.log('\n== 暖直连（专用 handle：预热1次 + 采样5次同文本） ==')
-  {
-    const open = await api('/__perf/warm/open', { text: '预热：只回复 OK。' })
-    if (!open.handleId) {
-      console.log(`  open failed: ${JSON.stringify(open).slice(0, 120)}`)
-      results.push({ pair: 'warm-direct', side: 'direct', status: 'failed', reason: 'open failed' })
-      overallStatus = 'incomplete'
-      process.exitCode = 1
-    } else {
-      console.log(`  warmup: ${open.warmupMs}ms status=${open.warmupStatus} (excluded)`)
-      if (open.warmupStatus !== 'ok') {
-        console.log('  WARNING: warmup failed — warm-direct samples may be unreliable')
-        overallStatus = 'incomplete'
-        process.exitCode = 1
-      }
-      try {
-        for (let i = 1; i <= 5; i++) {
-          const d = await api('/__perf/warm/turn', { handleId: open.handleId, text: QA })
-          const s = normalizeSample({ ...d, round: i, pair: 'warm-direct', side: 'direct',
-            ms: d.ms, reply: d.replyBytes > 0 ? '(direct)' : undefined,
-            status: d.status, error: d.error,
-            toolEvidence: bashToolEvidence(d), targetEvidence: false })
-          results.push(s)
-          console.log(`  ${i}D: ${d.ms}ms status=${d.status}${d.error ? ` error=${String(d.error).slice(0, 40)}` : ''}`)
-        }
-      } finally {
-        // 专用 handle 生命周期收尾：无论成败必须 close（释放会话）
-        const closed = await api('/__perf/warm/close', { handleId: open.handleId }).catch(() => null)
-        console.log(`  close: ${closed?.ok === true ? 'ok' : 'failed(可能已随异常/TTL 释放)'}`)
-      }
-    }
-  }
+  // ===== 采样编排（可测核心 orchestrate.mjs；本文件只提供真实依赖） =====
+  const sampling = await runSampling({
+    api, mkBot, rmBot,
+    log: (line) => console.log(line),
+  })
+  results.push(...sampling.results)
+  overallStatus = sampling.overall === 'failed' ? 'failed' : (sampling.overall === 'ok' ? 'ok' : 'incomplete')
+  if (sampling.exitCode !== 0) process.exitCode = sampling.exitCode
 
   // ===== 汇总（统一判定：非 ok 状态均不计通过） =====
   const nonOk = results.filter(r => r.status !== 'ok')
@@ -319,7 +162,9 @@ async function main() {
   }
   if (nonOk.length > 0) overallStatus = overallStatus === 'incomplete' ? 'incomplete' : (summary.failed > 0 ? 'failed' : 'incomplete')
 
-  const output = { commit, libHash, fixtureDir: FIXTURE_HOME, timestamp: new Date().toISOString(), model: 'zai/glm-5.3', overall: overallStatus, summary, samples: results }
+  const output = { commit, libHash, fixtureDir: FIXTURE_HOME, timestamp: new Date().toISOString(),
+    models: sampling.models, // 每配对实际 provider/model 与匹配条件（unknown/false → incomplete）
+    overall: overallStatus, summary, samples: results }
   writeFileSync(`${FIXTURE_HOME}/paired-results.json`, JSON.stringify(output, null, 2))
   console.log(`\n[sampling] overall=${overallStatus} summary=${JSON.stringify(summary)}`)
   console.log(`[sampling] → ${FIXTURE_HOME}/paired-results.json`)

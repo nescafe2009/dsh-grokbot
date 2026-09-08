@@ -54,6 +54,15 @@ FIXTURE_DIR=<dir> ZAI_API_KEY=<key> TESTED_SHA=<sha> node sample.mjs
 `config.testEndpoints: true`（或环境变量 `GROKBOT_TEST_ENDPOINTS=1`）。仍走同一宿主认证；
 开启仅注册测试路由，不放宽 CSP/认证/隔离。采样完成后关闭。
 
+## 采样契约（orchestrate.mjs，测试驱动）
+
+- 模型参数：每样本记录服务端返回的实际 `model`（provider/model）；**冷冷暖暖四组与全局基准一致**才 match=true，任一未知（null）→ unknown、不等 → false，均 overall incomplete（输出 `models` 字段，不再硬编码）
+- 时间字段显式：`totalMs`（插件=perf.totalMs / 直连=服务端 ms）、`executionMs`+`queueMs`（插件拆分，直连 null）、`rttMs`（客户端往返，另列）
+- 取消带部分文本 → `status='cancelled'`（非 ok）
+- 预热非 ok → 该组停止采样并释放（warm-plugin→rmBot；warm-direct→跳过 turns 且 finally close）
+- close 失败/未知 → 记 cleanup 失败样本 + overall incomplete + 非零退出（非仅日志）
+- marker：仅工具配对轮携带 evidenceMarker（服务端 testEndpoints 门控）
+
 ## 配对结果 schema
 
 ```json
