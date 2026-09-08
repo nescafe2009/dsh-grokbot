@@ -43,7 +43,7 @@ tar -xzf "$TGZ" -C "$EXTRACT"
 python3 - "$EXTRACT" <<'PY' || exit 1
 import os, re, sys
 extract = sys.argv[1]
-pat = re.compile(r"/Users/[a-z]|/home/[a-z]|ZAI_API|sk-[A-Za-z0-9]{8}")
+pat = re.compile(r"/Users/[a-z][a-z0-9_-]*|/home/[a-z][a-z0-9_-]*|ZAI_API|sk-[A-Za-z0-9]{8}")
 hits = []
 for root, _dirs, names in os.walk(extract):
     for n in names:

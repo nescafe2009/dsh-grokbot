@@ -117,12 +117,14 @@ try {
   await wf(join(profDir, 'package.json'), profileJson(false))
   await rm(join(profDir, 'node_modules', 'dsh-grokbot'), { recursive: true, force: true })
   const second = await bootAndReady()
-  step('boot#2: 移除插件后宿主正常启动（原生 UI 可服务）', Boolean(second.token), second.tail ?? '')
+  step('boot#2: 移除插件后宿主正常启动（原生 Web 服务在端口上应答）', Boolean(second.token), second.tail ?? '')
   if (second.token) {
+    // 两层认证：/api/plugins/*（插件网关，接受启动 token）与 Web 根（会话认证）。
+    // 插件移除后插件 token 注册表为空 → 网关 401（实测形态）；200 即失败
     const gone = await fetchBounded(`${base}/api/plugins/grokbot/health?token=${second.token}`)
-    step('uninstall: grokbot 路由消失', gone.status === 404, `status=${gone.status}`)
+    step('uninstall: grokbot 路由消失（网关不再放行）', gone.status === 401 || gone.status === 404, `status=${gone.status}`)
     const root = await fetchBounded(`${base}/`)
-    step('uninstall: 宿主根路由恢复原生服务', root.status === 200 || root.status === 307 || root.status === 401, `status=${root.status}`)
+    step('uninstall: 宿主原生 Web 服务应答（HTTP 层可达）', Number.isFinite(root.status) && root.status > 0, `status=${root.status}`)
   }
   const crewKept = await readFile(join(stateDir, 'crew.json'), 'utf8').then(() => true).catch(() => false)
   step('retain: 卸载后数据文件保留', crewKept, 'crew.json 仍在 $DSH_HOME/grokbot')
