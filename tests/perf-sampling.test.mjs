@@ -73,7 +73,7 @@ function makeMockDeps(overrides = {}) {
 
 test('成功全链：模型匹配/时间字段显式/交替顺序/marker 门控/finally close', async () => {
   const d = makeMockDeps()
-  const out = await runSampling({ ...d, texts: { qaRounds: 2, toolRounds: 1, warmRounds: 2 } })
+  const out = await runSampling({ ...d, listModels: async () => ['prov/m-1'], texts: { qaRounds: 2, toolRounds: 1, warmRounds: 2 } })
   assert.equal(out.overall, 'ok', `overall=ok（${JSON.stringify(out.models)}）`)
   assert.equal(out.exitCode, 0)
   // 每配对模型匹配 true（双侧 prov/m-1）
@@ -111,13 +111,13 @@ test('模型不匹配 → incomplete 非零；未知（null）→ incomplete', a
     if (path === '/__perf/warm/turn' || path === '/__perf/warm/open') r.model = 'prov/B'
     return r
   }
-  const out1 = await runSampling({ api: d1.api, mkBot: d1.mkBot, rmBot: d1.rmBot, texts: { qaRounds: 1, toolRounds: 1, warmRounds: 1 } })
+  const out1 = await runSampling({ api: d1.api, mkBot: d1.mkBot, rmBot: d1.rmBot, listModels: async () => ['prov/A', 'prov/B'], texts: { qaRounds: 1, toolRounds: 1, warmRounds: 1 } })
   assert.equal(out1.overall, 'incomplete')
   assert.equal(out1.exitCode, 1)
   assert.equal(out1.models['cold-qa'].match, false, '不匹配 → false 记录')
 
   const d2 = makeMockDeps({ model: null })
-  const out2 = await runSampling({ api: d2.api, mkBot: d2.mkBot, rmBot: d2.rmBot, texts: { qaRounds: 1, toolRounds: 1, warmRounds: 1 } })
+  const out2 = await runSampling({ api: d2.api, mkBot: d2.mkBot, rmBot: d2.rmBot, listModels: async () => ['prov/m-1'], texts: { qaRounds: 1, toolRounds: 1, warmRounds: 1 } })
   assert.equal(out2.overall, 'incomplete')
   assert.equal(out2.models['cold-qa'].match, 'unknown', '未知 → unknown 记录')
 })
@@ -125,7 +125,7 @@ test('模型不匹配 → incomplete 非零；未知（null）→ incomplete', a
 test('取消带部分文本 → status=cancelled（非 ok）→ overall incomplete 非零', async () => {
   // 第 1 次 chat 即取消（带部分文本）
   const d = makeMockDeps({ cancelOnceAt: 1 })
-  const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, texts: { qaRounds: 1, toolRounds: 1, warmRounds: 1 } })
+  const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, listModels: async () => ['prov/m-1'], texts: { qaRounds: 1, toolRounds: 1, warmRounds: 1 } })
   const cancelled = out.results.filter((r) => r.status === 'cancelled')
   assert.ok(cancelled.length >= 1, '存在 cancelled 样本')
   assert.ok(cancelled.some((r) => typeof r.reply === 'string' && r.reply.length > 0), '取消样本带部分文本（场景构造）')
@@ -138,7 +138,7 @@ test('取消带部分文本 → status=cancelled（非 ok）→ overall incomple
 
 test('warm-plugin 预热失败：本组停止采样并释放（无 5 轮样本、rmBot 调用）', async () => {
   const d = makeMockDeps({ warmupFailPlugin: true })
-  const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, texts: { qaRounds: 1, toolRounds: 1, warmRounds: 5 } })
+  const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, listModels: async () => ['prov/m-1'], texts: { qaRounds: 1, toolRounds: 1, warmRounds: 5 } })
   const warmSamples = out.results.filter((r) => r.pair === 'warm-plugin')
   assert.equal(warmSamples.length, 1, '仅失败记录一条（5 轮采样全部跳过）')
   assert.equal(warmSamples[0].status, 'failed')
@@ -150,7 +150,7 @@ test('warm-plugin 预热失败：本组停止采样并释放（无 5 轮样本�
 
 test('warm-direct 预热失败：跳过 turns 且 close 仍执行（释放）', async () => {
   const d = makeMockDeps({ warmupFailDirect: true })
-  const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, texts: { qaRounds: 1, toolRounds: 1, warmRounds: 5 } })
+  const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, listModels: async () => ['prov/m-1'], texts: { qaRounds: 1, toolRounds: 1, warmRounds: 5 } })
   const warm = out.results.filter((r) => r.pair === 'warm-direct')
   assert.equal(warm.filter((r) => r.reason !== 'warmup failed').length, 0, '无 turn 样本（本组停止）')
   assert.equal(d.state.closed.length, 1, 'finally close 仍执行（handle 释放）')
@@ -160,7 +160,7 @@ test('warm-direct 预热失败：跳过 turns 且 close 仍执行（释放）', 
 
 test('close 失败/未知 → cleanup 失败样本 + incomplete 非零（非仅日志）', async () => {
   const d = makeMockDeps({ closeFail: true })
-  const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, texts: { qaRounds: 1, toolRounds: 1, warmRounds: 1 } })
+  const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, listModels: async () => ['prov/m-1'], texts: { qaRounds: 1, toolRounds: 1, warmRounds: 1 } })
   const closeFail = out.results.find((r) => r.reason === 'close failed (cleanup unconfirmed)')
   assert.ok(closeFail, 'close 失败入结果（非仅日志）')
   assert.equal(closeFail.status, 'failed')
@@ -210,7 +210,7 @@ test('warm turn 异常（api reject）：真实 finally close 仍执行，closed
     if (path === '/__perf/warm/turn') { d.state.turnTry = (d.state.turnTry ?? 0) + 1; if (d.state.turnTry >= 2) throw new Error('connection reset') }
     return origApi(path, body)
   }
-  const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, texts: { qaRounds: 1, toolRounds: 1, warmRounds: 3 } })
+  const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, listModels: async () => ['prov/m-1'], texts: { qaRounds: 1, toolRounds: 1, warmRounds: 3 } })
   assert.equal(d.state.closed.length, 1, 'finally close 恰执行一次（handle 释放）')
   assert.ok(out.results.some((r) => r.reason === 'turn exception'), '异常样本留证')
   assert.ok(out.results.some((r) => r.pair === 'warm-direct' && r.round), '异常前的 turn 样本仍在')
@@ -221,7 +221,7 @@ test('warm turn 异常（api reject）：真实 finally close 仍执行，closed
 test('暖 round 配对：warm-plugin 与 warm-direct 同 round 同任务文本、预热排除在样本外', async () => {
   const d = makeMockDeps()
   const warmRounds = 3
-  const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, texts: { qaRounds: 1, toolRounds: 1, warmRounds } })
+  const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, listModels: async () => ['prov/m-1'], texts: { qaRounds: 1, toolRounds: 1, warmRounds } })
   // mock 记录请求文本：按 round 提取暖侧任务文本
   const warmBotId = out.results.find((r) => r.pair === 'warm-plugin')?.botId
   const warmPluginTexts = d.state.calls.filter((c) => c.path === `/conversations/${warmBotId}/chat` && !c.body.text?.includes('预热')).map((c) => c.body.text)
@@ -236,4 +236,83 @@ test('暖 round 配对：warm-plugin 与 warm-direct 同 round 同任务文本�
   const warmupCalls = d.state.calls.filter((c) => (c.path.endsWith('/chat') || c.path === '/__perf/warm/open') && c.body.text?.includes('预热'))
   assert.ok(warmupCalls.length >= 2, '双侧各一次预热')
   assert.ok(!out.results.some((r) => r.warmupMs !== undefined && r.round), '预热不计入样本')
+})
+
+test('清理覆盖：warm 预热 reject / 冷 chat reject → finally rmBot 仍执行；DELETE 失败 → cleanup 失败样本 + incomplete', async () => {
+  // (a) warm-plugin 预热 reject（此前预热在 try 外，bot 不清理）
+  {
+    const d = makeMockDeps()
+    const origApi = d.api
+    const warmBotIdOf = () => d.state.bots[d.state.bots.length - 1]
+    d.api = async (path, body) => {
+      if (path.endsWith('/chat') && body?.text?.includes('预热') && path.includes(warmBotIdOf?.() ?? '#')) {
+        const warmBot = `bot-${d.state.bots.length}` // 最后创建的即暖采样 bot
+        if (path === `/conversations/${warmBot}/chat`) throw new Error('warmup connection reset')
+      }
+      return origApi(path, body)
+    }
+    const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, listModels: async () => ['prov/m-1'], texts: { qaRounds: 1, toolRounds: 1, warmRounds: 2 } })
+    const warmRecs = out.results.filter((r) => r.pair === 'warm-plugin')
+    assert.ok(warmRecs.some((r) => r.reason === 'warmup exception'), '预热异常留证')
+    assert.ok(d.state.removedBots.length >= 1, 'finally rmBot 仍执行（bot 清理）')
+    assert.equal(out.overall, 'incomplete')
+    assert.equal(out.exitCode, 1)
+  }
+  // (b) 冷 chat reject（mkBot 后请求异常）→ finally rmBot
+  {
+    const d = makeMockDeps()
+    const origApi = d.api
+    let firstPluginChat = true
+    d.api = async (path, body) => {
+      if (path.endsWith('/chat') && firstPluginChat) { firstPluginChat = false; throw new Error('chat boom') }
+      return origApi(path, body)
+    }
+    const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, listModels: async () => ['prov/m-1'], texts: { qaRounds: 1, toolRounds: 1, warmRounds: 1 } })
+    assert.ok(out.results.some((r) => r.pair === 'cold-qa' && r.reason === 'chat exception'), '冷 chat 异常留证')
+    assert.ok(d.state.removedBots.length >= 1, '冷侧 finally rmBot 执行')
+    assert.equal(out.overall, 'incomplete')
+  }
+  // (c) DELETE 失败（rmBot 抛错）→ cleanup 失败样本 + incomplete（非吞异常）
+  {
+    const d = makeMockDeps()
+    const badRmBot = async (id) => { throw new Error('DELETE 500') }
+    const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: badRmBot, listModels: async () => ['prov/m-1'], texts: { qaRounds: 1, toolRounds: 1, warmRounds: 1 } })
+    const cleanups = out.results.filter((r) => r.reason === 'bot cleanup failed')
+    assert.ok(cleanups.length >= 1, 'DELETE 失败记 cleanup 失败样本（非吞异常）')
+    assert.equal(out.overall, 'incomplete')
+    assert.equal(out.exitCode, 1)
+  }
+})
+
+test('暖交替：双侧各预热一次后同 round 交替先后（order 记录），奇偶轮翻转', async () => {
+  const d = makeMockDeps()
+  const out = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, listModels: async () => ['prov/m-1'], texts: { qaRounds: 1, toolRounds: 1, warmRounds: 4 } })
+  const wp = out.results.filter((r) => r.pair === 'warm-plugin')
+  const wd = out.results.filter((r) => r.pair === 'warm-direct')
+  assert.deepEqual(wp.map((r) => r.round), [1, 2, 3, 4], '插件侧 round 对齐')
+  assert.deepEqual(wd.map((r) => r.round), [1, 2, 3, 4], '直连侧 round 对齐')
+  // 同 round 双侧 order 互补且奇偶翻转：round1 direct 先（1/2），round2 plugin 先
+  const orderByRound = (i) => ({
+    d: wd.find((r) => r.round === i)?.order,
+    p: wp.find((r) => r.round === i)?.order,
+  })
+  assert.deepEqual(orderByRound(1), { d: 1, p: 2 }, 'round1：direct 先')
+  assert.deepEqual(orderByRound(2), { d: 2, p: 1 }, 'round2：plugin 先（交替）')
+  assert.deepEqual(orderByRound(3), { d: 1, p: 2 }, 'round3：direct 先')
+  // 双侧各恰一次预热且不产生样本
+  const warmupCalls = d.state.calls.filter((c) => (c.path === '/__perf/warm/open') || (c.path.endsWith('/chat') && c.body.text?.includes('预热')))
+  assert.equal(d.state.calls.filter((c) => c.path === '/__perf/warm/open').length, 1, '直连预热恰一次')
+  assert.equal(out.overall, 'ok')
+})
+
+test('模型白名单：基准不在实际可用选项 → unknown + incomplete；在清单 → true（对照）', async () => {
+  const d = makeMockDeps() // 模型 prov/m-1
+  const out1 = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, listModels: async () => ['other/x', 'other/y'], texts: { qaRounds: 1, toolRounds: 1, warmRounds: 1 } })
+  assert.equal(out1.models['cold-qa'].match, 'unknown', '基准不在白名单 → unknown（不确定标 unknown）')
+  assert.equal(out1.models['cold-qa'].whitelistChecked, true)
+  assert.equal(out1.overall, 'incomplete')
+  assert.equal(out1.exitCode, 1)
+  const out2 = await runSampling({ api: d.api, mkBot: d.mkBot, rmBot: d.rmBot, listModels: async () => ['prov/m-1', 'other/y'], texts: { qaRounds: 1, toolRounds: 1, warmRounds: 1 } })
+  assert.equal(out2.models['cold-qa'].match, true, '基准在白名单 → true（对照）')
+  assert.equal(out2.overall, 'ok')
 })

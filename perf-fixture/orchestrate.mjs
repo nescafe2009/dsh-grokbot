@@ -40,6 +40,20 @@ export function normalizeSample(raw) {
   }
 }
 
+
+// bot 清理（真实 finally 内调用）：rmBot 抛错/返回假值 → 记 cleanup 失败并降级（不吞异常）
+async function cleanupBot(rmBot, botId, pair, results, degrade, log) {
+  if (!botId) return
+  try {
+    const ok = await rmBot(botId)
+    if (ok === false) throw new Error('rmBot 返回 false（DELETE 未成功）')
+    log(`  cleanup bot ${botId}: ok`)
+  } catch (e) {
+    degrade(`${pair} bot 清理失败（${botId}）：${String(e?.message ?? e).slice(0, 80)}`)
+    results.push({ pair, side: 'plugin', botId, status: 'failed', reason: 'bot cleanup failed', error: String(e?.message ?? e).slice(0, 120) })
+  }
+}
+
 export function alternatingOrder(round) {
   return round % 2 === 1 ? ['direct', 'plugin'] : ['plugin', 'direct']
 }
@@ -84,13 +98,19 @@ export async function runSampling(deps) {
         log(`  ${i}D: ${s.rttMs}ms status=${s.status} model=${s.model ?? '未知'}`)
       } else {
         const bid = await mkBot(`冷${i}`)
+        try {
         const p = await api(`/conversations/${bid}/chat`, { text: QA })
         const s = normalizeSample({ round: i, pair: 'cold-qa', side: 'plugin', order: order.indexOf('plugin') + 1, botId: bid,
           reply: (p.reply || '').trim().slice(0, 20) || undefined,
           rttMs: p.rttMs, http: p.http, outcome: p.outcome, error: p.error, cancelled: p.outcome?.cancelled })
         results.push(s)
         log(`  ${i}P: ${s.rttMs}ms status=${s.status} model=${s.model ?? '未知'}`)
-        await rmBot(bid)
+        } catch (e) {
+          degrade(`cold-qa ${i}P chat 异常：${String(e?.message ?? e).slice(0, 60)}`)
+          results.push({ round: i, pair: 'cold-qa', side: 'plugin', botId: bid, status: 'failed', reason: 'chat exception', error: String(e?.message ?? e).slice(0, 120) })
+        } finally {
+          await cleanupBot(rmBot, bid, 'cold-qa', results, degrade, log)
+        }
       }
     }
   }
@@ -111,105 +131,153 @@ export async function runSampling(deps) {
         log(`  ${i}D: ${s.rttMs}ms tools=${d.toolCalls} evidence=${hasTools} status=${s.status}`)
       } else {
         const bid = await mkBot(`工具${i}`)
-        const p = await api(`/conversations/${bid}/chat`, { text: TOOL, evidenceMarker: MARKER })
-        const hasTools = bashToolEvidence(p.outcome)
-        const matched = targetEvidence(p.outcome, MARKER)
-        const outcome = p.outcome ?? {}
-        const s = normalizeSample({ round: i, pair: 'cold-tool', side: 'plugin', order: order.indexOf('plugin') + 1, botId: bid,
-          rttMs: p.rttMs, http: p.http, reply: (p.reply || '').trim().slice(0, 30) || undefined,
-          outcome, error: outcome.error, cancelled: outcome.cancelled,
-          toolEvidence: hasTools, targetMatch: matched,
-          status: hasTools && matched && !outcome.cancelled && !outcome.error ? 'ok' : 'failed' })
-        results.push(s)
-        log(`  ${i}P: ${s.rttMs}ms tools=${hasTools} target=${matched} status=${s.status}`)
-        await rmBot(bid)
+        try {
+          const p = await api(`/conversations/${bid}/chat`, { text: TOOL, evidenceMarker: MARKER })
+          const hasTools = bashToolEvidence(p.outcome)
+          const matched = targetEvidence(p.outcome, MARKER)
+          const outcome = p.outcome ?? {}
+          const s = normalizeSample({ round: i, pair: 'cold-tool', side: 'plugin', order: order.indexOf('plugin') + 1, botId: bid,
+            rttMs: p.rttMs, http: p.http, reply: (p.reply || '').trim().slice(0, 30) || undefined,
+            outcome, error: outcome.error, cancelled: outcome.cancelled,
+            toolEvidence: hasTools, targetMatch: matched,
+            status: hasTools && matched && !outcome.cancelled && !outcome.error ? 'ok' : 'failed' })
+          results.push(s)
+          log(`  ${i}P: ${s.rttMs}ms tools=${hasTools} target=${matched} status=${s.status}`)
+        } catch (e) {
+          degrade(`cold-tool ${i}P chat 异常：${String(e?.message ?? e).slice(0, 60)}`)
+          results.push({ round: i, pair: 'cold-tool', side: 'plugin', botId: bid, status: 'failed', reason: 'chat exception', error: String(e?.message ?? e).slice(0, 120) })
+        } finally {
+          await cleanupBot(rmBot, bid, 'cold-tool', results, degrade, log)
+        }
       }
     }
   }
 
-  // ===== 暖插件（预热 1 次排除；预热非 ok → 停组并释放） =====
-  log('== 暖插件（预热1次 + 采样同文本） ==')
+  // ===== 暖配对（双侧各预热一次排除；同 round 交替先后；双侧独立清理） =====
+  log('== 暖配对（双侧预热 + 同 round 交替） ==')
   {
+    // -- 插件侧：预热在 try 内（预热 reject 也走 finally 清理）--
     const warmBot = await mkBot('暖采样')
-    const warmup = await api(`/conversations/${warmBot}/chat`, { text: WARMUP })
-    const wOutcome = warmup.outcome ?? {}
-    const warmupOk = warmup.reply && !warmup.reply.includes('未能给出') && !wOutcome.cancelled && !wOutcome.error
-    log(`  warmup: ${warmup.ms}ms ok=${warmupOk} (excluded)`)
+    let pluginSideAlive = true
     try {
+      const warmup = await api(`/conversations/${warmBot}/chat`, { text: WARMUP })
+      const wOutcome = warmup.outcome ?? {}
+      const warmupOk = warmup.reply && !warmup.reply.includes('未能给出') && !wOutcome.cancelled && !wOutcome.error
+      log(`  P warmup: ${warmup.rttMs ?? warmup.ms}ms ok=${warmupOk} (excluded)`)
       if (!warmupOk) {
-        degrade('warm-plugin 预热失败：本组停止采样并释放 bot')
-        results.push({ pair: 'warm-plugin', side: 'plugin', botId: warmBot, status: 'failed', reason: 'warmup failed', warmupMs: warmup.rttMs ?? warmup.ms, model: wOutcome.model ?? null })
+        pluginSideAlive = false
+        degrade('warm-plugin 预热失败：插件侧停止采样并释放 bot')
+        results.push({ pair: 'warm-plugin', side: 'plugin', botId: warmBot, status: 'failed', reason: 'warmup failed', warmupRttMs: warmup.rttMs ?? null, model: wOutcome.model ?? null })
+      } else if (wOutcome.cancelled === true || /cancel/i.test(String(wOutcome.stopReason ?? ''))) {
+        pluginSideAlive = false
+        degrade('warm-plugin 预热取消：插件侧停止采样')
+        results.push({ pair: 'warm-plugin', side: 'plugin', botId: warmBot, status: 'cancelled', reason: 'warmup cancelled' })
+      }
+    } catch (e) {
+      pluginSideAlive = false
+      degrade(`warm-plugin 预热异常：${String(e?.message ?? e).slice(0, 60)}`)
+      results.push({ pair: 'warm-plugin', side: 'plugin', botId: warmBot, status: 'failed', reason: 'warmup exception', error: String(e?.message ?? e).slice(0, 120) })
+    }
+
+    // -- 直连侧：open（预热）在 try 内（handle 取得后 close 必达）--
+    let openHandleId = null
+    let directSideAlive = false
+    try {
+      const open = await api('/__perf/warm/open', { text: WARMUP })
+      openHandleId = open.handleId ?? null
+      if (!openHandleId) {
+        degrade('warm-direct open 失败')
+        results.push({ pair: 'warm-direct', side: 'direct', status: 'failed', reason: 'open failed', error: open.error ?? null })
       } else {
-        for (let i = 1; i <= warmRounds; i++) {
-          const p = await api(`/conversations/${warmBot}/chat`, { text: QA })
-          const s = normalizeSample({ round: i, pair: 'warm-plugin', side: 'plugin', botId: warmBot,
-            rttMs: p.rttMs, http: p.http, reply: (p.reply || '').trim().slice(0, 20) || undefined,
-            outcome: p.outcome ?? {}, error: p.outcome?.error, cancelled: p.outcome?.cancelled,
-            status: p.reply && !p.reply.includes('未能给出') && !p.outcome?.cancelled && !p.outcome?.error ? 'ok' : 'empty' })
-          results.push(s)
-          log(`  ${i}: ${s.rttMs}ms status=${s.status}`)
+        log(`  D warmup: ${open.warmupMs}ms status=${open.warmupStatus} (excluded)`)
+        if (open.warmupStatus === 'cancelled') {
+          degrade('warm-direct 预热取消：直连侧停止采样')
+          results.push({ pair: 'warm-direct', side: 'direct', status: 'cancelled', reason: 'warmup cancelled', warmupMs: open.warmupMs, model: open.model ?? null })
+        } else if (open.warmupStatus !== 'ok') {
+          degrade('warm-direct 预热失败：直连侧停止采样')
+          results.push({ pair: 'warm-direct', side: 'direct', status: 'failed', reason: 'warmup failed', warmupMs: open.warmupMs, model: open.model ?? null })
+        } else {
+          directSideAlive = true
+        }
+      }
+    } catch (e) {
+      degrade(`warm-direct open 异常：${String(e?.message ?? e).slice(0, 60)}`)
+      results.push({ pair: 'warm-direct', side: 'direct', status: 'failed', reason: 'open exception', error: String(e?.message ?? e).slice(0, 120) })
+    }
+
+    // -- 同 round 交替（奇数轮 direct 先，偶数轮 plugin 先；order 记录先后）--
+    try {
+      for (let i = 1; i <= warmRounds; i++) {
+        const order = alternatingOrder(i)
+        for (const side of order) {
+          if (side === 'direct' && directSideAlive) {
+            try {
+              const d = await api('/__perf/warm/turn', { handleId: openHandleId, text: QA })
+              const s = normalizeSample({ ...d, round: i, pair: 'warm-direct', side: 'direct', order: order.indexOf('direct') + 1,
+                reply: (d.replyBytes ?? 0) > 0 ? '(direct)' : undefined,
+                status: d.status, error: d.error,
+                toolEvidence: bashToolEvidence(d), targetMatch: false })
+              results.push(s)
+              log(`  ${i}D(${order.indexOf('direct') + 1}): ${s.rttMs}ms status=${s.status}`)
+            } catch (e) {
+              directSideAlive = false // 直连侧停止（后续轮只跑插件侧）
+              degrade(`warm-direct ${i}D turn 异常：${String(e?.message ?? e).slice(0, 60)}`)
+              results.push({ round: i, pair: 'warm-direct', side: 'direct', order: order.indexOf('direct') + 1, status: 'failed', reason: 'turn exception', error: String(e?.message ?? e).slice(0, 120) })
+            }
+          } else if (side === 'plugin' && pluginSideAlive) {
+            try {
+              const p = await api(`/conversations/${warmBot}/chat`, { text: QA })
+              const s = normalizeSample({ round: i, pair: 'warm-plugin', side: 'plugin', order: order.indexOf('plugin') + 1, botId: warmBot,
+                rttMs: p.rttMs, http: p.http, reply: (p.reply || '').trim().slice(0, 20) || undefined,
+                outcome: p.outcome ?? {}, error: p.outcome?.error, cancelled: p.outcome?.cancelled,
+                status: p.reply && !p.reply.includes('未能给出') && !p.outcome?.cancelled && !p.outcome?.error ? 'ok' : 'empty' })
+              results.push(s)
+              log(`  ${i}P(${order.indexOf('plugin') + 1}): ${s.rttMs}ms status=${s.status}`)
+            } catch (e) {
+              pluginSideAlive = false
+              degrade(`warm-plugin ${i}P chat 异常：${String(e?.message ?? e).slice(0, 60)}`)
+              results.push({ round: i, pair: 'warm-plugin', side: 'plugin', order: order.indexOf('plugin') + 1, botId: warmBot, status: 'failed', reason: 'chat exception', error: String(e?.message ?? e).slice(0, 120) })
+            }
+          }
         }
       }
     } finally {
-      await rmBot(warmBot) // 真实 finally：无论成败/异常释放
-    }
-  }
-
-  // ===== 暖直连（专用 handle：open 预热 + turns + finally close） =====
-  log('== 暖直连（专用 handle） ==')
-  {
-    const open = await api('/__perf/warm/open', { text: WARMUP })
-    if (!open.handleId) {
-      degrade('warm-direct open 失败')
-      results.push({ pair: 'warm-direct', side: 'direct', status: 'failed', reason: 'open failed', error: open.error ?? null })
-    } else {
-      log(`  warmup: ${open.warmupMs}ms status=${open.warmupStatus} (excluded)`)
-      try {
-        if (open.warmupStatus !== 'ok') {
-          degrade('warm-direct 预热失败：本组停止采样')
-          results.push({ pair: 'warm-direct', side: 'direct', status: 'failed', reason: 'warmup failed', warmupMs: open.warmupMs, model: open.model ?? null })
-        } else {
-          for (let i = 1; i <= warmRounds; i++) {
-            const d = await api('/__perf/warm/turn', { handleId: open.handleId, text: QA })
-            const s = normalizeSample({ ...d, round: i, pair: 'warm-direct', side: 'direct',
-              reply: (d.replyBytes ?? 0) > 0 ? '(direct)' : undefined,
-              status: d.status, error: d.error,
-              toolEvidence: bashToolEvidence(d), targetMatch: false })
-            results.push(s)
-            log(`  ${i}D: ${s.rttMs}ms status=${s.status}${d.error ? ` error=${String(d.error).slice(0, 40)}` : ''}`)
-          }
-        }
-      } catch (turnError) {
-        // turn 异常（api reject）：保留 incomplete 证据，finally close 仍执行
-        degrade(`warm-direct turn 异常：${String(turnError?.message ?? turnError).slice(0, 80)}`)
-        results.push({ pair: 'warm-direct', side: 'direct', status: 'failed', reason: 'turn exception', error: String(turnError?.message ?? turnError).slice(0, 120) })
-      } finally {
-        // 真实 finally close：close 失败/未知必须记 cleanup 失败（非仅日志）
-        const closed = await api('/__perf/warm/close', { handleId: open.handleId }).catch((e) => ({ ok: false, error: String(e) }))
+      // 双侧清理：close 与 rmBot 均真实 finally，失败各自记 cleanup 失败
+      if (openHandleId) {
+        const closed = await api('/__perf/warm/close', { handleId: openHandleId }).catch((e) => ({ ok: false, error: String(e) }))
         if (closed?.ok !== true) {
           degrade(`warm-direct close 失败（cleanup 未确认）：${closed?.error ?? `http=${closed?.http ?? 'unknown'}`}`)
           results.push({ pair: 'warm-direct', side: 'direct', status: 'failed', reason: 'close failed (cleanup unconfirmed)', closeDetail: { http: closed?.http ?? null, error: closed?.error ?? null } })
         } else {
-          log('  close: ok')
+          log('  D close: ok')
         }
       }
+      await cleanupBot(rmBot, warmBot, 'warm-plugin', results, degrade, log)
     }
   }
 
-  // ===== 模型参数匹配（冷冷暖暖同模型条件：全四组与全局基准一致） =====
-  // 基准 = 首个非空模型（冷组优先）；任一组未知（null）→ unknown；组内/与基准不等 → false
+  // ===== 模型参数匹配（冷冷暖暖同模型条件 + 实际有效选项白名单） =====
+  // 基准 = 首个非空模型；白名单（deps.listModels 实际可用选项）不可得或基准不在其中 → 不确定 → unknown
   const models = {}
+  let whitelist = null
+  if (typeof deps.listModels === 'function') {
+    whitelist = await deps.listModels().then((list) => (Array.isArray(list) ? new Set(list.map(String)) : null)).catch(() => null)
+  }
   const allModels = results.map((r) => r.model ?? null).filter(Boolean)
   const reference = allModels[0] ?? null
+  const referenceValid = whitelist === null ? false : whitelist.has(String(reference))
   for (const pair of ['cold-qa', 'cold-tool', 'warm-plugin', 'warm-direct']) {
     const inPair = [...new Set(results.filter((r) => r.pair === pair).map((r) => r.model ?? null))]
     const direct = [...new Set(results.filter((r) => r.pair === pair && r.side === 'direct').map((r) => r.model ?? null))].join('|')
     const plugin = [...new Set(results.filter((r) => r.pair === pair && r.side === 'plugin').map((r) => r.model ?? null))].join('|')
     const unknown = inPair.includes(null) || inPair.length === 0 || !reference
     const mismatch = !unknown && inPair.some((m) => m !== reference)
-    const match = unknown ? 'unknown' : (mismatch ? false : true)
-    models[pair] = { direct: direct || 'unknown', plugin: plugin || 'unknown', reference: reference ?? 'unknown', match }
-    if (match !== true) degrade(`配对 ${pair} 模型参数不匹配或未知（direct=${direct || 'unknown'} plugin=${plugin || 'unknown'} 基准=${reference ?? 'unknown'}）`)
+    const match = (unknown || !referenceValid) ? 'unknown' : (mismatch ? false : true)
+    models[pair] = { direct: direct || 'unknown', plugin: plugin || 'unknown', reference: reference ?? 'unknown', whitelistChecked: whitelist !== null, match }
+    if (match !== true) {
+      const why = !reference ? '无样本模型' : (!referenceValid ? `基准 ${reference} 不在实际可用选项${whitelist === null ? '（清单不可得）' : ''}` : `组内不一致（direct=${direct} plugin=${plugin}）`)
+      degrade(`配对 ${pair} 模型参数不匹配或不确定：${why}`)
+    }
   }
 
   // ===== 汇总 =====

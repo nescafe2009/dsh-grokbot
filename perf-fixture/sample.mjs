@@ -80,11 +80,18 @@ async function mkBot(name) {
     return (JSON.parse(text)).bot?.id
   } catch { return undefined }
 }
+// bot 清理：验证 DELETE 状态（2xx 才算成功）——失败抛错交由编排记录 cleanup 失败（不吞异常）
 async function rmBot(id) {
   if (!id) return
-  try {
-    await fetchWithTimeout(`http://127.0.0.1:${PORT}/api/plugins/grokbot/bots/${id}?token=${token}`, { method: 'DELETE' }, 10000)
-  } catch { /* best effort */ }
+  const { response } = await fetchWithTimeout(`http://127.0.0.1:${PORT}/api/plugins/grokbot/bots/${id}?token=${token}`, { method: 'DELETE' }, 10000)
+  if (!(response.status >= 200 && response.status < 300)) throw new Error(`DELETE bots/${id} → ${response.status}`)
+}
+// 实际有效模型选项（/model-catalog）：provider/model 全集，作为采样模型白名单
+async function listModels() {
+  const { response, text } = await fetchWithTimeout(`http://127.0.0.1:${PORT}/api/plugins/grokbot/model-catalog?token=${token}`, { method: 'GET' }, 30000)
+  if (!response.ok) throw new Error(`model-catalog → ${response.status}`)
+  const j = JSON.parse(text)
+  return (j.catalog ?? []).flatMap((p) => (p.models ?? []).map((m) => `${p.id}/${m.id}`))
 }
 
 // ===== 主流程 =====
@@ -115,7 +122,7 @@ async function main() {
 
   // ===== 采样编排（可测核心 orchestrate.mjs；本文件只提供真实依赖） =====
   const sampling = await runSampling({
-    api, mkBot, rmBot,
+    api, mkBot, rmBot, listModels,
     log: (line) => console.log(line),
   })
   results.push(...sampling.results)
