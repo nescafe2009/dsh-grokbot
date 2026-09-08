@@ -130,7 +130,7 @@ try {
   if (crewOk) writeFileSync(sentinelPath, sentinelBytes)
   step('sentinel: 哨兵写入数据目录', crewOk, crewOk ? sentinelPath.replace(R3HOME, '$DSH_HOME') : 'crew.json 未生成，无法写哨兵')
 
-  await stageWindow('a', base, a.token, (r) => [
+  await stageWindow('a', `${base}/?token=${a.token}`, (r) => [
     ['Grok 侧栏/机器人入口渲染', r.uiRendered === true, r.uiDetail ?? ''],
     ['聊天视图可打开（无模型不无限加载）', r.chatOpened === true, r.chatDetail ?? ''],
     ['截图留证', typeof r.screenshot === 'string' && r.screenshot.length > 0, r.screenshot ?? ''],
@@ -151,7 +151,7 @@ try {
     const goneB = await fetchBounded(`${base}/api/plugins/grokbot/state`, { headers: { cookie: cookieB } })
     step('http#B: 插件路由 404（沿用）', goneB.status === 404, `status=${goneB.status}`)
   }
-  await stageWindow('b', base, b.token, (r) => [
+  await stageWindow('b', `${base}/?token=${b.token}`, (r) => [
     ['原生宿主可操作', r.nativeOperable === true, r.nativeDetail ?? ''],
     ['Grok 节点/样式消失', r.grokGone === true, r.goneDetail ?? ''],
     ['截图留证', typeof r.screenshot === 'string' && r.screenshot.length > 0, r.screenshot ?? ''],

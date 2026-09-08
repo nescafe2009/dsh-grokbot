@@ -6,7 +6,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
-import { renameSync, writeFileSync } from 'node:fs'
+import { renameSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { makeStageWindow, newRunId } from './package-build/stage-window.mjs'
@@ -112,5 +112,39 @@ test('正例：身份匹配 + 本轮目录实际非空截图 + 原子提交 → 
     await win2('a', 'http://x/?token=zzz', checks)
     assert.match(rec2.steps.join('\n'), /BLOCKED/)
     assert.equal(rec2.exitCode(), 2)
+  } finally { await rm(runDir, { recursive: true, force: true }) }
+})
+
+test('实际入口成功路径：生产三参调用 + 正确身份 done → checks 执行、URL 带认证、日志不回显 token', async () => {
+  const runDir = await mkdtemp(join(tmpdir(), 'sw-prod-'))
+  try {
+    await writeFile(join(runDir, 'shot.png'), 'real-png-bytes')
+    const TOKEN = 'sEcReTtOkEn123'
+    const rec = recorder()
+    const win = makeStageWindow({ runDir, runId: RUN_ID, tgzSha256: TGZ_SHA, step: rec.step, timeoutMs: 4000, pollMs: 50 })
+    const checksCalled = []
+    // 生产调用形态：stageWindow(phase, 完整 token URL, checks 回调)——回归 5c92361 的四参错位
+    const p = win('a', `http://127.0.0.1:1/?token=${TOKEN}`, (r) => {
+      checksCalled.push(r)
+      return [
+        ['Grok 侧栏渲染', r.uiRendered === true, ''],
+        ['聊天视图可打开', r.chatOpened === true, ''],
+        ['截图留证', true, ''],
+      ]
+    })
+    setTimeout(() => atomicDone(runDir, 'a', { runId: RUN_ID, phase: 'a', tgzSha256: TGZ_SHA, uiRendered: true, chatOpened: true, screenshot: 'shot.png' }), 150)
+    const logs = []
+    const origLog = console.log
+    console.log = (...a) => logs.push(a.join(' '))
+    try { await p } finally { console.log = origLog }
+    // checks 真的执行了（而非收到字符串导致 is not a function）
+    assert.equal(checksCalled.length, 1, 'checks 回调必须被调用一次（实际入口成功路径）')
+    assert.deepEqual(rec.steps.filter((x) => x.startsWith('PASS')).length, 3, `三项全 PASS（got ${rec.steps.join('; ')}）`)
+    assert.equal(rec.exitCode(), 0)
+    // URL 文件携带认证（token 存在），但模块日志不得回显
+    const urlContent = readFileSync(join(runDir, 'stage-a.url'), 'utf8')
+    assert.ok(urlContent.includes(`token=${TOKEN}`), 'URL 文件必须含完整认证 token')
+    const echoed = logs.some((l) => l.includes(TOKEN))
+    assert.equal(echoed, false, '日志不得回显 token')
   } finally { await rm(runDir, { recursive: true, force: true }) }
 })
