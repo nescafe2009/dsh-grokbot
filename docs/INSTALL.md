@@ -46,4 +46,4 @@
 
 ## 包完整性
 
-每个 tgz 附 `dist/r3/manifest.json`：git SHA、tgz SHA256、逐文件 SHA256。构建脚本扫描私人路径（`/Users/…`）、状态目录残留与凭据痕迹，命中即失败。
+每个 tgz 附 `dist/r3/manifest.json`：git SHA、tgz SHA256、逐文件 SHA256。构建脚本扫描机器特定绝对路径与凭据痕迹，命中即失败。
