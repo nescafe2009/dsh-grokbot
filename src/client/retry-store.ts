@@ -11,6 +11,7 @@ export interface PendingRetry {
   text: string
   taskId: string | null
   createdAt: number
+  seq?: number // 请求序号（allocateSeq 分配）——旧请求不能覆盖较新的
 }
 
 /**
@@ -23,15 +24,37 @@ export const RETRY_GUARANTEE_MS = 5 * 60_000
 export const RETRY_FAILURE_GUARANTEE_MS = 30_000
 
 const store = new Map<string, PendingRetry>()
+/** 每会话已结算（成功清除/失败写入）的最高序号——旧回调不能低于此水印写槽 */
+const settledWatermark = new Map<string, number>()
 
 export function setPendingRetry(retry: PendingRetry): void {
-  // 保留首次创建时间：重复失败不延长原请求的保留期
   const existing = store.get(retry.conversationId)
-  store.set(retry.conversationId, existing ? { ...retry, createdAt: existing.createdAt } : retry)
+  if (existing && (existing.seq ?? 0) > (retry.seq ?? 0)) {
+    return
+  }
+  // 低于已结算水印的旧失败不能重新占据重试槽（新请求已成功/新失败已写入）
+  const wm = settledWatermark.get(retry.conversationId) ?? 0
+  if ((retry.seq ?? 0) < wm) {
+    return
+  }
+  // 同一请求（requestId 相同）重复失败：保留首次创建时间（不延长保留期）；新请求失败用新时间
+  const record = existing && existing.requestId === retry.requestId ? { ...retry, createdAt: existing.createdAt } : retry
+  store.set(retry.conversationId, record)
+  settledWatermark.set(retry.conversationId, Math.max(wm, retry.seq ?? 0))
 }
 
-export function clearPendingRetry(conversationId: string): void {
+/** 新发送前声明该会话的下一个请求序号（send 递增后写 store），旧回调只能写 ≤ 自己序号的槽 */
+let nextSeq = 1
+export function allocateSeq(): number {
+  return nextSeq++
+}
+
+export function clearPendingRetry(conversationId: string, seq?: number): void {
   store.delete(conversationId)
+  if (seq !== undefined) {
+    const wm = settledWatermark.get(conversationId) ?? 0
+    settledWatermark.set(conversationId, Math.max(wm, seq))
+  }
 }
 
 export function getPendingRetry(conversationId: string): PendingRetry | null {
@@ -46,7 +69,7 @@ export function retryMatches(retry: PendingRetry | null, conversationId: string)
 /**
  * 风险分级（仅文案，不是安全承诺）：30s 内高把握命中去重（失败缓存最短边界）；
  * 30s~5min 中风险；超 5min 低把握（且服务端重启会清空，任何时候重启都不保证）。
- * 首次失败时间不因重复失败刷新（createdAt 记录首次创建，setPendingRetry 已存在时不覆盖）。
+ * 首次失败时间不因重复失败刷新（同 requestId 重复失败保留原 createdAt，见 setPendingRetry）。
  */
 export function retryRiskLevel(retry: PendingRetry, now = Date.now()): 'high' | 'medium' | 'low' {
   const age = now - retry.createdAt

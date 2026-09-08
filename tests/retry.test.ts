@@ -21,6 +21,9 @@ test('重复失败不刷新首次创建时间（不延长保留期）', () => {
   const got = getPendingRetry(conv)
   assert.ok(Date.now() - got.createdAt >= 39_000, '首次时间未被刷新')
   assert.equal(retryRiskLevel(got), 'medium', '40s 仍是 medium，不被第二次失败拉回 high')
+  // 不同请求（新 requestId）失败：用新的首次时间，不继承旧记录
+  setPendingRetry({ conversationId: conv, requestId: 'r2', text: 'a', taskId: null, createdAt: Date.now() })
+  assert.ok(Date.now() - getPendingRetry(conv).createdAt < 1_000, '新请求失败用新时间')
   clearPendingRetry(conv)
 })
 

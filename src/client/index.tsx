@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { AvatarView, MarkdownView, splitChips, SidebarRow, MessageView, Composer, TaskCard } from './components'
 import { GKF_CSS } from './tokens'
-import { getPendingRetry, setPendingRetry, clearPendingRetry, retryMatches, retryRiskLevel } from './retry-store'
+import { getPendingRetry, setPendingRetry, clearPendingRetry, retryMatches, retryRiskLevel, allocateSeq } from './retry-store'
 
 export const API_ROOT = '/api/plugins/grokbot'
 const POLL_MS = 2000
@@ -1114,6 +1114,7 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
     const taskForSend = isRetry ? overrideRequest!.taskId : (draftTask?.taskId ?? null)
     const sendBotId = bot.id // 会话守卫：await 后只写入仍是当前会话的状态
     const sendGen = ++botGenRef.current // 执行代次：同会话新旧两轮也要区分
+    const sendSeq = allocateSeq() // 请求序号：旧失败不能覆盖较新的重试槽
     if (!isRetry) setDraft('')
     setRetryRequest(null); clearPendingRetry(bot.id)
     appendLocal(bot.id, { id: `${Date.now()}-u`, role: 'user', text, at: Date.now() })
@@ -1125,6 +1126,7 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
         body: JSON.stringify({ text, requestId, ...(taskForSend ? { taskId: taskForSend } : {}), ...(opts?.retryMode ? { retryMode: opts.retryMode } : {}) }),
       })
       if (sendGen !== botGenRef.current) return // 迟到结果：新轮已发起（含切回同会话的第二轮），丢弃
+      clearPendingRetry(bot.id, sendSeq) // POST 成功即结算水印——不等历史刷新（refetchHistory 窗口内旧失败不得占槽）
       const activity = (outcome?.activity ?? []) as string[]
       if (activity.length > 0) {
         const counted = activity.reduce<Record<string, number>>((acc, name) => {
@@ -1145,7 +1147,7 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
       setDraftTask(null)
     } catch (error) {
       // 失败记录始终保存到原会话 store（不丢弃），但 UI 写入仅当仍是当前代次
-      const pending = { conversationId: sendBotId, requestId, text, taskId: taskForSend, createdAt: isRetry && overrideRequest?.createdAt ? overrideRequest.createdAt : Date.now() }
+      const pending = { conversationId: sendBotId, requestId, text, taskId: taskForSend, createdAt: isRetry && overrideRequest?.createdAt ? overrideRequest.createdAt : Date.now(), seq: sendSeq }
       setPendingRetry(pending)
       if (sendGen !== botGenRef.current) return // 切走/新轮后不写入当前 UI——但 store 中已有记录供切回恢复
       appendLocal(bot.id, {
@@ -1429,6 +1431,7 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
     const taskForSend = isRetry ? overrideRequest!.taskId : (draftTask?.taskId ?? null)
     const sendRoomId = room.id // 会话守卫
     const sendGen = ++roomGenRef.current // 执行代次：同群新旧两轮也要区分
+    const sendSeq = allocateSeq() // 请求序号
     if (!isRetry) setDraft('')
     setRetryRequest(null); clearPendingRetry(room.id)
     setSending(true)
@@ -1440,9 +1443,10 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
       if (sendGen !== roomGenRef.current) return // 迟到结果：新轮已发起（含切回同群的第二轮），丢弃
       setMessages(((outcome?.messages ?? []) as RoomMessage[]).slice())
       setDraftTask(null)
+      clearPendingRetry(room.id, sendSeq) // 新成功水印
     } catch (error) {
       // 失败记录始终保存到原会话 store（不丢弃），UI 写入仅当仍是当前代次
-      const pending = { conversationId: sendRoomId, requestId, text, taskId: taskForSend, createdAt: isRetry && overrideRequest?.createdAt ? overrideRequest.createdAt : Date.now() }
+      const pending = { conversationId: sendRoomId, requestId, text, taskId: taskForSend, createdAt: isRetry && overrideRequest?.createdAt ? overrideRequest.createdAt : Date.now(), seq: sendSeq }
       setPendingRetry(pending)
       if (sendGen !== roomGenRef.current) return // 切走/新轮后不写入当前 UI
       setMessages((prev) => [...prev, { ts: Date.now(), role: 'system', text: `发送失败：${String((error as Error)?.message ?? error)}（可重试本次，复用原请求）` }])

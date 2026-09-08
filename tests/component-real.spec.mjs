@@ -16,7 +16,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 // 导入真实组件（构建产物 ESM + react symlink）
-const { BotChatView, GroupChatView } = await import('/tmp/ctb/test-entry.mjs')
+const { BotChatView, GroupChatView } = await import(await import('./ctb-path.mjs').then(m => m.CTB_DIR + '/test-entry.mjs'))
 const React = await import('/tmp/react-test-env/node_modules/react/index.js')
 const { createRoot } = await import('/tmp/react-test-env/node_modules/react-dom/client.js')
 const { act } = await import('/tmp/react-test-env/node_modules/react-dom/test-utils.js')
@@ -490,5 +490,105 @@ test('Codex: group A-B-A old POST cannot overwrite new generation', async () => 
       json: async () => ({ messages: [{ ts: 1, role: 'bot', botId: 'cx', text: 'OLD_GENERATION_ONLY' }] })
     }))
     assert.ok(!c.el.textContent.includes('OLD_GENERATION_ONLY'), 'old generation must not replace new state')
+  } finally { await act(async () => c.root.unmount()); c.el.remove(); teardownMockFetch() }
+})
+
+
+// ===== 12. Codex 探针：旧失败不能覆盖较新的重试记录 =====
+test('Codex: older failure cannot overwrite newer retry', async () => {
+  setupMockFetch(); const c = createContainer(); const a = makeBot('orderA'); const b = makeBot('orderB')
+  async function send(text) {
+    const ta = c.el.querySelector('textarea')
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text)
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('↑')).click())
+  }
+  try {
+    await render(React.createElement(BotChatView, { bot: a, state: null }), c)
+    await send('OLDER')
+    const old = deferredQueue.find(d => d.call.url.includes('/orderA/chat'))
+    assert.ok(old, 'OLDER POST pending')
+
+    // 切 B 再切回 A → 发 NEWER
+    await rerender(React.createElement(BotChatView, { bot: b, state: null }), c)
+    await rerender(React.createElement(BotChatView, { bot: a, state: null }), c)
+    await send('NEWER')
+    const posts = deferredQueue.filter(d => d.call.url.includes('/orderA/chat'))
+    const newer = posts[1]
+    assert.ok(newer, 'NEWER POST pending')
+    const newerId = JSON.parse(newer.call.body).requestId
+
+    // NEWER 先失败
+    await act(async () => newer.reject(new Error('new failure')))
+    // OLDER 后失败（迟到）
+    await act(async () => old.reject(new Error('old failure')))
+
+    // 切走再切回 A → 重试
+    await rerender(React.createElement(BotChatView, { bot: b, state: null }), c)
+    await rerender(React.createElement(BotChatView, { bot: a, state: null }), c)
+    await act(async () => {
+      const btn = [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('重试'))
+      if (btn) btn.click()
+    })
+
+    const last = fetchCalls.filter(f => f.url.includes('/orderA/chat')).at(-1)
+    assert.equal(JSON.parse(last.body).requestId, newerId, 'must retain newer retry requestId')
+  } finally { await act(async () => c.root.unmount()); c.el.remove(); teardownMockFetch() }
+})
+
+// ===== 13. 旧失败晚于新成功 → 不重新占据重试槽 =====
+test('旧失败不覆盖新成功后的重试槽', async () => {
+  setupMockFetch(); const c = createContainer(); const a = makeBot('lateOrderA'); const b = makeBot('lateOrderB')
+  const { clearPendingRetry } = await import('../src/client/retry-store.ts')
+  clearPendingRetry('lateOrderA'); clearPendingRetry('lateOrderB')
+  async function send(text) {
+    const ta = c.el.querySelector('textarea')
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text)
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('↑')).click())
+  }
+  try {
+    await render(React.createElement(BotChatView, { bot: a, state: null }), c)
+    await send('OLD_MSG')
+    const old = deferredQueue.find(d => d.call.url.includes('/lateOrderA/chat'))
+
+    // 切 B 再切回 A → 发 NEW_MSG → NEW_MSG 成功
+    await rerender(React.createElement(BotChatView, { bot: b, state: null }), c)
+    await rerender(React.createElement(BotChatView, { bot: a, state: null }), c)
+    await send('NEW_MSG')
+    const newer = deferredQueue.filter(d => d.call.url.includes('/lateOrderA/chat')).at(-1)
+    assert.ok(newer)
+    // NEW 成功
+    await act(async () => {
+      newer.resolve({ ok: true, status: 200, json: async () => ({ reply: 'NEW_OK' }), text: async () => '{}' })
+    })
+    // 成功路径会 await refetchHistory：resolve 该会话所有挂起的历史 GET
+    // （首次挂载也排过一个 GET——只 resolve 第一个会让 refetchHistory 永远挂起）
+    await act(async () => {
+      for (;;) {
+        const hi = deferredQueue.findIndex(d => d.call.url.includes('/lateOrderA') && d.call.method === 'GET')
+        if (hi < 0) break
+        deferredQueue.splice(hi, 1)[0].resolve({ ok: true, status: 200, json: async () => ({ messages: [] }), text: async () => '{}' })
+      }
+    })
+    await act(async () => { await new Promise(r => setTimeout(r, 50)) })
+
+    // 检查 store：新成功后应无 pending retry
+
+    // 旧 POST 迟到失败
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    await act(async () => old.reject(new Error('late old fail')))
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+
+    // 切走再切回 A → 不应有重试条（新请求已成功，旧失败不覆盖）
+    await rerender(React.createElement(BotChatView, { bot: b, state: null }), c)
+    await rerender(React.createElement(BotChatView, { bot: a, state: null }), c)
+    const allButtons = [...c.el.querySelectorAll('button')].map(b2 => b2.textContent?.trim())
+    const retryBtn = allButtons.find(t => t?.includes('重试'))
+    assert.ok(!retryBtn, `新请求已成功，旧失败不应重新占据重试槽——buttons: ${JSON.stringify(allButtons)}`)
   } finally { await act(async () => c.root.unmount()); c.el.remove(); teardownMockFetch() }
 })
