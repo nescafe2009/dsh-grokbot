@@ -140,9 +140,30 @@ export function apply(ctx, config = {}) {
   const maxConcurrentJobs = Math.max(1, Math.min(8, Number(config.maxConcurrentJobs) || 2))
   const jobTimeoutMs = Math.max(30_000, Number(config.jobTimeoutMs) || 1_800_000)
   const rescanIntervalMs = Math.max(1_000, Number(config.rescanIntervalMs) || 5_000)
-  // 测试端点（__probe/*、__perf/direct）默认关闭：显式测试配置才启用——
+  // 测试端点（__probe/*、__perf/direct、__perf/warm/*）默认关闭：显式测试配置才启用——
   // 生产实例不注册这些路由（404），不创建会话、不写计数器；仍走同一 origin/宿主认证层
   const testEndpointsOn = config.testEndpoints === true || process.env.GROKBOT_TEST_ENDPOINTS === '1'
+
+  // 暖直连专用 handle 注册表（效率配对；仅 testEndpoints 开启时可达）
+  const warmHandles = new Map() // handleId -> { handle, sessionId, busy, createdAt, expiresAt, timer, turns }
+  const WARM_MAX_ACTIVE = 2
+  const WARM_TTL_MS = 5 * 60_000
+  const WARM_TURN_TIMEOUT_MS = Math.min(jobTimeoutMs, 10 * 60_000)
+  const warmTombstones = new Map() // handleId -> { reason, at }：TTL 释放后短窗内可区分 410（过期）与 404（不存在/已关）
+  async function disposeWarmHandle(handleId, reason) {
+    const entry = warmHandles.get(handleId)
+    if (!entry) return
+    warmHandles.delete(handleId) // 先移除：并发访问立即按不存在处理，不会复活
+    warmTombstones.set(handleId, { reason, at: Date.now() })
+    if (warmTombstones.size > 16) { // 有界：只保留最近的
+      const oldest = warmTombstones.keys().next().value
+      warmTombstones.delete(oldest)
+    }
+    if (entry.timer) clearTimeout(entry.timer)
+    try { entry.handle.agent.cancel({ kind: 'user' }, { keepInbox: true }) } catch { /* best effort */ }
+    try { await entry.handle.dispose() } catch { /* best effort */ }
+    ctx.logger?.info?.(`grokbot 暖直连 handle ${handleId.slice(0, 8)}… 释放（${reason}）`)
+  }
 
   const crewState = { path: '', crew: { routing: { default: '' }, bots: [] } }
   const botStates = new Map()
@@ -2423,6 +2444,106 @@ export function apply(ctx, config = {}) {
             }
           }
         }
+        // 暖直连专用生命周期（效率配对；testEndpoints 门控，同一 origin/宿主认证层）。
+        // 专用 handle：服务端自建 sessionId（randomUUID）——不接受/不 resume 任意用户 sessionId；
+        // 预热一次 + 多轮 followup（同一 session）；串行执行（忙=409）；活跃上限 2、TTL 上限 5min；
+        // close/turn 异常/单轮超时/插件 dispose 均释放；未知或已关 handle 一律 404 且零会话创建。
+        if (testEndpointsOn && method === 'POST' && suffix === '/__perf/warm/open') {
+          const body = await readJsonBody(req)
+          if (warmHandles.size >= WARM_MAX_ACTIVE) throw new HttpError(409, `活跃暖直连 handle已达上限 ${WARM_MAX_ACTIVE}`)
+          const handleId = randomUUID()
+          const sessionId = randomUUID() // 专用会话：与用户会话命名空间无关，fixture 无法指定
+          const warmText = String(body?.text ?? '预热：只回复 OK。')
+          const ttlMs = Math.max(1_000, Math.min(WARM_TTL_MS, Number(body?.ttlMs) || WARM_TTL_MS))
+          const t0 = Date.now()
+          let handle = null
+          let warmupMs = null
+          let warmupStatus = 'skipped'
+          try {
+            const fallbackSel = typeof ctx.agentDefaultModel?.currentSelection === 'function' ? ctx.agentDefaultModel.currentSelection() : null
+            const sel = crewState.crew.defaultModel?.provider && crewState.crew.defaultModel?.model
+              ? crewState.crew.defaultModel
+              : (fallbackSel?.provider && fallbackSel?.model ? fallbackSel : null)
+            handle = await ctx.agents.create({
+              sessionId,
+              meta: { cwd: join(stateDir, 'workspace') },
+              ...(sel ? { agentOptions: sel } : {}),
+              setup: () => { /* 不注册任何插件工具——纯 DSH */ },
+            })
+            await handle.agent.whenIdle()
+            const firstSeq = handle.agent.session.seq
+            handle.agent.followup(userMessage(warmText))
+            await handle.agent.whenIdle()
+            const turn = summarizeTurn(handle.agent.session.events, firstSeq)
+            warmupMs = Date.now() - t0
+            warmupStatus = turn?.error ? 'failed' : (turn?.text?.trim() ? 'ok' : 'empty')
+          } catch (error) {
+            if (handle) { try { await handle.dispose() } catch { /* best effort */ } }
+            throw new HttpError(500, `暖直连 open 失败：${safeError(error)}`)
+          }
+          const entry = { handle, sessionId, busy: false, createdAt: Date.now(), expiresAt: Date.now() + ttlMs, timer: null, turns: 0 }
+          entry.timer = setTimeout(() => { void disposeWarmHandle(handleId, 'ttl') }, ttlMs)
+          entry.timer.unref?.()
+          warmHandles.set(handleId, entry)
+          logPerf({ kind: 'dsh-warm-open', conversationId: '__perf__', ms: warmupMs, status: warmupStatus })
+          respond(res, 200, { handleId, sessionId, warmupMs, warmupStatus, ttlMs, maxActive: WARM_MAX_ACTIVE }); return
+        }
+        if (testEndpointsOn && method === 'POST' && suffix === '/__perf/warm/turn') {
+          const body = await readJsonBody(req)
+          const handleId = String(body?.handleId || '')
+          const text = String(body?.text || '').trim()
+          const evidenceMarker = String(body?.evidenceMarker ?? '')
+          if (!text) throw new HttpError(400, 'text 不能为空')
+          const entry = warmHandles.get(handleId)
+          if (!entry) {
+            const tomb = warmTombstones.get(handleId)
+            if (tomb?.reason === 'ttl' && Date.now() - tomb.at < 30_000) throw new HttpError(410, '暖直连 handle 已过期（TTL）并已释放')
+            throw new HttpError(404, `暖直连 handle 不存在或已关闭：${handleId.slice(0, 8)}…（不会隐式创建）`)
+          }
+          if (Date.now() > entry.expiresAt) {
+            await disposeWarmHandle(handleId, 'ttl')
+            throw new HttpError(410, '暖直连 handle 已过期（TTL）并已释放')
+          }
+          if (entry.busy) throw new HttpError(409, '暖直连 handle 忙（串行执行）：请等待在途轮次完成')
+          entry.busy = true
+          const t0 = Date.now()
+          const timeoutMs = Math.max(200, Math.min(Number(body?.turnTimeoutMs) || WARM_TURN_TIMEOUT_MS, WARM_TURN_TIMEOUT_MS))
+          let timer = null
+          try {
+            const firstSeq = entry.handle.agent.session.seq
+            const turnDone = (async () => {
+              entry.handle.agent.followup(userMessage(text))
+              await entry.handle.agent.whenIdle()
+            })()
+            const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`warm turn timeout after ${timeoutMs}ms`)), timeoutMs); timer.unref?.() })
+            await Promise.race([turnDone, timeout])
+            const events = entry.handle.agent.session.events
+            const turn = summarizeTurn(events, firstSeq)
+            const activity = activityOf(events, firstSeq)
+            const evidence = shellExecutionEvidence(events, firstSeq, evidenceMarker)
+            const reply = turn?.text?.trim() ?? ''
+            const turnError = turn?.error ?? null
+            const status = turnError ? 'failed' : (reply ? 'ok' : 'empty')
+            entry.turns += 1
+            const ms = Date.now() - t0
+            logPerf({ kind: 'dsh-warm-turn', conversationId: '__perf__', ms, toolCalls: activity.length, status, replyBytes: reply.length, warm: true, turn: entry.turns, error: turnError })
+            respond(res, 200, { ms, sessionId: entry.sessionId, status, toolCalls: activity.length, activity, evidence, replyBytes: reply.length, error: turnError, warm: true, turn: entry.turns }); return
+          } catch (error) {
+            // 单轮超时/执行异常：释放 handle（下次访问按不存在处理，不复活）
+            await disposeWarmHandle(handleId, 'turn-error')
+            logPerf({ kind: 'dsh-warm-turn-error', conversationId: '__perf__', ms: Date.now() - t0, error: safeError(error) })
+            throw new HttpError(500, `暖直连 turn 失败（handle 已释放）：${safeError(error)}`)
+          } finally {
+            if (timer) clearTimeout(timer)
+            if (warmHandles.has(handleId)) entry.busy = false
+          }
+        }
+        if (testEndpointsOn && method === 'POST' && suffix === '/__perf/warm/close') {
+          const handleId = String((await readJsonBody(req))?.handleId || '')
+          if (!warmHandles.has(handleId)) throw new HttpError(404, `暖直连 handle 不存在或已关闭：${handleId.slice(0, 8)}…（零创建）`)
+          await disposeWarmHandle(handleId, 'close')
+          respond(res, 200, { ok: true, handleId }); return
+        }
         // 预览 POST 边界测试端点（R2-B）：无害副作用（内存计数器，重启即清），
         // 默认关闭——显式测试配置才注册；用于验证沙箱产物无法借宿主授权产生副作用
         if (testEndpointsOn && method === 'POST' && suffix === '/__probe/echo') {
@@ -2975,6 +3096,7 @@ export function apply(ctx, config = {}) {
 
   ctx.effect(() => () => {
     disposed = true
+    for (const handleId of [...warmHandles.keys()]) void disposeWarmHandle(handleId, 'plugin-dispose')
     for (const probe of busyProbes.values()) clearInterval(probe)
     busyProbes.clear()
     clearInterval(rescanTimer)

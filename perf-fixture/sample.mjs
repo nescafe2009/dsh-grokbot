@@ -272,11 +272,40 @@ async function main() {
   }
   await rmBot(warmBot)
 
-  // ===== 暖直连（fixture 私有 handle——当前未实现，标记 incomplete） =====
-  console.log('\n== 暖直连（未实现：需 fixture 私有 handle） ==')
-  results.push({ pair: 'warm-direct', side: 'direct', status: 'blocked', reason: 'fixture private handle not yet implemented' })
-  // 暖直连缺失 → 整体 incomplete（不可报告通过）
-  overallStatus = 'incomplete'
+  // ===== 暖直连 ×5（专用 handle：open 预热一次 + 同 session 多轮 + finally close） =====
+  // 与暖插件匹配：同模型参数（同一宿主默认/crew 配置）、同任务文本（QA）、预热一次排除
+  console.log('\n== 暖直连（专用 handle：预热1次 + 采样5次同文本） ==')
+  {
+    const open = await api('/__perf/warm/open', { text: '预热：只回复 OK。' })
+    if (!open.handleId) {
+      console.log(`  open failed: ${JSON.stringify(open).slice(0, 120)}`)
+      results.push({ pair: 'warm-direct', side: 'direct', status: 'failed', reason: 'open failed' })
+      overallStatus = 'incomplete'
+      process.exitCode = 1
+    } else {
+      console.log(`  warmup: ${open.warmupMs}ms status=${open.warmupStatus} (excluded)`)
+      if (open.warmupStatus !== 'ok') {
+        console.log('  WARNING: warmup failed — warm-direct samples may be unreliable')
+        overallStatus = 'incomplete'
+        process.exitCode = 1
+      }
+      try {
+        for (let i = 1; i <= 5; i++) {
+          const d = await api('/__perf/warm/turn', { handleId: open.handleId, text: QA })
+          const s = normalizeSample({ ...d, round: i, pair: 'warm-direct', side: 'direct',
+            ms: d.ms, reply: d.replyBytes > 0 ? '(direct)' : undefined,
+            status: d.status, error: d.error,
+            toolEvidence: bashToolEvidence(d), targetEvidence: false })
+          results.push(s)
+          console.log(`  ${i}D: ${d.ms}ms status=${d.status}${d.error ? ` error=${String(d.error).slice(0, 40)}` : ''}`)
+        }
+      } finally {
+        // 专用 handle 生命周期收尾：无论成败必须 close（释放会话）
+        const closed = await api('/__perf/warm/close', { handleId: open.handleId }).catch(() => null)
+        console.log(`  close: ${closed?.ok === true ? 'ok' : 'failed(可能已随异常/TTL 释放)'}`)
+      }
+    }
+  }
 
   // ===== 汇总（统一判定：非 ok 状态均不计通过） =====
   const nonOk = results.filter(r => r.status !== 'ok')

@@ -105,7 +105,7 @@ FIXTURE_DIR=<dir> ZAI_API_KEY=<key> TESTED_SHA=<sha> node sample.mjs
 |---|---|
 | 冷↔冷 | 每轮交替先后（奇数轮 direct→plugin，偶数轮 plugin→direct） |
 | 暖插件 | 独立 bot 预热 1 次（排除） + 采样 5 次同文本 |
-| 暖直连 | 需 fixture 私有 handle（保留专用 session 多次 followup + finally dispose）——当前未实现，恒 incomplete |
+| 暖直连 | 专用 handle 生命周期：`__perf/warm/open`（服务端自建 sessionId 预热一次）→ `__perf/warm/turn` ×5（同 session 同文本）→ `finally __perf/warm/close`；忙=409 串行、活跃上限 2、TTL 5min、单轮超时/异常/插件 dispose 均释放、未知/已关 404 零创建；与暖插件同模型参数同任务文本，预热排除、完整 ms/status/error 字段 |
 
 ## 清理
 
