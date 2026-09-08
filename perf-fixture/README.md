@@ -48,6 +48,12 @@ FIXTURE_DIR=<dir> ZAI_API_KEY=<key> TESTED_SHA=<sha> node sample.mjs
 1. 环境变量 `ZAI_API_KEY` 是否设置（不打印值）
 2. 真实模型调用 `/__perf/direct`，status≠ok → **exit 1 不记任何时延**
 
+## 测试端点开关（必需）
+
+`__perf/direct`、`__probe/*` 自 d336690 起默认关闭（生产实例 404）。采样前需在宿主插件配置显式开启：
+`config.testEndpoints: true`（或环境变量 `GROKBOT_TEST_ENDPOINTS=1`）。仍走同一宿主认证；
+开启仅注册测试路由，不放宽 CSP/认证/隔离。采样完成后关闭。
+
 ## 配对结果 schema
 
 ```json

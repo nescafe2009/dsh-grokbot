@@ -100,6 +100,9 @@ export function apply(ctx, config = {}) {
   const maxConcurrentJobs = Math.max(1, Math.min(8, Number(config.maxConcurrentJobs) || 2))
   const jobTimeoutMs = Math.max(30_000, Number(config.jobTimeoutMs) || 1_800_000)
   const rescanIntervalMs = Math.max(1_000, Number(config.rescanIntervalMs) || 5_000)
+  // 测试端点（__probe/*、__perf/direct）默认关闭：显式测试配置才启用——
+  // 生产实例不注册这些路由（404），不创建会话、不写计数器；仍走同一 origin/宿主认证层
+  const testEndpointsOn = config.testEndpoints === true || process.env.GROKBOT_TEST_ENDPOINTS === '1'
 
   const crewState = { path: '', crew: { routing: { default: '' }, bots: [] } }
   const botStates = new Map()
@@ -2267,7 +2270,7 @@ export function apply(ctx, config = {}) {
             queueDepth: pendingJobs.length,
             recentJobs,
             lastTarget: uiState.lastTarget,
-            config: { inboxRoot, stateDir, maxConcurrentJobs, jobTimeoutMs },
+            config: { inboxRoot, stateDir, maxConcurrentJobs, jobTimeoutMs, testEndpoints: testEndpointsOn },
           }); return
         }
         if (method === 'POST' && suffix === '/ui-state') {
@@ -2331,8 +2334,9 @@ export function apply(ctx, config = {}) {
         if (method === 'GET' && suffix === '/crew') {
           respond(res, 200, { crew: crewState.crew }); return
         }
-        // 效率配对：DSH 直连基线（裸 agents 会话，无插件工具/编排），冷启每次
-        if (method === 'POST' && suffix === '/__perf/direct') {
+        // 效率配对：DSH 直连基线（裸 agents 会话，无插件工具/编排），冷启每次。
+        // 测试端点：默认关闭（显式配置才注册），生产实例不可达
+        if (testEndpointsOn && method === 'POST' && suffix === '/__perf/direct') {
           const body = await readJsonBody(req)
           const text = String(body?.text || '').trim()
           if (!text) throw new HttpError(400, 'text 不能为空')
@@ -2375,12 +2379,13 @@ export function apply(ctx, config = {}) {
             }
           }
         }
-        // 预览 POST 边界测试端点（R2-B）：无害副作用（计数器），验证沙箱产物被阻止调用
-        if (method === 'POST' && suffix === '/__probe/echo') {
+        // 预览 POST 边界测试端点（R2-B）：无害副作用（内存计数器，重启即清），
+        // 默认关闭——显式测试配置才注册；用于验证沙箱产物无法借宿主授权产生副作用
+        if (testEndpointsOn && method === 'POST' && suffix === '/__probe/echo') {
           probeEchoCount += 1
           respond(res, 200, { ok: true, count: probeEchoCount }); return
         }
-        if (method === 'GET' && suffix === '/__probe/count') {
+        if (testEndpointsOn && method === 'GET' && suffix === '/__probe/count') {
           respond(res, 200, { count: probeEchoCount }); return
         }
         // 成果原件：GET 服务快照（?download=1 保存副本）；POST ?action=reveal 在本机打开源文件
