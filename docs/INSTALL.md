@@ -34,7 +34,7 @@
 ## 卸载与产物保留
 
 - 卸载：移除 profile 依赖与 bundles 条目（`dsh plugin --profile <name> remove dsh-grokbot`）——**不删除任何用户数据**
-- 用户数据/产物目录：`<宿主工作目录>/.dsh-grokbot/`（可经插件 config `stateDir` 覆盖）。含：
+- 用户数据/产物目录：**`$DSH_HOME/grokbot/`**（随包 `cordis.patch.yml` 以 `dshHomePath('grokbot')` 配置的默认；可经插件 config `stateDir` 覆盖）。含：
   - `crew.json`（成员与会话）、`bots/<id>/`（DM 转录、记忆、stats）
   - `tasks/`（任务与 run 历史）、`artifacts/<id>/`（成果快照 + meta，SHA256 校验）
   - `rooms/`（群转录）、`inbox/`（派发队列）、`memory/`、`skills/`
