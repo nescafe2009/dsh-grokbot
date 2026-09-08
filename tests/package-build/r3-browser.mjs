@@ -10,11 +10,12 @@
 // 用法：node tests/package-build/r3-browser.mjs <path-to-tgz>
 import { spawn, execFileSync } from 'node:child_process'
 import { mkdir, mkdtemp, writeFile, symlink, rm, readFile } from 'node:fs/promises'
-import { writeFileSync, readFileSync, existsSync } from 'node:fs'
+import { writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
+import { makeStageWindow, newRunId } from './stage-window.mjs'
 
 const TGZ = resolve(process.argv[2] ?? '')
 if (!TGZ.endsWith('.tgz')) { console.error('usage: r3-browser.mjs <path-to-tgz>'); process.exit(2) }
@@ -22,8 +23,11 @@ const DSH_BIN = '/Applications/DSH Desktop.app/Contents/Resources/app/node_modul
 const SHARED_MODULES = `${process.env.HOME}/.dsh/profiles/node_modules`
 const PORT = 8795
 const HERE = dirname(fileURLToPath(import.meta.url))
-const OUTDIR = resolve(HERE, '..', '..', 'dist', 'r3')
+// 每轮独立 run 目录：URL/done/截图隔离，防旧结果复用（runId+phase+tgzSha 身份绑定）
+const RUN_ID = newRunId()
+const OUTDIR = resolve(HERE, '..', '..', 'dist', 'r3', `run-${RUN_ID}`)
 await mkdir(OUTDIR, { recursive: true })
+const TGZ_SHA = createHash('sha256').update(readFileSync(resolve(TGZ))).digest('hex')
 
 const sanitize = (s) => String(s).replace(/token=[A-Za-z0-9_-]+/g, 'token=***')
 const fetchBounded = (url, opts = {}, ms = 8000) => fetch(url, { ...opts, signal: AbortSignal.timeout(ms) }).catch(() => ({ status: 0, headers: { get: () => null }, text: async () => '', json: async () => ({}) }))
@@ -82,21 +86,7 @@ const session = async (base, token) => {
   const cookie = r.headers?.get?.('set-cookie')?.split(';')[0] ?? null
   return cookie && r.status === 303 ? cookie : null
 }
-// 阶段窗口：写 URL 文件 → 等旗标（浏览器操作方写 done JSON）→ 读回结果并计步
-const stageWindow = async (label, base, token, checks) => {
-  const urlFile = join(OUTDIR, `stage-${label}.url`)
-  const doneFile = join(OUTDIR, `stage-${label}.done`)
-  writeFileSync(urlFile, `${base}/?token=${token}\n`)
-  writeFileSync(doneFile.replace(/\.done$/, '.result.json'), '')
-  console.log(`STAGE_${label.toUpperCase()}_READY url-file=${urlFile}（等待 ${doneFile}，超时 240s）`)
-  const deadline = Date.now() + 240_000
-  while (Date.now() < deadline && !existsSync(doneFile)) await new Promise((r) => setTimeout(r, 500))
-  if (!existsSync(doneFile)) { step(`browser(${label}): 浏览器阶段结果`, null, '旗标超时未出现'); return null }
-  let result = {}
-  try { result = JSON.parse(readFileSync(doneFile, 'utf8')) } catch { step(`browser(${label}): 结果文件解析`, false, 'JSON 非法'); return null }
-  for (const [key, ok, desc] of checks(result)) step(`browser(${label}): ${key}`, ok, desc ?? '')
-  return result
-}
+const stageWindow = makeStageWindow({ runDir: OUTDIR, runId: RUN_ID, tgzSha256: TGZ_SHA, step, timeoutMs: Number(process.env.R3_STAGE_TIMEOUT_MS) || 240_000 })
 
 try {
   R3HOME = await mkdtemp(join(tmpdir(), 'dsh-r3browser-'))
@@ -177,6 +167,8 @@ try {
   step('shared: 共享树运行期间零变动（find -newer）', diff === '', diff === '' ? '无任何新增/修改' : diff.split('\n').slice(0, 3).join('; '))
 } finally {
   await cleanup()
-  writeFileSync(join(OUTDIR, 'r3-browser-evidence.json'), JSON.stringify({ ...evidence, r3home: 'removed' }, null, 1))
-  console.log(JSON.stringify({ event: 'r3-browser-evidence', steps: evidence.steps.map((s) => `${s.state} ${s.name}`), exitCode: process.exitCode ?? 0 }))
+  // URL 文件含 token：run 结束清理，不留 token；done/截图/证据保留于本轮 run 目录
+  for (const f of ['stage-a.url', 'stage-b.url']) { try { rmSync(join(OUTDIR, f)) } catch { /* 已不存在 */ } }
+  writeFileSync(join(OUTDIR, 'r3-browser-evidence.json'), JSON.stringify({ ...evidence, runId: RUN_ID, tgzSha256: TGZ_SHA, r3home: 'removed' }, null, 1))
+  console.log(JSON.stringify({ event: 'r3-browser-evidence', runDir: OUTDIR, steps: evidence.steps.map((s) => `${s.state} ${s.name}`), exitCode: process.exitCode ?? 0 }))
 }
