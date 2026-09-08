@@ -28,7 +28,7 @@
     "docs"
   ],
   "scripts": {
-    "build": "set -e; TMP=$(mktemp -d \"${TMPDIR:-/tmp}/grokbot-lib.XXXXXX\"); trap 'rm -rf \"$TMP\"' EXIT; npx tsdown --config ./tsdown.config.ts --outDir \"$TMP\"; test -f \"$TMP/index.mjs\" && test -f \"$TMP/client.js\"; rm -rf lib.old; mv lib lib.old 2>/dev/null || true; mv \"$TMP\" lib; rm -rf lib.old; echo deployed",
+    "build": "set -e; TMP=$(mktemp -d \"${TMPDIR:-/tmp}/grokbot-lib.XXXXXX\"); trap 'rm -rf \"$TMP\"' EXIT; npx tsdown --config ./tsdown.config.ts --outDir \"$TMP\"; for f in index.mjs client.js; do if [ ! -f \"$TMP/$f\" ]; then echo \"BUILD OUTPUT MISSING: $f\"; exit 1; fi; done; rm -rf lib.old; mv lib lib.old 2>/dev/null || true; mv \"$TMP\" lib; rm -rf lib.old; echo deployed",
     "check": "node --check src/index.mjs && node --check src/crew.mjs && node --check src/inbox.mjs && node --test tests/*.test.mjs && node --experimental-strip-types --test tests/retry.test.ts tests/component-switch.test.ts && ./tests/build-component-test.sh && node --test tests/component-real.spec.mjs",
     "prepublishOnly": "npm run build && npm run check",
     "typecheck": "tsc --noEmit"
