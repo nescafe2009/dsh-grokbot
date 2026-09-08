@@ -877,7 +877,7 @@ export function GrokbotSidebarCrew(): ReactNode {
           <span className="gk-lbl">电脑</span>
           <span className="grokbot-sidebar__computer-status" aria-hidden />
         </button>
-        <button type="button" className="grokbot-iconbtn gk-foot-ico" aria-label={routines.length > 0 ? `例行任务（${routines.length} 个）` : '例行任务（暂无）'} title={routines.length > 0 ? `${routines.length} 个例行任务` : '例行任务（暂无）'} onClick={() => { const next = !routinesOpen; setRoutinesOpen(next); if (next && routineList === null) { api('/routines').then((r) => setRoutineList(r?.routines ?? [])).catch(() => setRoutineList([])) } }}>
+        <button type="button" className="grokbot-iconbtn gk-foot-ico" aria-label={routines.length > 0 ? `例行任务（${routines.length} 个）` : '例行任务（暂无）'} title={routines.length > 0 ? `${routines.length} 个例行任务` : '例行任务（暂无）'} onClick={() => { const next = !routinesOpen; setRoutinesOpen(next); if (next) { setRoutineList(null); api('/routines').then((r) => setRoutineList(r?.routines ?? [])).catch(() => setRoutineList([])) } }}>
           <span className="gk-ico" aria-hidden>⏱</span>
         </button>
       </div>
