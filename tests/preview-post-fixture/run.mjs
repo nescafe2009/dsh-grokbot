@@ -88,6 +88,22 @@ const countBefore = await getCount()
 
 console.log(JSON.stringify({ event: 'ready', base, previewUrl, artifactId: meta.id, countBefore, agentsCreateCalls }))
 
+// 有界收尾：浏览器 keep-alive 连接会卡住 server.close 回调——先 closeAllConnections，
+// 再给 2s 兜底强退；自有临时目录清理放 finally，任何路径都不遗留
+async function teardown(exitCode) {
+  try {
+    for (const d of disposers.reverse()) { try { await d() } catch {} }
+  } finally {
+    try { server.closeAllConnections?.() } catch { /* Node <18.2 无此 API */ }
+    await Promise.race([
+      new Promise((r) => server.close(() => r())),
+      new Promise((r) => setTimeout(r, 2000)),
+    ])
+    await rm(stateDir, { recursive: true, force: true }).catch(() => undefined)
+    process.exit(exitCode)
+  }
+}
+
 if (SERVE) {
   // 浏览器验证模式：等 SIGINT，退出时打印证据汇总
   let closing = false
@@ -96,10 +112,7 @@ if (SERVE) {
     closing = true
     const countAfter = await getCount().catch(() => -1)
     console.log(JSON.stringify({ event: 'evidence', countBefore, countAfter, counterChanged: countAfter !== countBefore, agentsCreateCalls, requests: requestLog }, null, 1))
-    for (const d of disposers.reverse()) { try { await d() } catch {} }
-    await new Promise((r) => server.close(r))
-    await rm(stateDir, { recursive: true, force: true }).catch(() => undefined)
-    process.exit(0)
+    await teardown(0)
   }
   process.on('SIGINT', () => void shutdown())
   process.on('SIGTERM', () => void shutdown())
@@ -113,10 +126,7 @@ if (SERVE) {
   const okSave = dl.status === 200 && /^attachment;/.test(disposition ?? '')
   const countAfter = await getCount()
   console.log(JSON.stringify({ event: 'selfcheck', okPreview, csp, okSave, disposition, countBefore, countAfter, agentsCreateCalls, requests: requestLog }, null, 1))
-  for (const d of disposers.reverse()) { try { await d() } catch {} }
-  await new Promise((r) => server.close(r))
-  await rm(stateDir, { recursive: true, force: true }).catch(() => undefined)
-  process.exit(okPreview && okSave ? 0 : 1)
+  await teardown(okPreview && okSave ? 0 : 1)
 }
 
 async function waitHealthy() {
@@ -144,7 +154,9 @@ function buildProbePage(b) {
 <html><head><meta charset="utf-8"><title>preview-post-probe</title></head>
 <body>
 <h1>PREVIEW_OK</h1>
-<iframe name="sink" id="sink" style="display:none"></iframe>
+<!-- 两个独立 sink：共享同一 iframe 时，第二次 submit 会取消第一次尚未派发的导航（无 token form 丢失） -->
+<iframe name="sinkNoToken" id="sinkNoToken" style="display:none"></iframe>
+<iframe name="sinkToken" id="sinkToken" style="display:none"></iframe>
 <ul id="results"></ul>
 <a id="save" href="#">保存副本</a>
 <script>
@@ -170,14 +182,15 @@ attempt('fetch-token-noCors', B + '/__probe/echo?token=' + T, { method: 'POST', 
 attempt('fetch-count-token', B + '/__probe/count?token=' + T, {})
 function formAttempt(name, withToken) {
   var f = document.createElement('form')
-  f.method = 'POST'; f.target = 'sink'
+  // 独立 sink：无 token / 带 token 各走自己的 iframe，第二次 submit 不再取消第一次
+  f.method = 'POST'; f.target = withToken ? 'sinkToken' : 'sinkNoToken'
   f.action = B + '/__probe/echo' + (withToken ? '?token=' + T : '')
   document.body.appendChild(f)
   f.submit()
   setTimeout(function () { mark(name, 'submitted') }, 60)
 }
 setTimeout(function () { formAttempt('form-noToken', false) }, 100)
-setTimeout(function () { formAttempt('form-token', true) }, 300)
+setTimeout(function () { formAttempt('form-token', true) }, 400)
 </script>
 </body></html>`.replace('ARTIFACT_ID', '__ARTIFACT_ID__')
 }
