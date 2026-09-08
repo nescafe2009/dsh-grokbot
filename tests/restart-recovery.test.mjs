@@ -87,9 +87,10 @@ async function startLifecycle(stateDir) {
 test('重启恢复：历史正确恢复、终态不重派不重复交付、在途按设计恢复、二次重启幂等', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'rr-'))
   const inboxRoot = join(stateDir, 'inbox')
+  const lifecycles = [] // finally 统一关闭：断言中途失败也不遗留 server
   try {
     // ===== 生命周期 A：真实 HTTP chat 产生 DM 历史 =====
-    const A = await startLifecycle(stateDir)
+    const A = await startLifecycle(stateDir); lifecycles.push(A)
     const stateA0 = await (await A.api('/state')).json()
     const botId = stateA0.bots[0].id
     assert.ok(botId, '默认 crew 至少一个 bot')
@@ -144,7 +145,7 @@ test('重启恢复：历史正确恢复、终态不重派不重复交付、在�
     const queueA = await readFile(join(inboxRoot, 'queue.jsonl'), 'utf8')
 
     // ===== 生命周期 B：同 stateDir 重启 =====
-    const B = await startLifecycle(stateDir)
+    const B = await startLifecycle(stateDir); lifecycles.push(B)
     assert.equal(B.agents.calls.create, 0, '重启后不盲重跑：零会话创建')
     assert.equal(B.agents.calls.followups, 0)
 
@@ -193,7 +194,7 @@ test('重启恢复：历史正确恢复、终态不重派不重复交付、在�
     await B.close()
 
     // ===== 生命周期 C：二次重启幂等 =====
-    const C = await startLifecycle(stateDir)
+    const C = await startLifecycle(stateDir); lifecycles.push(C)
     assert.equal(C.agents.calls.create, 0, '二次重启仍零重跑')
     assert.equal(await readFile(join(job.dir, 'status.json'), 'utf8'), claimedBytesB, 'claimed→failed 状态文件二次重启不再改写')
     assert.equal(await readFile(join(stateDir, 'tasks', `${task.id}.json`), 'utf8'), taskBytesB, '任务文件二次重启字节不变（interrupted 不再触碰）')
@@ -213,6 +214,7 @@ test('重启恢复：历史正确恢复、终态不重派不重复交付、在�
       },
     }))
   } finally {
+    for (const lc of lifecycles.splice(0)) await lc.close().catch(() => undefined)
     await rm(stateDir, { recursive: true, force: true }).catch(() => undefined)
   }
 })
