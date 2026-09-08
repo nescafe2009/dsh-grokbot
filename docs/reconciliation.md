@@ -48,7 +48,7 @@
 ## 五、真实模型验收所需非秘密配置/授权条件
 
 - **凭据注入由用户完成**：在隔离验收 profile 的 DSH 设置界面（或用户自管环境变量）配置 llm provider API key——密钥不经过开发/审核方，不落仓库/日志/issue。
-- **凭据按实际 provider**：以用户 `~/.dsh/settings.yaml` 实际配置的 provider 为准（密钥用户自管，具体服务/端点不在文档复述）；预检只查该 provider 是否就绪，由用户回报"就绪/未就绪"，不回显值——**不假定 `ZAI_API_KEY` 或任何特定环境变量**。
+- **凭据按实际 provider**：以用户 `~/.dsh/settings.yaml` 实际配置的 provider 为准（密钥用户自管，具体服务/端点不在文档复述）；预检只查该 provider 是否就绪，由用户回报"就绪/未就绪"，不回显值——**不假定任何特定 provider 的环境变量名**。
 - **采样范围授权**：仅 fixture 专用 bot（如 `冷启动N`/`暖采样`），**不采样用户 chief 会话**；每轮样本数与总时长明确（如冷 4 轮、暖 5 次，单轮超时上限沿用 jobTimeoutMs）。
 - **开关**：`config.testEndpoints: true` 显式开启（验收后关闭）；全程无 CSP/认证/隔离放宽。
 - **停止条件**：任一轮 status≠ok 即停（沿用 fixture 预检语义）；验收后卸载 fixture profile 并清理其 DSH_HOME。
