@@ -1,10 +1,13 @@
 #!/bin/bash
-# 构建独立效率采样 fixture（首次使用）
+# 构建独立效率采样 fixture（每批唯一目录，无秘密）
+# 用法：./setup.sh  → 输出 FIXTURE_DIR=... 供 sample.mjs 使用
 set -euo pipefail
 
 DSH_APP_MODULES="/Applications/DSH Desktop.app/Contents/Resources/app/node_modules"
-FIXTURE_HOME="/tmp/dsh-perf-fixture"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# 每批唯一目录（带时间戳+PID，防覆盖旧配置）
+RUN_ID="$(date +%Y%m%d%H%M%S)-$$"
+FIXTURE_HOME="/tmp/dsh-perf-fixture-${RUN_ID}"
 
 echo "[setup] creating ${FIXTURE_HOME}"
 mkdir -p "${FIXTURE_HOME}/sessions" "${FIXTURE_HOME}/workspace"
@@ -26,25 +29,16 @@ agent-default-model:
   model: glm-5.3
 EOF
 
-# profile package.json（bundles 引用）
-cat > "${FIXTURE_HOME}/profiles/web/package.json" <<'EOF'
-{
-  "name": "dsh-perf-fixture-profile",
-  "private": true,
-  "dependencies": {
-    "dsh-grokbot": "link:'"${PROJECT_DIR}"'"
-  },
-  "dsh": {
-    "profile": {
-      "bundles": [
-        "@deepseek-ai/dsh-base",
-        "@deepseek-ai/dsh-web-app",
-        "dsh-grokbot"
-      ]
-    }
-  }
-}
-EOF
+# package.json：用 node 生成合法 JSON（避免 shell 引号 heredoc 问题）
+node -e "
+const pkg = {
+  name: 'dsh-perf-fixture-profile',
+  private: true,
+  dependencies: { 'dsh-grokbot': 'link:' + process.argv[1] },
+  dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'dsh-grokbot'] } }
+};
+require('fs').writeFileSync(process.argv[2], JSON.stringify(pkg, null, 2) + '\n');
+" "${PROJECT_DIR}" "${FIXTURE_HOME}/profiles/web/package.json"
 
 # cordis.yml（空 include——bundles 由 package.json 加载）
 echo "[]" > "${FIXTURE_HOME}/profiles/web/cordis.yml"
@@ -61,14 +55,12 @@ cat > "${FIXTURE_HOME}/profiles/web/cordis.patch.yml" <<'EOF'
   disabled: false
 EOF
 
-# node_modules：DSH Desktop.app 的 @deepseek-ai 包（只读 link）
+# node_modules：DSH Desktop.app 的包（只读 link）
 for pkg in "${DSH_APP_MODULES}/@deepseek-ai"/*/; do
   name=$(basename "$pkg")
   [[ "$name" == .* ]] && continue
   ln -sfn "$pkg" "${FIXTURE_HOME}/profiles/web/node_modules/@deepseek-ai/$name"
 done
-
-# 非 @deepseek-ai scope 的包
 for dir in "${DSH_APP_MODULES}/"@"*"*/; do
   scope=$(basename "$dir")
   [[ "$scope" == "@deepseek-ai" || "$scope" == .* ]] && continue
@@ -79,16 +71,27 @@ for dir in "${DSH_APP_MODULES}/"@"*"*/; do
     ln -sfn "$pkg" "${FIXTURE_HOME}/profiles/web/node_modules/$scope/$name"
   done
 done
-
-# 非 scope 的包
 for pkg in "${DSH_APP_MODULES}"/*/; do
   name=$(basename "$pkg")
   [[ "$name" == @* || "$name" == .* ]] && continue
   ln -sfn "$pkg" "${FIXTURE_HOME}/profiles/web/node_modules/$name"
 done
 
-# dsh-grokbot link（fixture 专用，不影响用户安装）
+# dsh-grokbot link（fixture 专用，指向待测项目目录）
 ln -sfn "${PROJECT_DIR}" "${FIXTURE_HOME}/profiles/web/node_modules/dsh-grokbot"
 
-echo "[setup] fixture ready at ${FIXTURE_HOME}"
-echo "[setup] required env: ZAI_API_KEY (export before running sample.mjs)"
+# 所有权标记（cleanup 仅删有此标记的目录）
+echo "${RUN_ID}" > "${FIXTURE_HOME}/.dsh-perf-fixture-owner"
+
+# 验证生成的 package.json 是合法 JSON
+node -e "
+const pkg = JSON.parse(require('fs').readFileSync('${FIXTURE_HOME}/profiles/web/package.json', 'utf8'));
+if (!pkg.dependencies['dsh-grokbot'] || !pkg.dsh.profile.bundles.includes('dsh-grokbot')) {
+  console.error('[setup] VERIFY FAIL: package.json missing grokbot');
+  process.exit(1);
+}
+console.log('[setup] package.json OK:', pkg.dependencies['dsh-grokbot'].slice(0, 40) + '...');
+"
+
+echo "[setup] fixture ready: ${FIXTURE_HOME}"
+echo "FIXTURE_DIR=${FIXTURE_HOME}"
