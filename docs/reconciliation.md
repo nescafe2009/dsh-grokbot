@@ -10,7 +10,7 @@
 - **当前状态盘点（只读，仅计数与文件 hash，未读正文）**：
   - 实际 stateDir：`~/Library/Application Support/dsh-desktop/harness/grokbot`（桌面宿主 userData/harness 下的 `dshHomePath('grokbot')`，与随包 cordis.patch 一致）
   - 计数：tasks 24 · artifacts 35 · 群 transcript 22 · bots 50 · DM transcripts 38 · inbox job 目录 180 · workspace 文件 118 · crew.json sha256 前 16 位 `52e5438c567fdd4b`
-- **单消费者**：成立——单一宿主实例（用户 DSH Desktop），无第二消费者路径。
+- **单消费者**：成立（带时间范围的只读检查）：2026-09-08 12:41:57+0800 探查——DSH Desktop 主进程恰 1 个；grokbot bundle 引用仅 `~/.dsh/profiles/web/package.json`（headless profile 无）；state 目录 mtime 活动范围 2026-09-08（当日 12:05 仍有写入）。其他潜在消费路径未逐一枚举——**未知项标未知**（未做全盘扫描，不动真实服务）。
 - **Mac workspace**：成立——执行工具（bash/fs）经 cordis.patch 启用于宿主环境（Mac 本机，workspace-write + 审批）；共享 workspace 在 stateDir/workspace（上列 118 文件）。
 - **VM 非必需**：成立——`ensureComputerServices` 无 computer 配置即返回（本机未配置 enabled）；隧道/镜像路径默认不触发；R3 全部验收（含浏览器前后对照）均未使用 VM。
 
@@ -18,7 +18,7 @@
 
 | 项 | 值 |
 |---|---|
-| 产品面最后源码提交 | `e67f453`（此后 3 个提交均为测试设施，`git diff e67f453..HEAD -- src lib` = 0 行） |
+| 已测包构建基准 | `e67f453`（**已测 tgz 的构建基准**，非『src 最后提交』断言；对账时点其上 src/lib 差异为 0 行。效率证据批起 src 已有新改动，产品包需重建重测后方可更新本行） |
 | 当前 HEAD | `32994de`（测试提交，**不冒称重建产品包**——已测 tgz 仍以 e67f453 为准） |
 | 已测 tgz | `dsh-grokbot-0.3.2.tgz` · 61 文件 · SHA256 `72f54a3fe1bcad58ee44e0069f7a6c72d1f6f25378cb689bccc8e8def1c210b2` · `builtFromSource @e67f453` |
 | 宿主版本 | DSH Desktop 0.7.2 · `@deepseek-ai/dsh-base`/`dsh-web-app` 0.1.2-alpha.1（实测） |
@@ -48,7 +48,7 @@
 ## 五、真实模型验收所需非秘密配置/授权条件
 
 - **凭据注入由用户完成**：在隔离验收 profile 的 DSH 设置界面（或用户自管环境变量）配置 llm provider API key——密钥不经过开发/审核方，不落仓库/日志/issue。
-- **预检只查存在性**：`ZAI_API_KEY`（或对应 provider）是否设置，由用户执行并回报"已设置/未设置"，不回显值。
+- **凭据按实际 provider**：以用户 `~/.dsh/settings.yaml` 实际配置的 provider 为准（密钥用户自管，具体服务/端点不在文档复述）；预检只查该 provider 是否就绪，由用户回报"就绪/未就绪"，不回显值——**不假定 `ZAI_API_KEY` 或任何特定环境变量**。
 - **采样范围授权**：仅 fixture 专用 bot（如 `冷启动N`/`暖采样`），**不采样用户 chief 会话**；每轮样本数与总时长明确（如冷 4 轮、暖 5 次，单轮超时上限沿用 jobTimeoutMs）。
 - **开关**：`config.testEndpoints: true` 显式开启（验收后关闭）；全程无 CSP/认证/隔离放宽。
 - **停止条件**：任一轮 status≠ok 即停（沿用 fixture 预检语义）；验收后卸载 fixture profile 并清理其 DSH_HOME。

@@ -94,6 +94,21 @@ export function activityOf(events, firstSeq) {
   return calls
 }
 
+/**
+ * 工具结果文本（tool/result 事件的 message.content 文本块，截断）。
+ * 效率配对的"执行目标证据"以此为准：真实工具输出 ≠ 口头复述/回复字节数。
+ */
+export function toolResultTexts(events, firstSeq, maxChars = 200) {
+  const texts = []
+  for (const event of events) {
+    if (event.seq < firstSeq) continue
+    if (event.type !== 'tool/result') continue
+    const joined = contentText(event.data?.message?.content)
+    if (joined) texts.push(joined.slice(0, maxChars))
+  }
+  return texts
+}
+
 export function apply(ctx, config = {}) {
   const stateDir = resolve(String(config.stateDir || join(process.cwd(), '.dsh-grokbot')))
   const inboxRoot = resolve(String(config.inboxDir || join(stateDir, 'inbox')))
@@ -1455,6 +1470,7 @@ export function apply(ctx, config = {}) {
         outcome = {
           ...summarizeTurn(session.handle.agent.session.events, firstSeq),
           activity: activityOf(session.handle.agent.session.events, firstSeq),
+          toolResults: toolResultTexts(session.handle.agent.session.events, firstSeq),
         }
         const turnText = outcome.text?.trim()
         failed = Boolean(outcome.error) || !turnText
@@ -2359,16 +2375,18 @@ export function apply(ctx, config = {}) {
             handle.agent.followup(userMessage(text))
             await handle.agent.whenIdle()
             const ms = Date.now() - t0
-            // 事件解析：真实工具次数 + 回复 + 错误（不用常量 0）
+            // 事件解析：真实工具次数 + 工具结果文本 + 回复 + 错误（不用常量 0）
             const events = handle.agent.session.events
             const turn = summarizeTurn(events, firstSeq)
             const activity = activityOf(events, firstSeq)
+            const toolResults = toolResultTexts(events, firstSeq)
             const toolCalls = (activity ?? []).length
             const reply = turn?.text?.trim() ?? ''
             const turnError = turn?.error ?? null
             const status = turnError ? 'failed' : (reply ? 'ok' : 'empty')
             logPerf({ kind: 'dsh-direct', conversationId: '__perf__', ms, toolCalls, status, replyBytes: reply.length, model: sel ? `${sel.provider}/${sel.model}` : null, error: turnError })
-            respond(res, 200, { ms, sessionId, status, toolCalls, replyBytes: reply.length, error: turnError }); return
+            // activity/toolResults：执行证据（工具名 + 实际输出）——与插件侧同标准
+            respond(res, 200, { ms, sessionId, status, toolCalls, activity, toolResults, replyBytes: reply.length, error: turnError }); return
           } catch (error) {
             logPerf({ kind: 'dsh-direct-error', ms: Date.now() - t0, error: safeError(error) })
             throw new HttpError(500, safeError(error))

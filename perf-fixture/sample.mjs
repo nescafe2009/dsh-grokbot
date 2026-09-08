@@ -2,6 +2,7 @@
 // 用法：FIXTURE_DIR=<dir> ZAI_API_KEY=<key> [TESTED_SHA=<sha>] node sample.mjs
 // 退出：统一 finally；任何 incomplete/failed → exit 1
 import { spawn, execSync } from 'node:child_process'
+import { bashToolEvidence, targetEvidence } from './evidence.mjs'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { realpathSync } from 'node:fs'
@@ -133,13 +134,9 @@ function normalizeSample(raw) {
 }
 
 // 插件工具证据：从 outcome.activity 检查（不在顶层 activity）
+// 插件工具证据：显式检验 outcome.activity 真实 shell 工具标识（共享标准；read_file-only/纯 toolCalls 不算）
 function hasPluginToolEvidence(sample) {
-  const outcome = sample.outcome ?? {}
-  const activity = outcome.activity ?? outcome.perf?.toolCalls !== undefined ? (outcome.perf?.toolCalls > 0 ? ['bash'] : []) : []
-  if (Array.isArray(activity) && activity.length > 0) return true
-  // 也检查顶层 activity（直连响应形状）
-  if (Array.isArray(sample.activity)) return sample.activity.some(a => typeof a === 'string' && (a.includes('bash') || a.includes('exec')))
-  return false
+  return bashToolEvidence(sample?.outcome ?? sample)
 }
 
 // 直连工具证据：toolCalls > 0（在顶层）
@@ -218,10 +215,10 @@ async function main() {
     for (const side of order) {
       if (side === 'direct') {
         const d = await api('/__perf/direct', { text: TOOL })
-        // 工具证据：toolCalls > 0
-        const hasTools = (d.toolCalls ?? 0) > 0
-        // 直连工具：还需验证目标结果（bash echo 输出包含 COLD-TOOL）
-        const directTarget = (d.replyBytes ?? 0) > 0 // 至少有回复
+        // 工具证据：真实 shell 工具标识（toolCalls 计数本身不构成 bash 证据）
+        const hasTools = bashToolEvidence(d)
+        // 直连执行目标证据：实际工具结果包含 COLD-TOOL（口头复述/字节数不算）
+        const directTarget = targetEvidence(d, 'COLD-TOOL')
         const s = normalizeSample({ ...d, round: i, pair: 'cold-tool', side: 'direct', order: order.indexOf('direct')+1,
           status: d.status === 'ok' && hasTools && directTarget ? 'ok' : (d.status === 'ok' ? 'failed' : d.status),
           toolEvidence: hasTools, targetMatch: directTarget })
@@ -230,10 +227,11 @@ async function main() {
       } else {
         const bid = await mkBot(`工具${i}`)
         const p = await api(`/conversations/${bid}/chat`, { text: TOOL })
-        // 插件工具证据：从 outcome.activity/perf 检查（不在顶层）
+        // 插件工具证据：outcome.activity 真实 shell 标识
         const hasTools = hasPluginToolEvidence(p)
         const replyText = (p.reply || '').trim()
-        const targetMatch = replyText.includes('COLD-TOOL')
+        // 插件执行目标证据：与直连同标准——outcome.toolResults 实际结果包含 COLD-TOOL（口头复述不算）
+        const targetMatch = targetEvidence(p.outcome, 'COLD-TOOL')
         const outcome = p.outcome ?? {}
         const s = normalizeSample({ round: i, pair: 'cold-tool', side: 'plugin', order: order.indexOf('plugin')+1, botId: bid,
           ms: p.ms, http: p.http, reply: replyText || undefined,
