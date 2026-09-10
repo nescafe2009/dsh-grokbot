@@ -104,3 +104,14 @@ test('状态文件在完成后可读回', async () => {
     await stat(join(job.dir, 'reply.md'))
   })
 })
+
+test('failed job preserves partial output without being retried as a fresh queued job',async()=>{
+ await withInbox(async root=>{
+  const job=await enqueueJob(root,{toBot:'chief',text:'work'});await claimJob(job,'chief')
+  await failJob(job,'chief','deadline','partial implementation')
+  const status=JSON.parse(await readFile(join(job.dir,'status.json'),'utf8'))
+  assert.equal(status.status,'failed');assert.ok(status.startedAt)
+  const reply=await readFile(join(job.dir,'reply.md'),'utf8');assert.match(reply,/任务失败/);assert.match(reply,/partial implementation/)
+  assert.deepEqual(await scanInbox(root),[])
+ })
+})

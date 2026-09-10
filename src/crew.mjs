@@ -4,6 +4,20 @@ import { randomUUID } from 'node:crypto'
 
 const SAFE_ID_RE = /^[A-Za-z0-9._-]+$/
 
+export function normalizeModelPresets(value) {
+  if (!Array.isArray(value) || value.length > 30) throw new Error('常用模型必须为最多30项的列表')
+  const seen = new Set()
+  return value.map(item => {
+    const provider = String(item?.provider || '').trim(), model = String(item?.model || '').trim()
+    const name = String(item?.name || model).trim()
+    if (!provider || !model || provider.length > 200 || model.length > 200 || !name || name.length > 80) throw new Error('请填写有效的模型名称、服务商与模型 ID')
+    const key = JSON.stringify([provider, model])
+    if (seen.has(key)) throw new Error('相同服务商和模型不能重复添加')
+    seen.add(key)
+    return {name, provider, model}
+  })
+}
+
 export const DEFAULT_CREW = {
   routing: { default: 'chief' },
   bots: [
@@ -119,6 +133,7 @@ export function parseCrew(text) {
     bots: normalized,
     conversations,
     routines,
+    modelPresets: normalizeModelPresets(raw?.modelPresets ?? []),
     defaultModel: normModel(raw?.defaultModel),
     utilityModel: normModel(raw?.utilityModel),
   }
@@ -127,6 +142,7 @@ export function parseCrew(text) {
 export function serializeCrew(crew) {
   return `${JSON.stringify({
     routing: crew.routing,
+    modelPresets: crew.modelPresets || [],
     defaultModel: crew.defaultModel || null,
     utilityModel: crew.utilityModel || null,
     bots: crew.bots.map((bot) => ({ ...bot, model: bot.model || null })),

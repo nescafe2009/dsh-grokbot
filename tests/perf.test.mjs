@@ -89,13 +89,10 @@ test('结构：catchError 在 try/catch/finally 共同作用域声明（let catc
   assert.ok(idx > 0, '声明存在于构建产物')
 })
 
-test('结构：取消分支 outcome 赋值（finally 补 perf 可透传到返回值）', () => {
-  // 取消 return 前必须 outcome = {...}（不是直接 return 新对象）
-  const cancelIdx = libSrc.indexOf('cancelled = true')
-  assert.ok(cancelIdx > 0)
-  // 检查 cancelIdx 之后 200 字符内是否有 outcome = {
-  const nearby = libSrc.slice(cancelIdx, cancelIdx + 500)
-  assert.ok(nearby.includes('outcome = {') || nearby.includes('outcome =\\n'), '取消分支赋值 outcome（finally 统一补 perf 后返回——否则 perf 无法透传）')
+test('结构：取消异常分支先赋值 outcome，保留 finally 的计量结果', () => {
+  const source = readFileSync(new URL('../src/index.mjs', import.meta.url), 'utf8')
+  const branch = source.slice(source.indexOf('const cancelIntentErr'))
+  assert.match(branch, /if \(cancelIntentErr\) \{[\s\S]*?outcome = \{[\s\S]*?return outcome/)
 })
 
 test('结构：finally 统一 perf（closeActiveRun 后、同一 endTs、cancelled 优先）', () => {

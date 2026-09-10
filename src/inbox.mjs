@@ -42,7 +42,7 @@ async function exists(path) {
   }
 }
 
-export async function scanInbox(inboxRoot, { limit = 50 } = {}) {
+export async function scanInbox(inboxRoot, { limit = 50, include = async () => true } = {}) {
   const queueText = await readTextIfPresent(join(inboxRoot, 'queue.jsonl'))
   const jobs = []
   for (const line of queueText.split('\n')) {
@@ -66,7 +66,9 @@ export async function scanInbox(inboxRoot, { limit = 50 } = {}) {
     if (await exists(join(dir, 'reply.md'))) continue
     const promptMd = await readTextIfPresent(join(dir, 'prompt.md'))
     const jobJson = await readJsonIfPresent(join(dir, 'job.json'))
-    jobs.push({
+    const job = {
+      projectEpoch:entry.projectEpoch??jobJson?.projectEpoch??0,
+      projectStep:entry.projectStep??jobJson?.projectStep??null,
       jobId,
       dir,
       toBot: String(entry.toBot || jobJson?.toBot || '').trim(),
@@ -77,7 +79,9 @@ export async function scanInbox(inboxRoot, { limit = 50 } = {}) {
       ...(entry.conversationId || jobJson?.conversationId ? { conversationId: String(entry.conversationId || jobJson.conversationId) } : {}),
       ...(entry.taskId || jobJson?.taskId ? { taskId: String(entry.taskId || jobJson.taskId) } : {}),
       ...(entry.handoff || jobJson?.handoff ? { handoff: entry.handoff || jobJson.handoff } : {}),
-    })
+    }
+    if(!await include(job))continue
+    jobs.push(job)
     if (jobs.length >= limit) break
   }
   return jobs
@@ -115,9 +119,9 @@ export async function completeJob(job, botId, replyText) {
   })
 }
 
-export async function failJob(job, botId, errorText) {
+export async function failJob(job, botId, errorText, partialText = '') {
   const replyPath = join(job.dir, 'reply.md')
-  await atomicWriteFile(replyPath, `[任务失败] ${errorText}\n`)
+  await atomicWriteFile(replyPath, `[任务失败] ${errorText}\n${partialText ? `\n〔以下为未完成的部分结果，供恢复任务参考〕\n${partialText.trim()}\n` : ''}`)
   const claimed = await readStatusIfPresent(job.dir)
   await writeStatus(job.dir, {
     status: 'failed',
@@ -151,11 +155,13 @@ export async function atomicWriteFile(path, text) {
   await rename(tmp, path)
 }
 
-export async function enqueueJob(inboxRoot, { jobId, toBot, text, images = [], fromBotId, conversationId, handoff = null, taskId = null }) {
+export async function enqueueJob(inboxRoot, { jobId, toBot, text, images = [], fromBotId, conversationId, projectEpoch = 0, projectStep = null, handoff = null, taskId = null, retryOf = null, retryReason = null }) {
   const id = String(jobId || `job_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`)
   const dir = join(inboxRoot, id)
   await mkdir(dir, { recursive: true })
   const payload = {
+    projectEpoch,projectStep,
+    ...(retryOf ? {retryOf,retryReason} : {}),
     jobId: id, id, text, dir, toBot: String(toBot || ''), images, createdAt: Date.now(),
     ...(fromBotId ? { fromBotId: String(fromBotId) } : {}),
     ...(conversationId ? { conversationId: String(conversationId) } : {}),

@@ -4,3 +4,5 @@ node_modules/
 design-ref/
 tests/ctb-path.mjs
 dist/
+
+tests/*-fixture/harness.page.js

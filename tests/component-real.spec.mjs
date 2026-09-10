@@ -4,6 +4,8 @@ import { Window } from '/tmp/react-test-env/node_modules/happy-dom/lib/index.js'
 const win = new Window()
 globalThis.document = win.document
 globalThis.window = win
+globalThis.requestAnimationFrame = win.requestAnimationFrame.bind(win)
+globalThis.cancelAnimationFrame = win.cancelAnimationFrame.bind(win)
 Object.defineProperty(globalThis, 'navigator', { value: win.navigator, writable: true, configurable: true })
 globalThis.HTMLElement = win.HTMLElement
 globalThis.HTMLTextAreaElement = win.HTMLTextAreaElement
@@ -16,7 +18,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 // 导入真实组件（构建产物 ESM + react symlink）
-const { BotChatView, GroupChatView } = await import(await import('./ctb-path.mjs').then(m => m.CTB_DIR + '/test-entry.mjs'))
+const { BotChatView, GroupChatView, ApprovalView } = await import(await import('./ctb-path.mjs').then(m => m.CTB_DIR + '/test-entry.mjs'))
 const React = await import('/tmp/react-test-env/node_modules/react/index.js')
 const { createRoot } = await import('/tmp/react-test-env/node_modules/react-dom/client.js')
 const { act } = await import('/tmp/react-test-env/node_modules/react-dom/test-utils.js')
@@ -31,6 +33,7 @@ function setupMockFetch() {
   deferredQueue = []
   globalThis.fetch = (url, opts) => {
     const call = { url, method: opts?.method ?? 'GET', body: opts?.body }
+    if (String(url).match(/\/bots\/[^/]+\/work(?:\?|$)/)) return Promise.resolve({ok:true,status:200,json:async()=>({jobs:[],observedAt:Date.now()}),text:async()=>'{}'})
     fetchCalls.push(call)
     return new Promise((resolve, reject) => {
       deferredQueue.push({ call, resolve, reject })
@@ -165,7 +168,7 @@ test('真实组件 DM→DM：A 发送失败 → B 无错误/重试条', async ()
   await act(async () => { sendBtn.click() })
 
   // A 的请求失败
-  await act(async () => { rejectLatest() })
+  await act(async () => { rejectFor('/conversations/botA/chat','POST') })
 
   // 切 B
   await rerender(React.createElement(BotChatView, { bot: makeBot('botB'), state: null }), c)
@@ -200,7 +203,7 @@ test('真实组件 DM→DM→DM：切回 A 重试记录保留', async () => {
   })
   const btn = [...c.el.querySelectorAll('button')].find(b => b.textContent?.includes('↑'))
   await act(async () => { btn.click() })
-  await act(async () => { rejectLatest() })
+  await act(async () => { rejectFor('/conversations/botA/chat','POST') })
 
   // 切 B 再切回 A
   await rerender(React.createElement(BotChatView, { bot: makeBot('botB'), state: null }), c)
@@ -267,7 +270,7 @@ test('真实组件：重试按钮复用原 requestId', async () => {
   })
   const btn = [...c.el.querySelectorAll('button')].find(b => b.textContent?.includes('↑'))
   await act(async () => { btn.click() })
-  await act(async () => { rejectLatest() })
+  await act(async () => { rejectFor('/conversations/botA/chat','POST') })
 
   // 找到重试按钮并点击
   const retryBtn = [...c.el.querySelectorAll('button')].find(b => b.textContent?.includes('重试'))
@@ -1007,7 +1010,7 @@ test('卸载重挂：群任务引用（带 taskId）恢复，发送携带且不�
     const c1 = createContainer(); mounts.push(c1)
     await render(React.createElement(GroupChatView, { conversation: g, bots }), c1)
     await act(async () => {
-      const hi = deferredQueue.findIndex(d => d.call.url.includes('/umG3') && d.call.method === 'GET')
+      const hi = deferredQueue.findIndex(d => d.call.url.endsWith('/conversations/umG3') && d.call.method === 'GET')
       if (hi >= 0) deferredQueue.splice(hi, 1)[0].resolve({ ok: true, status: 200, json: async () => roomHist, text: async () => '{}' })
       await new Promise(r => setTimeout(r, 20))
     })
@@ -1020,7 +1023,7 @@ test('卸载重挂：群任务引用（带 taskId）恢复，发送携带且不�
     // 卸载后群轮询 GET（旧实例）陆续返回：alive 守卫已防 setState，不影响
     await act(async () => {
       for (;;) {
-        const hi = deferredQueue.findIndex(d => d.call.url.includes('/umG3') && d.call.method === 'GET')
+        const hi = deferredQueue.findIndex(d => d.call.url.endsWith('/conversations/umG3') && d.call.method === 'GET')
         if (hi < 0) break
         deferredQueue.splice(hi, 1)[0].resolve({ ok: true, status: 200, json: async () => roomHist, text: async () => '{}' })
       }
@@ -1039,4 +1042,286 @@ test('卸载重挂：群任务引用（带 taskId）恢复，发送携带且不�
     for (const c of mounts.splice(0)) { try { await act(async () => c.root.unmount()) } catch {} c.el.remove() }
     teardownMockFetch()
   }
+})
+
+test('UI头像：旧emoji变体与角色资源一致，名字规范化稳定', async () => {
+  const { AvatarView, resolveGlyph, hashName } = await import(await import('./ctb-path.mjs').then(m => m.CTB_DIR + '/test-entry.mjs'))
+  assert.equal(resolveGlyph('🎖'), 'chief')
+  assert.equal(resolveGlyph('🎖️'), 'chief')
+  assert.equal(resolveGlyph('🛠'), 'coder')
+  assert.deepEqual(hashName('  café '), hashName('cafe\u0301'))
+  const el = document.createElement('div'); document.body.append(el)
+  const root = createRoot(el)
+  try {
+    await act(async () => root.render(React.createElement(AvatarView, { seed:'legacy', name:'幕僚长', glyph:'🎖', size:36 })))
+    assert.equal(el.querySelector('img').getAttribute('data-avatar-role'), 'chief')
+  } finally { await act(async () => root.unmount()); el.remove() }
+})
+
+test('例行任务：失败不伪装空态，刷新后显示真实任务', async () => {
+  const { RoutinesView } = await import(await import('./ctb-path.mjs').then(m => m.CTB_DIR + '/test-entry.mjs'))
+  const old = globalThis.fetch
+  let count = 0
+  globalThis.fetch = async () => ++count === 1
+    ? { ok:false, status:503, json:async()=>({error:'暂不可用'}) }
+    : { ok:true, json:async()=>({routines:[{id:'r1',botId:'b',prompt:'整理报告',schedule:{everyMinutes:30},enabled:true}]}) }
+  const el=document.createElement('div'); document.body.append(el); const root=createRoot(el)
+  try {
+    await act(async()=>{root.render(React.createElement(RoutinesView,{bots:[{id:'b',name:'分析师',avatar:'📊'}]})); await new Promise(r=>setTimeout(r,5))})
+    assert.match(el.textContent,/加载失败/)
+    assert.doesNotMatch(el.textContent,/还没有例行任务/)
+    await act(async()=>{el.querySelector('button').click();await new Promise(r=>setTimeout(r,5))})
+    assert.match(el.textContent,/整理报告/)
+    assert.match(el.textContent,/每 30 分钟/)
+    assert.equal(el.querySelector('img').getAttribute('data-avatar-role'),'analyst')
+  } finally {await act(async()=>root.unmount());el.remove();globalThis.fetch=old}
+})
+
+
+test('团队默认模型设置：读取已保存值、保存及错误可见', async () => {
+  const { ModelSettingsView } = await import(await import('./ctb-path.mjs').then(m => m.CTB_DIR + '/test-entry.mjs'))
+  const original=globalThis.fetch;let payload=null;let fail=false
+  globalThis.fetch=async(url,opts={})=>{
+    if(opts.method==='PATCH') {payload=JSON.parse(opts.body);return {ok:!fail,status:fail?503:200,json:async()=>fail?{error:'保存失败'}:{crew:{defaultModel:payload.defaultModel}}}}
+    return {ok:true,json:async()=>String(url).endsWith('/model-catalog')?{catalog:[{id:'zai',name:'Z.ai',models:[{id:'glm-5.3-flash',name:'GLM-5.3-Flash'}]}]}:{crew:{defaultModel:{provider:'zai',model:'glm-5.3-flash'}}}}
+  }
+  const el=document.createElement('div');document.body.append(el);const root=createRoot(el)
+  try {
+    await act(async()=>{root.render(React.createElement(ModelSettingsView));await new Promise(r=>setTimeout(r,5))})
+    assert.equal(el.querySelector('[aria-label="团队默认模型选择"]').value,'glm-5.3-flash')
+    await act(async()=>{[...el.querySelectorAll('button')].find(b=>b.textContent==='保存默认模型').click();await new Promise(r=>setTimeout(r,5))})
+    assert.deepEqual(payload,{defaultModel:{provider:'zai',model:'glm-5.3-flash'}})
+    assert.match(el.textContent,/默认模型已保存/)
+    fail=true
+    await act(async()=>{[...el.querySelectorAll('button')].find(b=>b.textContent==='保存默认模型').click();await new Promise(r=>setTimeout(r,5))})
+    assert.match(el.textContent,/保存失败/)
+    assert.doesNotMatch(el.textContent,/默认模型已保存/)
+  } finally {await act(async()=>root.unmount());el.remove();globalThis.fetch=original}
+})
+
+test('chief collects other member approvals; member redirects; chief review cannot be approved manually',async()=>{
+ setupMockFetch();const c=createContainer()
+ const chief=makeBot('chief'),member=makeBot('approval-member')
+ const approval={id:'approval-test',botId:member.id,botName:'测试成员',toolName:'bash',stage:'user',reviewReason:'涉及系统修改',details:'echo test'}
+ const state={bots:[chief,member],approvals:[approval],conversations:[],jobs:[],inbox:[]}
+ try {
+ await render(React.createElement(BotChatView,{bot:chief,state}),c)
+ assert.match(c.el.textContent,/需要你审批.*测试成员/)
+ assert.ok([...c.el.querySelectorAll('button')].some(b=>b.textContent==='允许一次'))
+ await rerender(React.createElement(BotChatView,{bot:chief,state:{...state,approvals:[{...approval,stage:'chief'}]}}),c)
+ assert.match(c.el.textContent,/幕僚长正在代审/)
+ assert.ok(![...c.el.querySelectorAll('button')].some(b=>b.textContent==='允许一次'))
+ await rerender(React.createElement(BotChatView,{bot:member,state}),c)
+ assert.match(c.el.textContent,/查看幕僚长审批/)
+ assert.ok(![...c.el.querySelectorAll('button')].some(b=>b.textContent==='允许一次'))
+ }finally{c.root.unmount();c.el.remove();teardownMockFetch()}
+})
+
+test('project board switches groups without stale results, shows numbered tasks with dependency and approval',async()=>{
+ const {ProjectBoard}=await import(await import('./ctb-path.mjs').then(m=>m.CTB_DIR+'/test-entry.mjs'))
+ const c=createContainer(),pending=new Map();let approvals=0
+ const load=id=>new Promise(resolve=>pending.set(id,resolve))
+ const props={bots:[makeBot('chief','幕僚长'),makeBot('dev','开发者')],load,onApproval:()=>approvals++}
+ try{
+ await render(React.createElement(ProjectBoard,{...props,conversationId:'old'}),c)
+ await rerender(React.createElement(ProjectBoard,{...props,conversationId:'new'}),c)
+ await act(async()=>pending.get('old')({conversationId:'old',rows:[{id:'secret',title:'OLD_PRIVATE',dependsOn:[]}]}))
+ assert.doesNotMatch(c.el.textContent,/OLD_PRIVATE/)
+ await act(async()=>pending.get('new')({conversationId:'new',updatedAt:1,hasPlan:true,rows:[{id:'a',title:'架构设计',botId:'chief',status:'done',dependsOn:[],artifacts:1,source:'plan'},{id:'b',title:'目录访问',botId:'dev',status:'approval',dependsOn:['a'],reason:'访问需确认',artifacts:0,source:'plan',progress:{observation:'awaiting-approval',elapsedMs:3600000,silenceMs:0,reviewNeeded:false},checkpoint:{completed:'帧编解码',files:['codec.cpp'],validation:'单测通过',remaining:'文件传输',blockers:'',verified:false}},{id:'old-failure',title:'OLD_RUN_HIDDEN',botId:'dev',status:'failed',dependsOn:[],artifacts:0,source:'job'}]}))
+ assert.match(c.el.textContent,/需要你审批/);assert.match(c.el.textContent,/前置：第 1 项/);assert.match(c.el.textContent,/成员交付与执行结束不自动计入/)
+ assert.match(c.el.textContent,/等待审批 · 已运行 60 分钟/);assert.match(c.el.textContent,/工作检查点（待核实）/);assert.match(c.el.textContent,/剩余：文件传输/)
+ assert.equal(c.el.querySelectorAll('.gk-board__tasks>li').length,2)
+ assert.deepEqual([...c.el.querySelectorAll('.gk-board__item h3')].map(n=>n.textContent),['1. 架构设计','2. 目录访问'])
+ await act(async()=>c.el.querySelector('[aria-label=收起任务列表]').click())
+ assert.equal(c.el.querySelector('li'),null)
+ await act(async()=>c.el.querySelector('[aria-label=展开任务列表]').click())
+ assert.equal(c.el.querySelector('svg'),null)
+ assert.doesNotMatch(c.el.textContent,/OLD_RUN_HIDDEN/)
+ await act(async()=>[...c.el.querySelectorAll('button')].find(b=>b.textContent.startsWith('查看其他执行记录')).click())
+ assert.match(c.el.textContent,/OLD_RUN_HIDDEN/)
+ assert.equal(c.el.querySelectorAll('.gk-board__tasks>li').length,3)
+ await act(async()=>[...c.el.querySelectorAll('button')].find(b=>b.textContent==='去幕僚长审批').click());assert.equal(approvals,1)
+ }finally{c.root.unmount();c.el.remove()}
+})
+
+test('execution card scrolls into view when runtime changes without a new message or final reply',async()=>{
+ setupMockFetch();const c=createContainer();const bot=makeBot('scroll-runtime','幕僚长')
+ try{
+ await render(React.createElement(BotChatView,{bot,state:null}),c)
+ const log=c.el.querySelector('.grokbot-log')
+ Object.defineProperty(log,'scrollHeight',{configurable:true,get:()=>log.querySelector('.gkf-task')?1500:1000})
+ log.scrollTop=1000
+ await rerender(React.createElement(BotChatView,{bot:{...bot,status:'working',currentJob:'pending-job'},state:null}),c)
+ assert.ok(log.querySelector('.gkf-task'));assert.equal(log.scrollTop,1500,'new runtime card triggers scroll before any reply')
+ log.scrollTop=900
+ await rerender(React.createElement(BotChatView,{bot:{...bot,status:'working',currentJob:'next-job'},state:null}),c)
+ assert.equal(log.scrollTop,1500,'runtime identity update triggers scroll too')
+ }finally{c.root.unmount();c.el.remove();teardownMockFetch()}
+})
+
+
+test('approval UX decodes nested JSON and only allows once even with stale grant props', async()=>{
+ const c=createContainer(),calls=[]
+ const args={file_path:'/workspace/PROFILE.md',old_string:'旧内容\n第二行',new_string:'新内容\n第二行',justification:'保存外网需求'}
+ const approval={id:'a',botId:'chief',botName:'幕僚长',toolName:'edit',stage:'user',details:JSON.stringify(JSON.stringify(args))}
+ await render(React.createElement(ApprovalView,{approval,allowFull:true,onDecision:async x=>calls.push(x),onFull:async()=>calls.push('full')}),c)
+ assert.equal(c.el.querySelectorAll('input').length,0)
+ assert.equal(c.el.querySelector('.gk-approval__reason').textContent,'保存外网需求')
+ assert.equal(c.el.querySelector('.gk-approval__change pre').textContent,'旧内容\n第二行')
+ assert.deepEqual(calls,[])
+ assert.equal(c.el.querySelector('.gk-approval__scope'),null)
+ await act(async()=>c.el.querySelector('button.primary').click())
+ assert.deepEqual(calls,['allowed-once'])
+ assert.equal(c.el.querySelector('footer'),null)
+ await act(async()=>c.root.unmount());c.el.remove()
+})
+test('approval failure stays actionable; once does not grant full; reviewing has no actions',async()=>{
+ const c=createContainer(),calls=[];let fail=true
+ const approval={id:'a',botId:'chief',toolName:'bash',stage:'user',details:JSON.stringify({command:'echo test'})}
+ const props={approval,allowFull:false,onDecision:async x=>{calls.push(x);if(fail)throw Error('连接失败')},onFull:async()=>calls.push('full')}
+ await render(React.createElement(ApprovalView,props),c)
+ await act(async()=>c.el.querySelector('button.primary').click())
+ assert.equal(c.el.querySelector('[role=alert]').textContent,'连接失败')
+ assert.equal(c.el.querySelector('button.primary').disabled,false)
+ fail=false;await act(async()=>c.el.querySelector('button.primary').click());assert.deepEqual(calls,['allowed-once','allowed-once'])
+ await render(React.createElement(ApprovalView,{...props,key:'reviewing',approval:{...approval,stage:'chief'}}),c)
+ assert.equal(c.el.querySelector('footer'),null)
+ await act(async()=>c.root.unmount());c.el.remove()
+})
+
+test('DM and group preserve historical scroll across updates and resume only at reader request',async()=>{
+ for(const group of [false,true]){
+ setupMockFetch();const c=createContainer(),bot=makeBot('reader'),room=makeConv('history-room',['reader'])
+ const view=(working=false)=>group?React.createElement(GroupChatView,{conversation:room,bots:[{...bot,status:working?'working':'idle',currentConversationId:room.id,currentJob:'job'}],state:null}):React.createElement(BotChatView,{bot:{...bot,status:working?'working':'idle',currentJob:'job'},state:null})
+ try{
+ await render(view(),c)
+ const log=c.el.querySelector('.grokbot-log');let height=1600
+ Object.defineProperty(log,'scrollHeight',{configurable:true,get:()=>height});Object.defineProperty(log,'clientHeight',{configurable:true,get:()=>600})
+ log.scrollTop=1000
+ await act(async()=>{log.dispatchEvent(new win.WheelEvent('wheel',{deltaY:-2}));log.scrollTop=998;log.dispatchEvent(new Event('scroll'))})
+ assert.ok(c.el.querySelector('.grokbot-jump-latest'),'small upward gesture near bottom must stop following')
+ await rerender(view(true),c)
+ assert.equal(log.scrollTop,998,'near-bottom upward gesture must survive runtime updates')
+ await act(async()=>{log.dispatchEvent(new win.WheelEvent('wheel',{deltaY:-100}));log.scrollTop=400;log.dispatchEvent(new Event('scroll'))})
+ assert.ok(c.el.querySelector('.grokbot-jump-latest'))
+ height=2000;await rerender(view(true),c)
+ assert.equal(log.scrollTop,400,'runtime update must preserve the historical position')
+ await act(async()=>{await new Promise(r=>requestAnimationFrame(r))})
+ assert.equal(log.scrollTop,400,'scheduled frame must also respect user pause')
+ await act(async()=>c.el.querySelector('.grokbot-jump-latest').click())
+ assert.equal(log.scrollTop,2000);assert.equal(c.el.querySelector('.grokbot-jump-latest'),null)
+ height=2400;await rerender(view(false),c);assert.equal(log.scrollTop,2400)
+ await act(async()=>{log.dispatchEvent(new win.WheelEvent('wheel',{deltaY:-300}));log.scrollTop=900;log.dispatchEvent(new Event('scroll'))})
+ await act(async()=>{log.dispatchEvent(new win.WheelEvent('wheel',{deltaY:300}));log.scrollTop=1800;log.dispatchEvent(new Event('scroll'))})
+ assert.equal(c.el.querySelector('.grokbot-jump-latest'),null,'manual return to bottom resumes following')
+ }finally{await act(async()=>c.root.unmount());c.el.remove();teardownMockFetch()}
+ }
+})
+
+test('project board exposes archive status and keeps unverified execution separate from acceptance',async()=>{
+ const {ProjectBoard}=await import(await import('./ctb-path.mjs').then(m=>m.CTB_DIR+'/test-entry.mjs'))
+ const c=createContainer()
+ try{
+  await render(React.createElement(ProjectBoard,{conversationId:'g',bots:[],load:async()=>({conversationId:'g',hasPlan:false,lifecycle:{status:'archived',revision:1,summary:'用户切换项目'},rows:[{id:'old',title:'成员回复',botId:'dev',status:'done',dependsOn:[],source:'job',artifacts:0}]}),mutate:async()=>{},onApproval:()=>{}}),c)
+  await act(async()=>{await new Promise(r=>setTimeout(r,5))})
+  assert.match(c.el.textContent,/已归档/)
+  assert.match(c.el.textContent,/0 项已验收/)
+  assert.match(c.el.textContent,/执行结束 · 待核实/)
+  assert.equal(c.el.querySelector('textarea,select,input'),null)
+  assert.equal([...c.el.querySelectorAll('button')].find(b=>b.textContent==='执行项目操作'),undefined)
+  assert.match(c.el.textContent,/直接告诉幕僚长/)
+ }finally{c.root.unmount();c.el.remove()}
+})
+
+test('review artifact links open local snapshots without allowing arbitrary relative or script URLs',async()=>{
+ const {MarkdownView}=await import(await import('./ctb-path.mjs').then(m=>m.CTB_DIR+'/test-entry.mjs'))
+ const c=createContainer()
+ try{
+  await render(React.createElement(MarkdownView,{text:'[设计稿](/api/plugins/grokbot/artifacts/abc-123) [拒绝](javascript:alert) [其他](/admin)'}),c)
+  const links=c.el.querySelectorAll('a')
+  assert.equal(links.length,1)
+  assert.equal(links[0].getAttribute('href'),'/api/plugins/grokbot/artifacts/abc-123')
+ }finally{c.root.unmount();c.el.remove()}
+})
+
+test('rework board explains current cycle and retest owner without exposing management forms',async()=>{
+ const {ProjectBoard}=await import(await import('./ctb-path.mjs').then(m=>m.CTB_DIR+'/test-entry.mjs'))
+ const c=createContainer()
+ try{
+  await render(React.createElement(ProjectBoard,{conversationId:'g',bots:[{id:'qa',name:'白泽'}],load:async()=>({conversationId:'g',hasPlan:true,rows:[{id:'core',title:'核心',botId:'dev',status:'awaiting_retest',source:'plan',dependsOn:[],rework:{cycle:2,reason:'碰撞错误',criteria:'回归通过',testerBotId:'qa'}}]}),onApproval:()=>{}}),c)
+  await act(async()=>{await new Promise(r=>setTimeout(r,5))})
+  assert.match(c.el.textContent,/待复测/);assert.match(c.el.textContent,/第 2 轮返工/);assert.match(c.el.textContent,/复测负责人：白泽/)
+  assert.equal(c.el.querySelector('textarea,select,input'),null)
+ }finally{c.root.unmount();c.el.remove()}
+})
+
+test('DM pending message survives stale history and remount', async () => {
+ setupMockFetch();const c=createContainer(),bot=makeBot('pending-history-regression')
+ try {
+  await render(React.createElement(BotChatView,{bot,state:null}),c)
+  await act(async()=>resolveFor('/conversations/'+bot.id,'GET',{messages:[{ts:1,role:'bot',text:'earlier'}]}))
+  await act(async()=>{const t=c.el.querySelector('textarea');Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(t,'keep my message');t.dispatchEvent(new Event('input',{bubbles:true}))})
+  await act(async()=>[...c.el.querySelectorAll('button')].find(b=>b.textContent.includes('↑')).click())
+  const requestId=JSON.parse(fetchCalls.find(f=>f.method==='POST'&&f.url.endsWith('/chat')).body).requestId
+  assert.ok(c.el.textContent.includes('keep my message'),'visible before executor status arrives')
+  await act(async()=>resolveFor('/'+bot.id+'/chat','POST',{reply:'received'}))
+  await act(async()=>resolveFor('/conversations/'+bot.id,'GET',{messages:[{ts:1,role:'bot',text:'earlier'}]}))
+  assert.ok(c.el.textContent.includes('keep my message'),'stale server snapshot must not erase optimistic user message')
+  await act(async()=>{const t=c.el.querySelector('textarea');Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(t,'second message');t.dispatchEvent(new Event('input',{bubbles:true}))})
+  await act(async()=>[...c.el.querySelectorAll('button')].find(b=>b.textContent.includes('↑')).click())
+  const secondId=JSON.parse(fetchCalls.filter(f=>f.method==='POST'&&f.url.endsWith('/chat')).at(-1).body).requestId
+  await act(async()=>resolveFor('/'+bot.id+'/chat','POST',{reply:'received again'}))
+  await act(async()=>resolveFor('/conversations/'+bot.id,'GET',{messages:[{ts:1,role:'bot',text:'earlier'},{ts:2,role:'user',text:'keep my message',requestId},{ts:3,role:'user',text:'second message',requestId:secondId}]}))
+  assert.equal([...c.el.querySelectorAll('.gkf-msg--user')].filter(n=>n.textContent.includes('keep my message')).length,1,'server request acknowledgement replaces optimistic message exactly once')
+  await act(async()=>c.root.unmount());c.el.remove()
+  const next=createContainer()
+  try {await render(React.createElement(BotChatView,{bot,state:null}),next);assert.equal(next.el.querySelectorAll('.gkf-msg--user').length,2,'acknowledged messages survive remount without duplicates')} finally {await act(async()=>next.root.unmount());next.el.remove()}
+  assert.ok(requestId)
+ } finally {try{await act(async()=>c.root.unmount())}catch{}c.el.remove();teardownMockFetch()}
+})
+
+test('DM history transport duplicates collapse by ID while same-text messages and user/bot roles remain distinct',async()=>{
+ setupMockFetch();const c=createContainer(),bot=makeBot('message-identity-render')
+ try{
+  await render(React.createElement(BotChatView,{bot,state:null}),c)
+  const user={ts:1,role:'user',text:'通过',requestId:'review-one',messageId:'chat-review-one-user'}
+  const reply={ts:2,role:'bot',text:'[成果入口](/api/plugins/grokbot/artifacts/example-one)',requestId:'review-one',messageId:'chat-review-one-bot'}
+  await act(async()=>resolveFor('/conversations/'+bot.id,'GET',{messages:[user,user,reply,reply,{...user,ts:3,requestId:'review-two',messageId:'chat-review-two-user'}]}))
+  assert.equal(c.el.querySelectorAll('.gkf-msg--user').length,2,'intentional same-text confirmation is retained')
+  assert.equal([...c.el.querySelectorAll('a')].filter(a=>a.textContent==='成果入口').length,1,'one persisted reply produces one link')
+ }finally{await act(async()=>c.root.unmount());c.el.remove();teardownMockFetch()}
+})
+
+test('model library assigns saved presets and preserves selection when save fails',async()=>{
+ const {ModelSettingsView}=await import(await import('./ctb-path.mjs').then(m=>m.CTB_DIR+'/test-entry.mjs'))
+ const original=globalThis.fetch;let fail=false;let selected=null;const preset={name:'快速模型',provider:'p',model:'custom/model'}
+ globalThis.fetch=async(url,opts={})=>{
+  if(opts.method==='PATCH'&&String(url).endsWith('/bots/chief')){const body=JSON.parse(opts.body);if(!fail)selected=body.model;return {ok:!fail,status:fail?503:200,json:async()=>fail?{error:'模型保存失败'}:{bot:{model:selected}}}}
+  return {ok:true,json:async()=>String(url).endsWith('/model-catalog')?{catalog:[]}:{crew:{modelPresets:[preset],bots:[{id:'chief',name:'幕僚长',avatar:'🎖️',model:null}]}}}
+ }
+ const el=document.createElement('div');document.body.append(el);const root=createRoot(el)
+ try{
+  await act(async()=>{root.render(React.createElement(ModelSettingsView));await new Promise(r=>setTimeout(r,10))})
+  const buttons=()=>[...el.querySelectorAll('button')];const botPreset=()=>buttons().filter(b=>b.textContent==='快速模型').at(-1)
+  await act(async()=>{botPreset().click();await new Promise(r=>setTimeout(r,5))})
+  assert.deepEqual(selected,{provider:'p',model:'custom/model'});assert.equal(botPreset().getAttribute('aria-pressed'),'true')
+  fail=true
+  await act(async()=>{buttons().find(b=>b.textContent==='跟随团队默认').click();await new Promise(r=>setTimeout(r,5))})
+  assert.match(el.textContent,/模型保存失败/);assert.equal(botPreset().getAttribute('aria-pressed'),'true')
+  fail=false
+  await act(async()=>{buttons().find(b=>b.textContent==='跟随团队默认').click();await new Promise(r=>setTimeout(r,5))})
+  assert.equal(selected,null)
+ }finally{await act(async()=>root.unmount());el.remove();globalThis.fetch=original}
+})
+
+test('ordinary Bot re-entry reconciles cached user message with late server reply',async()=>{
+ setupMockFetch();const c=createContainer(),a=makeBot('late-private-a'),b=makeBot('late-private-b')
+ try{
+  await render(React.createElement(BotChatView,{bot:a,state:null}),c)
+  await act(async()=>resolveFor('/conversations/'+a.id,'GET',{messages:[{ts:1,role:'user',text:'私聊问题',requestId:'late-r'}]}))
+  await rerender(React.createElement(BotChatView,{bot:b,state:null}),c)
+  await rerender(React.createElement(BotChatView,{bot:a,state:null}),c)
+  await act(async()=>resolveFor('/conversations/'+a.id,'GET',{messages:[{ts:1,role:'user',text:'私聊问题',requestId:'late-r'},{ts:2,role:'bot',text:'真实迟到回复',requestId:'late-r'}]}))
+  assert.match(c.el.textContent,/真实迟到回复/)
+ }finally{await act(async()=>c.root.unmount());c.el.remove();teardownMockFetch()}
 })

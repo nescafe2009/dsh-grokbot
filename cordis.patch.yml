@@ -16,5 +16,7 @@
       config:
         stateDir: !!js dshHomePath('grokbot')
         maxConcurrentJobs: 2
-        jobTimeoutMs: 600000
+        jobReviewAfterMs: 1800000
+        jobIdleWarningMs: 900000
+        jobHardTimeoutMs: 0
         rescanIntervalMs: 5000

@@ -23,10 +23,12 @@
 # 构建产物已提交，安装端无需 TS 工具链
 dsh plugin --profile web add <本目录>
 # 或从 GitHub
-dsh plugin --profile web add github:<owner>/dsh-grokbot
+dsh plugin --profile web add github:nescafe2009/dsh-grokbot
 ```
 
-重启 DSH 后首页出现「Agent 团队」区块。
+重启 DSH 后，从团队侧栏进入幕僚长、成员私聊或项目群聊。
+
+当前版本：**v0.5.0**。固定版本可从 [GitHub Releases](https://github.com/nescafe2009/dsh-grokbot/releases/tag/v0.5.0) 下载 `dsh-grokbot-0.5.0.tgz`，使用 `dsh plugin --profile web add /路径/dsh-grokbot-0.5.0.tgz` 安装。升级前请备份插件状态目录；升级不删除会话与项目文件。
 
 ## 配置
 
@@ -99,3 +101,20 @@ DSH_HOME=/tmp/dsh-smoke dsh --profile web --dump-config   # 树中应出现 grok
 ## License
 
 MIT
+
+
+### 审批与成员权限
+
+审批集中在幕僚长会话，侧栏显示待审批数量。卡片展示申请人、目标文件、申请原因，并可展开修改前后内容；原始工具参数默认折叠。
+
+- **允许一次**（默认）：仅放行本次工具操作。
+- **持久权限**：通过 DSH 宿主原生授权管理。插件不提供开启持久完全访问的入口。
+- **关闭历史完全访问**：如旧配置仍启用，可在对应 Bot 或成员权限页面关闭。
+
+### 项目与模型管理
+
+与幕僚长对话即可安排验收、返工、暂停、继续或归档。归档保留快照，不代表全部阶段已验收。各 Bot 的「工作进展」可查看真实派工、工具记录与交付。
+
+「团队默认模型」入口提供常用模型库和按成员快捷分配。选择后立即保存，下次对话或任务生效；未单独指定模型的成员跟随团队默认。服务商连接和凭据仍由 DSH 管理。
+
+生命周期与恢复机制详见 [设计说明](docs/LIFECYCLE-RELIABILITY.md)。

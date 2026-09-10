@@ -1,9 +1,15 @@
+import { ModelLibrary } from './model-library'
+import {BotWorkPanel} from './bot-work'
+import {uniqueMessages} from './message-identity'
+import {ApprovalView,APPROVAL_CSS} from './approval-view'
+import {ProjectBoard,BOARD_CSS} from './project-board'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { AvatarView, MarkdownView, splitChips, SidebarRow, MessageView, Composer, TaskCard } from './components'
+import { GroupAvatarView, AvatarView, MarkdownView, splitChips, SidebarRow, MessageView, Composer, TaskCard } from './components'
 import { GKF_CSS } from './tokens'
 import { getPendingRetry, setPendingRetry, clearPendingRetry, retryMatches, retryRiskLevel, allocateSeq } from './retry-store'
 import { saveDraft, loadDraft } from './draft-store'
+import { useChatScroll } from './chat-scroll'
 
 export const API_ROOT = '/api/plugins/grokbot'
 const POLL_MS = 2000
@@ -17,6 +23,9 @@ interface BotInfo {
   section: string
   hidden: boolean
   status: 'idle' | 'working'
+  accessMode?: 'full' | 'review'
+  currentWorkTitle?: string | null
+  currentConversationId?: string | null
   currentJob: string | null
   currentRunId?: string | null
   currentTaskId?: string | null
@@ -44,6 +53,7 @@ interface BotRating {
 }
 
 interface ConversationInfo {
+  lifecycle?:{status:string;revision:number}|null
   id: string
   name: string
   memberBotIds: string[]
@@ -62,6 +72,10 @@ interface RoutineInfo {
 }
 
 interface ApprovalInfo {
+  stage?: 'chief' | 'user'
+  botName?: string
+  reviewReason?: string
+  details?: string
   id: string
   botId: string
   toolName: string
@@ -70,6 +84,8 @@ interface ApprovalInfo {
 }
 
 interface RoomMessage {
+  messageId?: string
+  requestId?: string
   ts: number
   role: string
   botId?: string
@@ -95,9 +111,11 @@ interface ChatMessage {
   text: string
   at: number
   artifact?: ArtifactInfo | null
+  requestId?: string
 }
 
 interface GrokbotState {
+  accessControl?: {supported:boolean}
   lastTarget?: { kind: string; id: string } | null
   bots: BotInfo[]
   conversations: ConversationInfo[]
@@ -115,7 +133,7 @@ interface CatalogProvider {
   models: { id: string; name: string }[]
 }
 
-const GROKBOT_CSS = `
+const GROKBOT_CSS = BOARD_CSS + APPROVAL_CSS + `
 :root {
   --gk-bg-side: #f7f7f7;
   --gk-bg: #fcfcfc;
@@ -201,7 +219,7 @@ const GROKBOT_CSS = `
 .grokbot-form__submit:disabled { opacity:.5; box-shadow:none; }
 .grokbot-form__cancel { background:var(--gk-bg-soft); color:var(--gk-text); }
 .grokbot-form__cancel:hover { background:rgba(29,29,31,.10); }
-.grokbot-chat { width:100%; height:100%; display:flex; flex-direction:column; background:var(--gk-bg); }
+.grokbot-chat { width:100%; height:100%; min-height:0; overflow:hidden; display:flex; flex-direction:column; background:var(--gk-bg); }
 .grokbot-chat__head { display:flex; align-items:center; gap:11px; padding:13px 20px; border-bottom:1px solid var(--gk-line); background:rgba(255,255,255,.85); backdrop-filter:blur(12px); }
 .grokbot-chat__avatar { width:38px; height:38px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:18px; color:#fff; box-shadow:inset 0 -1px 2px rgba(0,0,0,.12), var(--gk-shadow-sm); }
 .grokbot-chat__title { flex:1; display:flex; flex-direction:column; min-width:0; cursor:pointer; }
@@ -211,8 +229,10 @@ const GROKBOT_CSS = `
 .grokbot-chat__stop:hover { background:rgba(239,68,68,.16); }
 .grokbot-chat__close { border:none; background:none; cursor:pointer; color:var(--gk-text-2); font-size:15px; width:30px; height:30px; display:inline-flex; align-items:center; justify-content:center; border-radius:9px; transition:all .14s; }
 .grokbot-chat__close:hover { color:var(--gk-text); background:rgba(29,29,31,.07); }
-.grokbot-body { flex:1; display:flex; min-height:0; }
-.grokbot-log { flex:1; overflow-y:auto; padding:26px 20px; display:flex; flex-direction:column; gap:13px; scrollbar-width:thin; }
+.grokbot-body { position:relative; flex:1; display:flex; min-height:0; }
+.grokbot-log { flex:1; min-width:0; min-height:0; overflow-y:auto; padding:26px 20px; display:flex; flex-direction:column; gap:13px; scrollbar-width:thin; }
+.grokbot-jump-latest { position:absolute; bottom:14px; left:50%; transform:translateX(-50%); z-index:3; border:1px solid var(--gk-line); border-radius:99px; padding:10px 16px; background:var(--gk-bg); color:var(--gk-text); box-shadow:0 3px 14px #0002; font:inherit; font-size:12px; cursor:pointer; }
+.grokbot-log > * { flex-shrink:0; }
 .grokbot-log::-webkit-scrollbar { width:5px; }
 .grokbot-log::-webkit-scrollbar-thumb { background:rgba(29,29,31,.15); border-radius:5px; }
 .grokbot-msg { max-width:72%; }
@@ -319,7 +339,7 @@ const GROKBOT_CSS = `
 
 
 
-let openTarget: { kind: 'conversation' | 'computer'; id: string } | null = null
+let openTarget: { kind: 'conversation' | 'computer' | 'routines' | 'settings'; id: string } | null = null
 let creatingUi = false
 let nativeSidebarVisible = false
 const listeners = new Set<() => void>()
@@ -390,7 +410,7 @@ function toggleNativeSidebar(): void {
   notify()
 }
 
-function useOpenTarget(): { kind: 'conversation' | 'computer'; id: string } | null {
+function useOpenTarget(): { kind: 'conversation' | 'computer' | 'routines' | 'settings'; id: string } | null {
   const [, force] = useState(0)
   useEffect(() => {
     const listener = (): void => force((n) => n + 1)
@@ -411,6 +431,9 @@ function useNativeSidebarVisible(): boolean {
 }
 
 const histories = new Map<string, ChatMessage[]>()
+const pendingMessages = new Map<string, Map<string, ChatMessage>>()
+const historyListeners = new Map<string, Set<() => void>>()
+function notifyHistory(id: string): void { for (const fn of historyListeners.get(id) ?? []) fn() }
 const loadedHistoryFor = new Set<string>()
 // 每会话历史拉取代次：卸载视图的旧实例/旧一轮响应不得覆盖较新历史（latest-wins）
 const historyFetchGen = new Map<string, number>()
@@ -427,10 +450,8 @@ function historyOf(botId: string): ChatMessage[] {
 const MAX_HISTORY = 200
 
 function appendLocal(botId: string, message: ChatMessage): void {
-  const list = historyOf(botId)
-  list.push(message)
-  if (list.length > MAX_HISTORY) list.splice(0, list.length - MAX_HISTORY)
-  notify()
+  histories.set(botId, [...historyOf(botId).filter(entry => entry.id !== message.id), message].slice(-MAX_HISTORY))
+  notifyHistory(botId)
 }
 
 let refreshState: (() => void) | null = null
@@ -501,6 +522,55 @@ async function fetchCatalog(): Promise<CatalogProvider[]> {
   const providers = (outcome?.catalog ?? []) as CatalogProvider[]
   catalogCache = { at: Date.now(), providers }
   return providers
+}
+
+export function ModelSettingsView({accessSupported=false}:{accessSupported?:boolean}={}): ReactNode {
+  const [providers, setProviders] = useState<CatalogProvider[]>([])
+  const [provider, setProvider] = useState('')
+  const [model, setModel] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [saved, setSaved] = useState(false)
+  const load = useCallback(async () => {
+    setLoading(true); setError('')
+    try {
+      const [catalog, crew] = await Promise.all([api('/model-catalog'), api('/crew')])
+      setProviders(catalog.catalog ?? [])
+      setProvider(crew.crew?.defaultModel?.provider ?? '')
+      setModel(crew.crew?.defaultModel?.model ?? '')
+    } catch (e) { setError(String((e as Error).message)) }
+    finally { setLoading(false) }
+  }, [])
+  useEffect(() => { void load() }, [load])
+  const save = async () => {
+    setBusy(true); setSaved(false); setError('')
+    try {
+      await api('/crew', { method:'PATCH', body:JSON.stringify({defaultModel:provider ? {provider,model} : null}) })
+      setSaved(true)
+    } catch (e) { setError(String((e as Error).message)) }
+    finally { setBusy(false) }
+  }
+  const valid = !provider || !!providers.find(p => p.id === provider)?.models.some(m => m.id === model)
+  return <section style={{padding:28,overflowY:'auto',height:'100%',boxSizing:'border-box'}}>
+    <h2 style={{marginTop:0}}>团队模型</h2>
+    <p>管理常用模型，为团队和成员选择合适的配置。</p>
+    <ModelLibrary api={api} onDefaultChange={value=>{setProvider(value?.provider||'');setModel(value?.model||'');setSaved(false)}} defaultEditor={loading ? <p>加载中…</p> : <div className="grokbot-form" style={{maxWidth:560}}>
+      <label>服务商<select aria-label="默认模型服务商" value={provider} onChange={e=>{setProvider(e.target.value);setModel('');setSaved(false)}}>
+        <option value="">跟随 DSH 全局默认</option>
+        {providers.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+      </select></label>
+      <label>模型<select aria-label="团队默认模型选择" value={model} disabled={!provider} onChange={e=>{setModel(e.target.value);setSaved(false)}}>
+        <option value="">选择模型</option>
+        {(providers.find(p=>p.id===provider)?.models ?? []).map(m=><option key={m.id} value={m.id}>{m.name}</option>)}
+      </select></label>
+      {!valid ? <p role="alert">请选择当前可用的模型。</p> : null}
+      <button type="button" className="grokbot-form__submit" disabled={busy || !valid || !!error} onClick={()=>void save()}>{busy?'保存中…':'保存默认模型'}</button>
+      {saved ? <p role="status">默认模型已保存，下次对话或任务生效。</p> : null}
+    </div>} />
+    {error ? <p role="alert">{error} <button onClick={()=>void load()}>重新加载</button></p> : null}
+    {accessSupported?<AccessSettings/>:null}
+  </section>
 }
 
 function BotForm(props: {
@@ -676,10 +746,9 @@ export function GrokbotSidebarCrew(): ReactNode {
   const nativeVisible = useNativeSidebarVisible()
   const [grouping, setGrouping] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
-  const [routinesOpen, setRoutinesOpen] = useState(false)
-  const [routineList, setRoutineList] = useState<{ id: string; botId: string; prompt: string; schedule: { everyMinutes?: number; time?: string }; enabled: boolean }[] | null>(null)
   const [creatingBot, setCreatingBot] = useState(false)
   const [filter, setFilter] = useState('')
+  const [showArchived,setShowArchived]=useState(false)
   const rootRef = useRef<HTMLDivElement | null>(null)
   const hiddenRef = useRef<HTMLElement[]>([])
 
@@ -757,10 +826,10 @@ export function GrokbotSidebarCrew(): ReactNode {
 
   const allBots = state?.bots ?? []
   const botOf = (botId: string): BotInfo | undefined => allBots.find((bot) => bot.id === botId)
-  const routines = state?.routines ?? []
 
   // 统一实体：一个会话一行（dm=成员 bot 档案；群=成员名列表）
   const conversations = (state?.conversations ?? [])
+    .filter(c=>showArchived?c.lifecycle?.status==='archived':c.lifecycle?.status!=='archived')
     .filter((conversation) => conversation.memberBotIds.every((botId) => botOf(botId) && !botOf(botId)!.hidden))
     .filter((conversation) => {
       if (!filter.trim()) return true
@@ -781,7 +850,7 @@ export function GrokbotSidebarCrew(): ReactNode {
   const rowPreview = (conversation: ConversationInfo): string => {
     if (conversation.memberBotIds.length === 1) {
       const bot = botOf(conversation.memberBotIds[0])
-      if (bot?.status === 'working') return `工作中${bot.currentJob ? ` · ${bot.currentJob}` : ''}`
+      if (bot?.status === 'working') return `工作中 · ${bot.currentWorkTitle || '点击查看实际进展'}`
       if (conversation.lastMessage) return `${conversation.lastFrom === 'user' ? '我: ' : ''}${conversation.lastMessage}`
       return bot?.title || '待命'
     }
@@ -798,6 +867,9 @@ export function GrokbotSidebarCrew(): ReactNode {
       <div className="grokbot-sidebar__search">
         <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="搜索" aria-label="搜索" />
       </div>
+      {(state?.approvals?.length ?? 0)>0 ? <button className="gk-approval-entry" aria-label={`幕僚长审批：${state?.approvals.filter(a=>a.stage !== 'chief').length ?? 0} 项需要你审批`} onClick={()=>openBot('chief')}>
+        {(state?.approvals.filter(a=>a.stage !== 'chief').length ?? 0)>0 ? `需要你审批 · ${state?.approvals.filter(a=>a.stage !== 'chief').length}` : `幕僚长代审中 · ${state?.approvals.length}`}
+      </button> : null}
       <div className="grokbot-sidebar__list">
         {menuOpen
           ? (
@@ -822,14 +894,14 @@ export function GrokbotSidebarCrew(): ReactNode {
           )
           : null}
         {grouping ? <RoomForm bots={allBots.filter((bot) => !bot.hidden)} onCancel={() => setGrouping(false)} onSaved={(roomId) => { setGrouping(false); openRoom(roomId) }} /> : null}
-        <div className="grokbot-sidebar__section">会话</div>
+        <div className="grokbot-sidebar__section">{showArchived?'已归档项目':'会话'} <button style={{border:0,background:'transparent',color:'inherit',font:'inherit',cursor:'pointer',marginLeft:8}} onClick={()=>setShowArchived(v=>!v)}>{showArchived?'返回会话':'查看归档'}</button></div>
         {conversations.length === 0 ? <div style={{ fontSize: 12, opacity: .5, padding: '4px 10px' }}>暂无会话，点 ＋ 开始</div> : null}
         {conversations.map((conversation) => {
           const isGroup = conversation.memberBotIds.length > 1
           const bot = isGroup ? undefined : botOf(conversation.memberBotIds[0])
           const working = !isGroup && bot?.status === 'working'
           const stack = isGroup
-            ? conversation.memberBotIds.slice(0, 2).map((botId) => {
+            ? conversation.memberBotIds.map((botId) => {
                 const member = botOf(botId)
                 return { seed: botId, name: member?.name, glyph: member?.roleTemplate || member?.avatar }
               })
@@ -851,34 +923,17 @@ export function GrokbotSidebarCrew(): ReactNode {
           )
         })}
       </div>
-      {routinesOpen ? (
-        <div className="grokbot-routinemenu" role="dialog" aria-label="例行任务" style={{ borderTop: '1px solid var(--gk-line, rgba(29,29,31,.1))', padding: '10px 12px', maxHeight: 220, overflowY: 'auto' }}>
-          <div style={{ fontSize: 12, fontWeight: 650, marginBottom: 6 }}>例行任务{routineList ? `（${routineList.length}）` : ''}</div>
-          {routineList === null ? <div style={{ fontSize: 12, opacity: .5 }}>加载中…</div> : null}
-          {routineList?.length === 0 ? (
-            <div style={{ fontSize: 11.5, opacity: .6, lineHeight: 1.6 }}>
-              还没有例行任务。进入任意助手 → 右上角 ⚙ 详情 → 「例行任务」可创建定时执行。
-            </div>
-          ) : null}
-          {routineList?.map((r) => (
-            <button key={r.id} type="button" className="grokbot-newmenu__item" style={{ padding: '7px 8px' }} onClick={() => { setRoutinesOpen(false); openBot(r.botId) }}>
-              <span className="grokbot-newmenu__icon" aria-hidden>⏱</span>
-              <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-                <span style={{ fontSize: 12.5, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.prompt.slice(0, 26) || '例行任务'}</span>
-                <span style={{ fontSize: 10.5, opacity: .55 }}>{botOf(r.botId)?.name ?? r.botId} · {r.schedule.time ? `每天 ${r.schedule.time}` : `每 ${r.schedule.everyMinutes ?? '?'} 分钟`}{r.enabled ? '' : ' · 已停用'}</span>
-              </span>
-            </button>
-          ))}
-        </div>
-      ) : null}
       <div className="grokbot-sidebar__foot">
-        <button type="button" className="grokbot-sidebar__computer" aria-label="共享电脑：本机工作区与任务成果" title="共享电脑：本机工作区与任务成果" onClick={() => openComputer()}>
-          <span className="gk-ico" aria-hidden>🖥️</span>
+        <button type="button" className="grokbot-sidebar__computer" aria-label="本机工作区与任务成果" title="本机工作区与任务成果" onClick={() => openComputer()}>
+          <span className="gk-ico"><NavigationIcon kind="computer" /></span>
           <span className="gk-lbl">电脑</span>
-          <span className="grokbot-sidebar__computer-status" aria-hidden />
+
         </button>
-        <button type="button" className="grokbot-iconbtn gk-foot-ico" aria-label={routines.length > 0 ? `例行任务（${routines.length} 个）` : '例行任务（暂无）'} title={routines.length > 0 ? `${routines.length} 个例行任务` : '例行任务（暂无）'} onClick={() => { const next = !routinesOpen; setRoutinesOpen(next); if (next) { setRoutineList(null); api('/routines').then((r) => setRoutineList(r?.routines ?? [])).catch(() => setRoutineList([])) } }}>
-          <span className="gk-ico" aria-hidden>⏱</span>
+        <button type="button" className="grokbot-iconbtn gk-foot-ico" aria-label="例行任务" title="例行任务" onClick={() => { openTarget = { kind: 'routines', id: 'routines' }; notify() }}>
+          <span className="gk-ico"><NavigationIcon kind="clock" /></span>
+        </button>
+        <button type="button" className="grokbot-iconbtn gk-foot-ico" aria-label="团队默认模型" title="团队默认模型" onClick={() => { openTarget = { kind: 'settings', id: 'settings' }; notify() }}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3" fill="var(--gk-bg-side)"/><circle cx="15" cy="17" r="3" fill="var(--gk-bg-side)"/></svg>
         </button>
       </div>
     </div>
@@ -886,9 +941,43 @@ export function GrokbotSidebarCrew(): ReactNode {
 }
 
 
+function NavigationIcon({ kind }: { kind: 'computer' | 'clock' }): ReactNode {
+  return <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    {kind === 'computer' ? <><rect x="3" y="4" width="18" height="13" rx="2" /><path d="M8 21h8M12 17v4" /></> : <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>}
+  </svg>
+}
+
+export function RoutinesView({ bots }: { bots: BotInfo[] }): ReactNode {
+  const [items, setItems] = useState<RoutineInfo[] | null>(null)
+  const [error, setError] = useState('')
+  const [revision, setRevision] = useState(0)
+  useEffect(() => {
+    let alive = true
+    setItems(null); setError('')
+    api('/routines').then((r) => { if (alive) setItems(r.routines ?? []) })
+      .catch((e) => { if (alive) setError(String(e?.message ?? e)) })
+    return () => { alive = false }
+  }, [revision])
+  return <section style={{ padding: '28px 32px', overflowY: 'auto', height: '100%', boxSizing: 'border-box' }} aria-label="例行任务">
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+      <h1 style={{ fontSize: 20, margin: 0 }}>例行任务</h1>
+      <button type="button" style={{ border: '1px solid var(--gk-line)', background: 'transparent', color: 'inherit', borderRadius: 8, padding: '7px 14px', font: 'inherit', fontSize: 13, cursor: 'pointer' }} onClick={() => setRevision((v) => v + 1)}>刷新</button>
+    </div>
+    <p style={{ color: 'var(--gk-text-2)', fontSize: 13 }}>查看助手的定时安排。打开对应助手，在详情中管理例行任务。</p>
+    {error ? <p role="alert">加载失败：{error}。请刷新重试。</p> : items === null ? <p role="status">加载中…</p> : items.length === 0 ? <p>还没有例行任务。在助手右上角打开详情，即可创建。</p> :
+      <div style={{ display: 'grid', gap: 10 }}>{items.map((r) => {
+        const bot = bots.find((b) => b.id === r.botId)
+        return <button key={r.id} type="button" className="grokbot-newmenu__item" disabled={!bot} onClick={() => openBot(r.botId)} style={{ border: '1px solid var(--gk-line)', borderRadius: 12, padding: 14, textAlign: 'left' }}>
+          <AvatarView seed={r.botId} name={bot?.name} glyph={bot?.roleTemplate || bot?.avatar} size={32} />
+          <span style={{ minWidth: 0, overflowWrap: 'anywhere' }}><strong>{r.prompt || '例行任务'}</strong><span style={{ display: 'block', marginTop: 5, fontSize: 12, opacity: .65 }}>{bot?.name ?? '助手已不可用'} · {r.schedule.time ? `每天 ${r.schedule.time}` : `每 ${r.schedule.everyMinutes ?? '?'} 分钟`} · {r.enabled ? '已启用' : '已停用'}</span></span>
+        </button>
+      })}</div>}
+  </section>
+}
+
 /* ---------------- 共享电脑 · 本机工作区（R-UI） ---------------- */
 
-function ComputerView(): ReactNode {
+export function ComputerView(): ReactNode {
   const [data, setData] = useState<{ workspace: string; computer: { enabled: boolean; local: boolean; vncUrl: string | null }; artifacts: { id: string; name: string; size: number; mime: string; taskId: string | null; createdAt: number | null }[] } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [revealing, setRevealing] = useState(false)
@@ -901,7 +990,7 @@ function ComputerView(): ReactNode {
   const fmtTime = (ts: number | null) => ts ? new Date(ts).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : ''
   return (
     <div className="grokbot-computer" style={{ padding: '28px 32px', overflowY: 'auto', height: '100%', boxSizing: 'border-box' }}>
-      <div style={{ fontSize: 19, fontWeight: 700, marginBottom: 4 }}>🖥️ 共享电脑 · 本机工作区</div>
+      <div style={{ fontSize: 19, fontWeight: 700, marginBottom: 4 }}>本机工作区</div>
       <div style={{ fontSize: 12.5, color: 'var(--gk-text-2, #6b6b70)', marginBottom: 20 }}>团队成员在本机 Mac 工作区直接执行任务；任务交付的成果原件保存在下方，可预览或保存副本。</div>
       {error ? <div style={{ fontSize: 13, color: '#cf1322' }}>加载失败：{error}</div> : null}
       {data ? (
@@ -1088,27 +1177,14 @@ function MembersPanel(props: { conversation: { id: string; name: string; memberB
   )
 }
 
-function ApprovalCard(props: { approval: ApprovalInfo }): ReactNode {
-  const [busy, setBusy] = useState(false)
-  const decide = useCallback(async (outcome: 'allowed-once' | 'rejected') => {
-    if (busy) return
-    setBusy(true)
-    try {
-      await api(`/approvals/${encodeURIComponent(props.approval.id)}`, { method: 'POST', body: JSON.stringify({ outcome }) })
-    } catch { /* 已失效则随轮询消失 */ } finally {
-      setBusy(false)
-    }
-  }, [busy, props])
-  return (
-    <div className="grokbot-msg approval">
-      <div className="grokbot-approval__title">🛡️ 需要审批：{props.approval.toolName || '工具操作'}</div>
-      {props.approval.reason ? <div className="grokbot-approval__reason">{props.approval.reason}</div> : null}
-      <div className="grokbot-approval__actions">
-        <button type="button" className="grokbot-approval__ok" disabled={busy} onClick={() => void decide('allowed-once')}>同意</button>
-        <button type="button" className="grokbot-approval__no" disabled={busy} onClick={() => void decide('rejected')}>取消</button>
-      </div>
-    </div>
-  )
+function ApprovalCard(props: {approval:ApprovalInfo}):ReactNode {
+ return <ApprovalView approval={props.approval} onDecision={async(outcome)=>{await api(`/approvals/${encodeURIComponent(props.approval.id)}`,{method:'POST',body:JSON.stringify({outcome})});refreshState?.()}}/>
+}
+function AccessSettings():ReactNode {
+ const [bots,setBots]=useState<{id:string;name:string;mode:string}[]>([]),[error,setError]=useState(''),[busy,setBusy]=useState('')
+ const load=()=>api('/access-control').then(r=>setBots(r.bots||[])).catch(e=>setError(e.message))
+ useEffect(()=>{void load()},[])
+ return <section className="gk-access-settings"><h3>成员权限</h3><p>插件完全访问已停用。操作仍需审核；持久权限请通过宿主原生授权管理。</p>{bots.map(b=><div key={b.id}><span>{b.name}<small>{b.mode==='full'?'完全访问已开启':'由幕僚长审核，必要时交给你'}</small></span>{b.mode==='full'?<button disabled={!!busy} onClick={()=>{setBusy(b.id);setError('');void api(`/bots/${encodeURIComponent(b.id)}/access`,{method:'POST',body:JSON.stringify({mode:'review'})}).then(load).catch(e=>setError(e.message)).finally(()=>setBusy(''))}}>关闭完全访问</button>:null}</div>)}{error?<p role="alert">{error}</p>:null}</section>
 }
 
 export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): ReactNode {
@@ -1148,9 +1224,16 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
   const [newRoutine, setNewRoutine] = useState(false)
   const [catalog, setCatalog] = useState<CatalogProvider[]>([])
   const [historyRefresh, forceRefresh] = useState(0)
-  const logRef = useRef<HTMLDivElement | null>(null)
-  const messages = useMemo(() => historyOf(bot.id), [bot.id, sending, historyRefresh])
-  const pending = (state?.approvals ?? []).filter((approval) => approval.botId === bot.id)
+  useEffect(() => {
+    const subscribers = historyListeners.get(bot.id) ?? new Set<() => void>()
+    historyListeners.set(bot.id, subscribers)
+    const refresh = () => forceRefresh(n => n + 1)
+    subscribers.add(refresh)
+    return () => { subscribers.delete(refresh); if (!subscribers.size) historyListeners.delete(bot.id) }
+  }, [bot.id])
+  const messages = historyOf(bot.id)
+  const {ref:logRef, paused:scrollPaused, jumpToLatest} = useChatScroll(`${bot.id}:${historyRefresh}:${sending}:${bot.status}:${bot.currentJob}:${bot.currentRunId}:${cancelling}:${messages.length}:${messages.at(-1)?.text ?? ''}:${JSON.stringify(state?.approvals ?? [])}`, bot.id)
+  const pending = (state?.approvals ?? []).filter((approval) => bot.id === 'chief' || approval.botId === bot.id)
 
   // 服务端 DM 历史拉取：保留 artifact 等透传字段（原件卡片不能在历史加载时丢失）。
   // 写入按会话 latest-wins：旧实例（已卸载视图）或旧一轮的迟到响应不得覆盖较新历史
@@ -1159,22 +1242,34 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
       const gen = (historyFetchGen.get(bot.id) ?? 0) + 1
       historyFetchGen.set(bot.id, gen)
       const outcome = await api(`/conversations/${encodeURIComponent(bot.id)}`)
-      const list = (outcome?.messages ?? []) as { ts: number; role: string; text: string; artifact?: ArtifactInfo | null }[]
+      const list = uniqueMessages((outcome?.messages ?? []) as { ts: number; role: string; text: string; messageId?: string; requestId?: string; artifact?: ArtifactInfo | null }[])
       if (list.length === 0) return
       if (historyFetchGen.get(bot.id) !== gen) return // 迟到旧响应：新历史已落（或新一轮在途），丢弃
-      histories.set(bot.id, list.map((message, index) => ({
-        id: `h${index}`,
-        role: message.role === 'user' ? ('user' as const) : ('bot' as const),
+      const updated = list.map((message, index) => ({
+        id: message.messageId || (message.requestId ? `chat-${message.requestId}-${message.role}` : `h${message.ts}-${index}`),
+        requestId: message.requestId,
+        role: message.role === 'user' ? ('user' as const) : message.role==='system' ? ('activity' as const) : ('bot' as const),
         text: message.text,
         at: message.ts,
         artifact: message.artifact ?? null,
-      })))
-      forceRefresh((n) => n + 1)
+      }))
+      const pending = pendingMessages.get(bot.id)
+      for (const message of list) if (message.role === 'user' && message.requestId) pending?.delete(message.requestId)
+      const merged = [...updated, ...[...(pending?.values() ?? [])]]
+      if (JSON.stringify(histories.get(bot.id)) === JSON.stringify(merged)) return
+      histories.set(bot.id, merged)
+      notifyHistory(bot.id)
     } catch { /* 轮询兜底 */ }
   }, [bot.id])
 
   useEffect(() => {
-    if (loadedHistoryFor.has(bot.id) || histories.get(bot.id)?.length) return
+    if (sending) return
+    const timer=setInterval(()=>void refetchHistory(),2000)
+    return ()=>clearInterval(timer)
+  }, [bot.id,sending,refetchHistory])
+
+  useEffect(() => {
+    // Always reconcile on entry: cached user messages may predate a late reply.
     loadedHistoryFor.add(bot.id)
     void refetchHistory()
   }, [bot.id, refetchHistory])
@@ -1184,9 +1279,6 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
     void fetchCatalog().then(setCatalog).catch(() => undefined)
   }, [catalog.length])
 
-  useEffect(() => {
-    logRef.current?.scrollTo({ top: logRef.current.scrollHeight })
-  }, [messages.length, sending, pending.length])
 
   // 取消确认复位：按 runId 对齐服务端（run 变了/结束了都可重试或复位），失败不清按钮由 catch 处理
   useEffect(() => {
@@ -1210,7 +1302,15 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
     const sendSeq = allocateSeq() // 请求序号：旧失败不能覆盖较新的重试槽
     if (!isRetry) setDraft('')
     setRetryRequest(null); clearPendingRetry(bot.id)
-    appendLocal(bot.id, { id: `${Date.now()}-u`, role: 'user', text, at: Date.now() })
+    historyFetchGen.set(bot.id, (historyFetchGen.get(bot.id) ?? 0) + 1)
+    const pending = pendingMessages.get(bot.id) ?? new Map<string, ChatMessage>()
+    pendingMessages.set(bot.id, pending)
+    if (!pending.has(requestId) && !historyOf(bot.id).some(m => m.requestId === requestId)) {
+      const message: ChatMessage = { id: `chat-${requestId}-user`, requestId, role: 'user', text, at: Date.now() }
+      pending.set(requestId, message)
+      appendLocal(bot.id, message)
+    }
+    jumpToLatest()
     setSending(true)
     try {
       const outcome = await api(`/conversations/${encodeURIComponent(bot.id)}/chat`, {
@@ -1235,7 +1335,7 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
           at: Date.now(),
         })
       }
-      appendLocal(bot.id, { id: `${Date.now()}-b`, role: 'bot', text: String(outcome?.reply ?? ''), at: Date.now() })
+      appendLocal(bot.id, { id: `chat-${requestId}-bot`, requestId, role: 'bot', text: String(outcome?.reply ?? ''), at: Date.now() })
       // 本回合可能有 deliver_file 交付的卡片：以服务端历史为准刷新（立即可见）
       await refetchHistory()
       if (sendGen !== botGenRef.current) return // refetchHistory 也是 await——之后再次验证代次
@@ -1255,14 +1355,14 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
     } finally {
       if (sendGen === botGenRef.current) setSending(false)
     }
-  }, [draft, sending, bot.id, refetchHistory, draftTask])
+  }, [draft, sending, bot.id, refetchHistory, draftTask, jumpToLatest])
 
   const routines = (state?.routines ?? []).filter((routine) => routine.botId === bot.id)
 
   return (
     <div className="grokbot-chat" onKeyDown={(event) => { if (event.key === 'Escape' && !detailsOpen && !editing) closeTarget() }}>
       <div className="grokbot-chat__head">
-        <AvatarView seed={bot.id} name={bot.name} glyph={bot.roleTemplate || undefined} size={38} level={bot.rating?.level} />
+        <AvatarView seed={bot.id} name={bot.name} glyph={bot.roleTemplate || bot.avatar} size={38} level={bot.rating?.level} />
         <span className="grokbot-chat__title" onClick={() => setDetailsOpen((v) => !v)}>
           <span className="grokbot-chat__name">{bot.name}</span>
           <span className="grokbot-chat__meta">
@@ -1275,17 +1375,20 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
         <button type="button" className="grokbot-iconbtn" title="编辑资料" onClick={() => setEditing((v) => !v)}>⚙</button>
         <button type="button" className="grokbot-chat__close" onClick={closeTarget} aria-label="关闭">✕</button>
       </div>
+      <BotWorkPanel botId={bot.id} botName={bot.name} />
       {editing ? <div style={{ padding: '0 20px' }}><BotForm initial={bot} onCancel={() => setEditing(false)} onSaved={() => setEditing(false)} /></div> : null}
+          {bot.accessMode==='full'?<div className="gk-access-banner"><span>此 Bot 完全访问已开启</span><button onClick={()=>{void api(`/bots/${encodeURIComponent(bot.id)}/access`,{method:'POST',body:JSON.stringify({mode:'review'})}).then(()=>refreshState?.()).catch(e=>window.alert(e.message))}}>关闭完全访问</button></div>:null}
       {bot.setupStage
         ? (
-          <div className="grokbot-body">
+      <div className="grokbot-body">
             <SetupWizard bot={bot} onAdvance={() => refreshState?.()} />
           </div>
         )
         : (
         <>
       <div className="grokbot-body">
-        <div className="grokbot-log" ref={logRef}>
+        {scrollPaused ? <button type="button" className="grokbot-jump-latest" onClick={jumpToLatest}>↓ 回到最新消息</button> : null}
+      <div className="grokbot-log" ref={logRef} tabIndex={0} aria-label="消息记录">
           {messages.length === 0 && pending.length === 0
             ? <div className="grokbot-empty">和 {bot.name} 对话，或投递任务给它。<br />它会真实使用工具、在本机工作区里干活。</div>
             : null}
@@ -1314,7 +1417,7 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
             const role = message.role === 'user' ? 'user' : message.role === 'error' ? 'error' : 'activity'
             return <MessageView key={message.id} role={role} text={message.text} at={message.at} markdown={false} />
           })}
-          {bot.status === 'working'
+          {bot.status === 'working' || sending
             ? (
               <TaskCard
                 title={bot.currentJob ? `任务 ${bot.currentJob.slice(0, 24)}` : `${bot.name} 正在执行`}
@@ -1340,7 +1443,7 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
             )
             : null}
           {pending.map((approval) => (
-            <ApprovalCard key={approval.id} approval={approval} />
+            bot.id === 'chief' ? <ApprovalCard key={approval.id} approval={approval} /> : <div key={approval.id} className="grokbot-msg approval">授权已交给幕僚长处理。<button onClick={()=>openBot('chief')}>查看幕僚长审批</button></div>
           ))}
           {sending && pending.length === 0 ? <div className="grokbot-empty"><img src="/api/plugins/grokbot/assets/states/thinking" width={20} height={20} alt="" style={{verticalAlign:'-4px'}} /> 思考中…</div> : null}
         </div>
@@ -1456,6 +1559,8 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
 export function GroupChatView(props: { conversation: ConversationInfo; bots: BotInfo[]; queued?: { jobId: string; botId: string; text: string }[] }): ReactNode {
   const room = { id: props.conversation.id, name: props.conversation.name || props.conversation.memberBotIds.map((botId) => props.bots.find((bot) => bot.id === botId)?.name ?? botId).join('、'), memberBotIds: props.conversation.memberBotIds }
   const bots = props.bots
+  const [boardOpen,setBoardOpen]=useState(true)
+  const loadBoard=useCallback((id:string)=>api(`/conversations/${encodeURIComponent(id)}/board`),[])
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [messages, setMessages] = useState<RoomMessage[]>([])
   const [draft, setDraft] = useState('')
@@ -1465,6 +1570,7 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
   const [retryRequest, setRetryRequest] = useState<{ conversationId: string; requestId: string; text: string; taskId: string | null; createdAt: number } | null>(null)
   const roomRef = useRef(room.id)
   const roomGenRef = useRef(0) // 执行代次
+  const roomHistoryGen = useRef(0)
   // 按群保存未发送草稿/任务引用：模块级 store（切走/卸载不丢，重挂恢复，新群不继承）
   const liveDraftRef = useRef({ draft, draftTask })
   liveDraftRef.current = { draft, draftTask }
@@ -1487,13 +1593,14 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
   // 卸载（父级切换到 DM/工作区等互斥视图）也保存当前群草稿
   useEffect(() => () => { saveDraft(roomRef.current, liveDraftRef.current) }, [])
   const queued = props.queued ?? []
-  const logRef = useRef<HTMLDivElement | null>(null)
+  const {ref:logRef, paused:scrollPaused, jumpToLatest} = useChatScroll(`${room.id}:${sending}:${JSON.stringify(messages)}:${JSON.stringify(queued)}:${JSON.stringify(bots.filter(b=>b.currentConversationId===room.id).map(b=>[b.id,b.status,b.currentJob,b.currentRunId]))}:${JSON.stringify([...cancellingRuns])}`, room.id)
 
   useEffect(() => {
     let alive = true
     const tick = (): void => {
+      const gen = ++roomHistoryGen.current
       api(`/conversations/${encodeURIComponent(room.id)}`).then((outcome) => {
-        if (alive) setMessages((outcome?.messages ?? []) as RoomMessage[])
+        if (alive && gen === roomHistoryGen.current) setMessages(uniqueMessages((outcome?.messages ?? []) as RoomMessage[]))
       }).catch(() => undefined)
     }
     tick()
@@ -1501,9 +1608,6 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
     return () => { alive = false; clearInterval(timer) }
   }, [room.id])
 
-  useEffect(() => {
-    logRef.current?.scrollTo({ top: logRef.current.scrollHeight })
-  }, [messages.length, sending])
 
   // 停止确认复位：按 (botId → 其当前 runId) 与服务端对齐；run 已变/结束即清该项
   useEffect(() => {
@@ -1542,7 +1646,8 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
       // 结算必须无条件执行（作用于原会话的 seq 槽）——切走后到达的成功也要落水印
       clearPendingRetry(sendRoomId, sendSeq)
       if (sendGen !== roomGenRef.current) return // 迟到结果：只丢弃 UI 写入
-      setMessages(((outcome?.messages ?? []) as RoomMessage[]).slice())
+      ++roomHistoryGen.current
+      setMessages(uniqueMessages((outcome?.messages ?? []) as RoomMessage[]))
       setDraftTask(null)
     } catch (error) {
       // 失败记录始终保存到原会话 store（不丢弃），UI 写入仅当仍是当前代次
@@ -1557,9 +1662,10 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
   }, [draft, sending, room.id, draftTask])
 
   return (
+    <div className="grokbot-group-shell">
     <div className="grokbot-chat" onKeyDown={(event) => { if (event.key === 'Escape' && !detailsOpen) closeTarget() }}>
       <div className="grokbot-chat__head">
-        <AvatarView seed={room.id} glyph="group" size={38} />
+        <GroupAvatarView name={room.name} members={room.memberBotIds.map(id => { const m = bots.find(b => b.id === id); return { seed: id, name: m?.name, glyph: m?.roleTemplate || m?.avatar } })} size={38} />
         <span className="grokbot-chat__title" onClick={() => setDetailsOpen((v) => !v)}>
           <span className="grokbot-chat__name">{room.name}</span>
           <span className="grokbot-chat__meta">
@@ -1569,28 +1675,30 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
             })}
           </span>
         </span>
+        <button type="button" className="gk-board-toggle" aria-expanded={boardOpen} onClick={()=>setBoardOpen(v=>!v)}>{boardOpen?'收起列表':'任务列表'}</button>
         <button type="button" className="grokbot-chat__close" onClick={closeTarget} aria-label="关闭">✕</button>
       </div>
       <div className="grokbot-body">
-      <div className="grokbot-log" ref={logRef}>
+      {scrollPaused ? <button type="button" className="grokbot-jump-latest" onClick={jumpToLatest}>↓ 回到最新消息</button> : null}
+      <div className="grokbot-log" ref={logRef} tabIndex={0} aria-label="消息记录">
         {messages.length === 0
-          ? <div className="grokbot-empty">群聊成员会自主决定谁应答；@成员名 可定向，bot 之间也会互相转交。</div>
+          ? <div className="grokbot-empty">由幕僚长统一协调，右侧查看团队任务进展。@成员名仍可定向交流。</div>
           : messages.map((message, index) => {
               if (message.role === 'user') {
-                return <MessageView key={index} role="user" text={message.text} at={message.ts} markdown={false} />
+                return <MessageView key={message.messageId || `${message.ts}-${index}`} role="user" text={message.text} at={message.ts} markdown={false} />
               }
               if (message.role === 'handoff') {
                 return (
-                  <MessageView key={index} role="activity" text={`↪ ${botOf(message.fromBotId)?.name ?? message.fromBotId} → ${botOf(message.toBotId)?.name ?? message.toBotId}：${message.text}`} markdown={false} />
+                  <MessageView key={message.messageId || `${message.ts}-${index}`} role="activity" text={`↪ ${botOf(message.fromBotId)?.name ?? message.fromBotId} → ${botOf(message.toBotId)?.name ?? message.toBotId}：${message.text}`} markdown={false} />
                 )
               }
               if (message.role === 'system') {
-                return <MessageView key={index} role="notice" text={message.text} markdown={false} />
+                return <MessageView key={message.messageId || `${message.ts}-${index}`} role="notice" text={message.text} markdown={false} />
               }
               const bot = botOf(message.botId)
               return (
                 <MessageView
-                  key={index}
+                  key={message.messageId || `${message.ts}-${index}`}
                   role="bot"
                   text={splitChips(message.text).body}
                   at={message.ts}
@@ -1614,7 +1722,7 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
             } }]}
           />
         ))}
-        {bots.filter((b) => b.status === 'working' && room.memberBotIds.includes(b.id)).map((b) => {
+        {bots.filter((b) => b.status === 'working' && b.currentConversationId === room.id && room.memberBotIds.includes(b.id)).map((b) => {
           const stopping = cancellingRuns.get(b.id) === b.currentRunId
           const cancellable = b.currentRunId && b.currentTaskId
           return (
@@ -1680,7 +1788,7 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
         onDraft={setDraft}
         onSend={() => void send()}
         sending={sending}
-        placeholder={draftTask ? `继续修改 ${draftTask.name}（同一任务）…` : `发到 ${room.name}…（@成员名 定向）`}
+        placeholder={draftTask ? `继续修改 ${draftTask.name}（同一任务）…` : room.memberBotIds.includes('chief') ? '告诉幕僚长你的需求…' : `发到 ${room.name}…` }
       />
       {detailsOpen
         ? (
@@ -1689,6 +1797,8 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
           </div>
         )
         : null}
+    </div>
+    {boardOpen?<ProjectBoard conversationId={room.id} bots={bots.filter(b=>room.memberBotIds.includes(b.id))} load={loadBoard} onApproval={()=>openBot('chief')}/>:null}
     </div>
   )
 }
@@ -1728,7 +1838,7 @@ function HomeBlank(props: { bots: BotInfo[] }): ReactNode {
           <div className="grokbot-home__grid">
             {bots.map((bot) => (
               <button key={bot.id} type="button" className="grokbot-home__card" onClick={() => openConversation(bot.id)}>
-                <AvatarView seed={bot.id} name={bot.name} glyph={bot.roleTemplate || undefined} size={44} level={bot.rating?.level} />
+                <AvatarView seed={bot.id} name={bot.name} glyph={bot.roleTemplate || bot.avatar} size={44} level={bot.rating?.level} />
                 <span className="grokbot-home__name">{bot.name}</span>
                 <span className="grokbot-home__desc">{bot.title || '常驻待命'}</span>
               </button>
@@ -1828,6 +1938,8 @@ export function GrokbotMainView(): ReactNode {
       style={{ position: 'fixed', left: box.left, top: box.top, width: box.width, height: box.height, zIndex: 900 }}
     >
       {(() => {
+        if (target?.kind === 'settings') return <ModelSettingsView accessSupported={state?.accessControl?.supported} />
+        if (target?.kind === 'routines') return <RoutinesView bots={state?.bots ?? []} />
         if (isComputer) return <ComputerView />
         if (bot) return <BotChatView bot={bot} state={state} />
         if (conversation && isGroup) return <GroupChatView conversation={conversation} bots={state?.bots ?? []} queued={(state?.queued ?? []).filter((q) => q.conversationId === conversation.id)} />
@@ -1857,7 +1969,8 @@ export function apply(ctx: any): void {
     style.dataset.dshGrokbot = ''
     document.head.append(style)
     const update = (): void => {
-      style.textContent = GROKBOT_CSS + GKF_CSS + (nativeSidebarVisible ? '' : '\n.grokbot-takeover [class*="centerCol"] > * { display: none !important; }\n.grokbot-takeover [class*="detailsCol"] { display: none !important; }')
+      const css = GROKBOT_CSS + GKF_CSS + (nativeSidebarVisible ? '' : '\n.grokbot-takeover [class*="centerCol"] > * { display: none !important; }\n.grokbot-takeover [class*="detailsCol"] { display: none !important; }')
+      if (style.textContent !== css) style.textContent = css
     }
     update()
     listeners.add(update)

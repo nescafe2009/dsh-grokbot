@@ -430,3 +430,41 @@ test('组合：读取中到达新事件随后失败——timer 至多 1 个、�
   const r = sched.request('g12')
   assert.ok(r === 'fired' || r === 'pending', '新事件可再推动')
 })
+
+test('failed coordination retains bounded retry budget across real attempt claims',()=>{
+ const {wake,fired,advance}=makeScheduler();wake.request('g')
+ for(let attempt=0;attempt<3;attempt++){
+  wake.beginAttempt('g');wake.failAttempt('g');advance(60000)
+ }
+ assert.equal(fired.length,3);assert.equal(wake.state.get('g').failBudget,-1)
+ wake.onFired('g');advance(60000);assert.equal(fired.length,3)
+ wake.request('g');assert.equal(fired.length,4)
+})
+test('successful coordination preserves events received during its attempt',()=>{
+ const {wake,fired,advance}=makeScheduler();wake.request('g');wake.beginAttempt('g')
+ wake.request('g');wake.completeAttempt('g');advance(60000)
+ assert.equal(fired.length,2)
+})
+
+test('12 minute coordination: a late completion never starts a competing turn or disappears', () => {
+  const { wake, fired, advance } = makeScheduler()
+  wake.request('g'); wake.beginAttempt('g')
+  advance(12 * 60_000)
+  assert.equal(wake.request('g'), 'pending')
+  assert.equal(fired.length, 1)
+  advance(1)
+  assert.equal(fired.length, 1)
+  wake.completeAttempt('g'); advance(0)
+  assert.equal(fired.length, 2)
+  wake.beginAttempt('g'); wake.completeAttempt('g'); advance(60_000)
+  assert.equal(fired.length, 2)
+})
+
+
+test('teardown cancels queued wakeups and rejects late producer events', () => {
+ const {wake,fired,advance}=makeScheduler()
+ wake.request('g');wake.beginAttempt('g');wake.request('g')
+ wake.dispose();wake.completeAttempt('g');advance(120000)
+ assert.equal(wake.request('g'),'disposed')
+ assert.equal(wake.state.size,0);assert.equal(fired.length,1)
+})

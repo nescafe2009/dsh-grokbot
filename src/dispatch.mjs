@@ -62,12 +62,13 @@ export class WakeScheduler {
     this.delay = delay ?? ((ms, fn) => setTimeout(fn, ms))
     this.cancelDelay = cancelDelay ?? ((handle) => clearTimeout(handle))
     this.now = now
+    this.disposed = false
     this.state = new Map() // key → { lastFiredAt, pending, inTransit, failBudget, timer?, timerGen }
   }
 
   _armPending(key) {
     const st = this.state.get(key)
-    if (!st || !st.pending || st.timer !== undefined) return
+    if (!st || !st.pending || st.timer !== undefined || st.failBudget === -1) return
     const wait = Math.max(0, this.intervalMs - (this.now() - st.lastFiredAt))
     const gen = (st.timerGen = (st.timerGen ?? 0) + 1)
     st.timer = this.delay(wait, () => {
@@ -75,8 +76,8 @@ export class WakeScheduler {
       // 代次校验：已被取消/重排的旧回调直接失效
       if (!cur || cur.timerGen !== gen) return
       cur.timer = undefined
-      cur.lastFiredAt = this.now()
       if (cur.pending && !cur.inTransit) {
+        cur.lastFiredAt = this.now()
         cur.inTransit = true
         this.fire(key)
       }
@@ -92,11 +93,23 @@ export class WakeScheduler {
     st.timerGen = (st.timerGen ?? 0) + 1 // 已入队旧回调失效
   }
 
+  drop(key) {
+    const st=this.state.get(key);if(st)this._cancelTimer(st)
+    this.state.delete(key)
+  }
+
+  dispose() {
+    this.disposed = true
+    for (const st of this.state.values()) this._cancelTimer(st)
+    this.state.clear()
+  }
+
   request(key) {
+    if (this.disposed) return 'disposed'
     const st = this.state.get(key) ?? { lastFiredAt: -Infinity, pending: false }
     this.state.set(key, st)
     st.failBudget = undefined // 新事件重置失败预算（新恢复机会）
-    if (this.now() - st.lastFiredAt < this.intervalMs) {
+    if (st.inTransit || this.now() - st.lastFiredAt < this.intervalMs) {
       st.pending = true
       this._armPending(key)
       return 'pending'
@@ -115,6 +128,23 @@ export class WakeScheduler {
     st.inTransit = false
     // pending 仍在（忙期间的新事件）→ 重开窗口到点再 fire，直到被真正消费（ack）——不丢
     this._armPending(key)
+  }
+
+  /** Claim the current batch without resetting retry budget or acknowledging success. */
+  beginAttempt(key) {
+    const st = this.state.get(key)
+    if (!st) return
+    st.pending = false
+    st.inTransit = true
+    st.lastFiredAt = this.now()
+  }
+
+  /** Successful consumption preserves events received during the attempt. */
+  completeAttempt(key) {
+    const st = this.state.get(key)
+    if (!st) return
+    st.failBudget = undefined
+    this.onFired(key)
   }
 
   /** 消费方确认：真正开始处理时调用（清除 pending/inTransit + 重置失败预算） */

@@ -53,6 +53,7 @@ export const ROLE_DEFS: Record<string, RoleDef> = {
 
 /* ---------- 哈希 → 拼装参数（ASSEMBLY.md 契约） ---------- */
 export function hashName(name: string): [number, number, number, number] {
+  name = name.trim().normalize('NFC')
   let h = 0
   for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) | 0
   const h2 = (h >>> 16) ^ h
@@ -224,6 +225,6 @@ export function resolveGlyph(glyph?: string | null): string | undefined {
   if (!glyph) return undefined
   const key = String(glyph).trim()
   if (ROLE_DEFS[key] !== undefined) return key
-  const mapped = EMOJI_GLYPH[key]
+  const mapped = EMOJI_GLYPH[key] ?? Object.entries(EMOJI_GLYPH).find(([emoji]) => emoji.replace(/\uFE0F/g, '') === key.replace(/\uFE0F/g, ''))?.[1]
   return mapped !== undefined ? mapped : undefined
 }

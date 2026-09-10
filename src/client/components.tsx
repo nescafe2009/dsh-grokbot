@@ -4,41 +4,30 @@
  * 私聊与群聊共用 MessageView/Composer；差异只通过 props 表达。
  * 本模块自包含（不回依赖 index.tsx），是客户端的基础层。
  */
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { renderAvatarSVG, renderLevelRing, ROLE_DEFS, resolveGlyph } from './avatars'
+import { resolveGlyph } from './avatars'
+import { identityMark } from './avatar-mark'
 import { TOKENS } from './tokens'
 
 /* ---------------- 头像 ---------------- */
 
 export function AvatarView(props: { seed: string; name?: string; glyph?: string; size: number; fontSize?: number; level?: number }): ReactNode {
-  const roleKey = resolveGlyph(props.glyph)
-  const size = props.size
-  const isKnown = roleKey && ROLE_DEFS[roleKey] !== undefined
-  const ring = props.level !== undefined && props.level >= 4 ? renderLevelRing(props.level) : ''
+  const role = resolveGlyph(props.glyph)
+  const label = props.name || (role === 'chief' ? '幕僚长' : 'Bot')
+  return <span className="gk-avatar-mark" style={{ width: props.size, height: props.size, display: 'inline-flex', flex: 'none', position: 'relative' }}>
+    <img src={`data:image/svg+xml,${encodeURIComponent(identityMark(role, props.name || props.seed))}`} data-avatar-role={role || 'custom'} width={props.size} height={props.size} alt={label} draggable={false} style={{ display: 'block', width: '100%', height: '100%' }} />
+    {props.level && props.level >= 4 && props.size >= 30 ? <span aria-label={`等级 ${props.level}`} style={{ position: 'absolute', right: -1, bottom: -1, borderRadius: 5, background: 'var(--gk-bg-side, #f7f7f7)', color: '#947126', fontSize: 10, fontWeight: 700, padding: '0 2px', lineHeight: '13px' }}>★</span> : null}
+  </span>
+}
 
-  if (isKnown) {
-    return (
-      <span style={{ width: size, height: size, position: 'relative', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flex: 'none' }}>
-        <img
-          src={`/api/plugins/grokbot/assets/avatars/${roleKey}`}
-          width={size}
-          height={size}
-          style={{ borderRadius: '50%', display: 'block', objectFit: 'contain' }}
-          alt={props.name || roleKey}
-        />
-        {ring ? <span style={{ position: 'absolute', inset: -2, pointerEvents: 'none' }} dangerouslySetInnerHTML={{ __html: ring.replace('<svg ', `<svg width="${size + 4}" height="${size + 4}" `) }} /> : null}
-      </span>
-    )
-  }
-
-  const svgHtml = renderAvatarSVG({ name: props.name, size })
-  return (
-    <span
-      style={{ width: size, height: size, position: 'relative', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flex: 'none' }}
-      dangerouslySetInnerHTML={{ __html: svgHtml }}
-    />
-  )
+type AvatarMember = { seed: string; name?: string; glyph?: string }
+export function GroupAvatarView({ members, size, name }: { members: AvatarMember[]; size: number; name?: string }): ReactNode {
+  const visible = members.slice(0, members.length > 4 ? 3 : 4)
+  return <span role="img" aria-label={`${name || '群聊'}，${members.length} 位成员`} className="gk-group-avatar" style={{ width: size, height: size, flex: 'none', display: 'grid', gridTemplateColumns: '1fr 1fr', gridTemplateRows: members.length === 2 ? '1fr' : '1fr 1fr', gap: 1, padding: 2, boxSizing: 'border-box', borderRadius: size * .26, background: 'var(--gk-bg-card, rgba(120,120,128,.08))', alignItems: 'center', justifyItems: 'center' }}>
+    {visible.map((member, i) => <span key={member.seed} aria-hidden="true" style={{ display: 'flex', ...(members.length === 3 && i === 2 ? { gridColumn: '1 / -1' } : {}) }}><AvatarView {...member} size={(size - 5) / 2} /></span>)}
+    {members.length > 4 ? <span aria-hidden="true" style={{ fontSize: Math.max(9, size * .25), fontWeight: 650, lineHeight: 1, color: 'var(--gk-text-2, #666)', fontVariantNumeric: 'tabular-nums' }}>+{members.length - 3}</span> : null}
+  </span>
 }
 
 /* ---------------- 轻量 Markdown ---------------- */
@@ -46,7 +35,7 @@ export function AvatarView(props: { seed: string; name?: string; glyph?: string;
 let mdKeySeed = 0
 function renderInline(text: string): ReactNode[] {
   const parts: ReactNode[] = []
-  const re = /(\*\*[^*]+\*\*|`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\)|https?:\/\/[^\s)]+)/g
+  const re = /(\*\*[^*]+\*\*|`[^`\n]+`|\[[^\]\n]+\]\((?:https?:\/\/[^\s)]+|\/api\/plugins\/grokbot\/artifacts\/[a-z0-9-]+)\)|https?:\/\/[^\s)]+)/g
   let last = 0
   let match: RegExpExecArray | null
   while ((match = re.exec(text))) {
@@ -58,7 +47,7 @@ function renderInline(text: string): ReactNode[] {
     } else if (token.startsWith('`')) {
       parts.push(<code key={key} className="grokbot-md__icode">{token.slice(1, -1)}</code>)
     } else if (token.startsWith('[')) {
-      const link = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/.exec(token)
+      const link = /\[([^\]]+)\]\((https?:\/\/[^\s)]+|\/api\/plugins\/grokbot\/artifacts\/[a-z0-9-]+)\)/.exec(token)
       if (link) parts.push(<a key={key} href={link[2]} target="_blank" rel="noreferrer" className="grokbot-md__link">{link[1]}</a>)
       else parts.push(token)
     } else {
@@ -133,7 +122,7 @@ function CodeBlock(props: { code: string; lang: string }): ReactNode {
   )
 }
 
-export function MarkdownView(props: { text: string }): ReactNode {
+export const MarkdownView = memo(function MarkdownView(props: { text: string }): ReactNode {
   const segments = props.text.split(/```/)
   return (
     <>
@@ -148,7 +137,7 @@ export function MarkdownView(props: { text: string }): ReactNode {
       })}
     </>
   )
-}
+})
 
 export function splitChips(text: string): { body: string; chips: string[] } {
   const match = /\n?\[\[([^\]\n]+)\]\]\s*$/.exec(text)
@@ -178,17 +167,7 @@ export interface SidebarRowProps {
 export function SidebarRow(props: SidebarRowProps): ReactNode {
   const size = TOKENS.size.avatarRow
   const avatar = props.stack && props.stack.length > 1
-    ? (
-      // 群聊：前两位成员头像堆叠（参照 Grok 多成员堆叠样式）
-      <span style={{ position: 'relative', width: size + 5, height: size, flex: 'none', display: 'inline-block' }}>
-        <span style={{ position: 'absolute', left: 5, top: 0, zIndex: 1, borderRadius: '50%', background: '#fff', boxShadow: '0 0 0 1.5px #fff' }}>
-          <AvatarView seed={props.stack[1].seed} name={props.stack[1].name} glyph={props.stack[1].glyph} size={size - 3} />
-        </span>
-        <span style={{ position: 'absolute', left: 0, top: 0, zIndex: 2, borderRadius: '50%', background: '#fff', boxShadow: '0 0 0 1.5px #fff' }}>
-          <AvatarView seed={props.stack[0].seed} name={props.stack[0].name} glyph={props.stack[0].glyph} size={size - 3} />
-        </span>
-      </span>
-    )
+    ? <GroupAvatarView members={props.stack} size={size} name={props.name} />
     : <AvatarView seed={props.seed} name={props.name} glyph={props.glyph} size={size} level={props.working ? undefined : props.level} />
   return (
     <button type="button" className={`gkf-row${props.active ? ' active' : ''}`} onClick={props.onClick}>
