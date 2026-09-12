@@ -37,7 +37,7 @@ const step = (name, ok, detail = '') => {
 // ---- 信号处理（启动即注册）与有界清理 ----
 let R3HOME = null
 let child = null
-const waitExit = (c, ms) => Promise.race([new Promise((r) => c.on('exit', (code, sig) => r({ code, sig }))), new Promise((r) => setTimeout(() => r(null), ms))])
+const waitExit = (c, ms) => c.exitCode !== null || c.signalCode !== null ? Promise.resolve({code:c.exitCode,sig:c.signalCode}) : Promise.race([new Promise((r) => c.on('exit', (code, sig) => r({ code, sig }))), new Promise((r) => setTimeout(() => r(null), ms))])
 const cleanup = async () => {
   if (child?.exitCode === null && !child?.killed) {
     child.kill('SIGTERM')
@@ -52,7 +52,7 @@ process.on('SIGINT', () => { void cleanup().finally(() => process.exit(130)) })
 process.on('SIGTERM', () => { void cleanup().finally(() => process.exit(143)) })
 
 const bootAndReady = async () => {
-  child = spawn(process.execPath, [DSH_BIN, '--profile', 'r3accept', '--no-open', '--host', '127.0.0.1', '--port', String(PORT)], {
+  child = spawn(process.execPath, ['--expose-internals', DSH_BIN, '--profile', 'r3accept', '--no-open', '--host', '127.0.0.1', '--port', String(PORT)], {
     env: { ...process.env, DSH_HOME: R3HOME },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -65,10 +65,10 @@ const bootAndReady = async () => {
   while (Date.now() < deadline) {
     const token = /token=([A-Za-z0-9_-]+)/.exec(bootLog)?.[1]
     if (token) return { token }
-    if (early) return { token: null, tail: sanitize(bootLog.slice(-200)) }
+    if (early) return { token: null, tail: sanitize(bootLog.slice(-1800)) }
     await new Promise((r) => setTimeout(r, 300))
   }
-  return { token: null, tail: sanitize(bootLog.slice(-200)) }
+  return { token: null, tail: sanitize(bootLog.slice(-1800)) }
 }
 const stopChild = async (label) => {
   child.kill('SIGTERM')
@@ -106,12 +106,14 @@ try {
   await writeFile(join(profDir, 'pnpm-workspace.yaml'), 'packages:\n  - .\nnodeLinker: hoisted\nautoInstallPeers: false\n')
   execFileSync('tar', ['-xzf', TGZ, '-C', join(profDir, 'node_modules')])
   execFileSync('mv', [join(profDir, 'node_modules', 'package'), join(profDir, 'node_modules', 'dsh-grokbot')])
-  await symlink(SHARED_MODULES, join(R3HOME, 'profiles', 'node_modules'), 'dir').catch(() => undefined)
+  // DSH 0.8.x manages its own installation fallback; never symlink the entire shared tree.
+  await mkdir(join(R3HOME, 'profiles', 'node_modules'), {recursive:true})
 
   const base = `http://127.0.0.1:${PORT}`
 
   // ===== boot#1：插件在载 =====
   const first = await bootAndReady()
+  if(first.tail) console.log(first.tail)
   step('boot#1: 隔离 harness 启动', Boolean(first.token), first.tail ?? '')
   const cookie1 = first.token ? await establishSession(base, first.token) : null
   step('boot#1: 临时认证会话建立（303+Set-Cookie）', Boolean(cookie1), cookie1 ? 'cookie 已取得（不回显）' : '会话建立失败')
