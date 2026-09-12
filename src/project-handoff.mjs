@@ -17,7 +17,7 @@ export async function bindProjectOrigin(root,id,originConversationId){return pro
  * A stable messageId lets the destination deduplicate a retry after a crash. */
 export async function prepareHandoff(root,id,{name,rows,epoch,summary,originConversationId,materialize=async()=>[]}){return projectLock(root,id,async()=>{
  const state=await readHandoff(root,id);state.originConversationId ||= originConversationId
- const pending=rows.filter(r=>r.source==='plan'&&r.status==='awaiting_acceptance'&&r.reviewMode!=='chief')
+ const pending=rows.filter(r=>r.source==='plan'&&r.status==='awaiting_acceptance'&&r.reviewMode!=='chief'&&r.reviewMode!=='codex')
  const current=new Set(pending.map(row=>row.fingerprint||stepFingerprint(row)))
  for(const r of state.requests)if(!current.has(r.fingerprint)||r.epoch!==epoch)r.superseded=true
  for(const row of pending){

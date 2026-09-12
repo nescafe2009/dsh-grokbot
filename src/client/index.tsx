@@ -1,5 +1,11 @@
+import {characterActivity} from './character-state'
+import {MotionSettings} from './character'
+import {CHARACTER_CSS} from './character-css'
+import {PermissionRules} from './permission-rules'
+import {UX_CSS} from './ux'
+import {ArchiveComputer} from './archive-library'
 import { ModelLibrary } from './model-library'
-import {BotWorkPanel} from './bot-work'
+import {BotWorkPanel,focusBotWork} from './bot-work'
 import {uniqueMessages} from './message-identity'
 import {ApprovalView,APPROVAL_CSS} from './approval-view'
 import {ProjectBoard,BOARD_CSS} from './project-board'
@@ -22,6 +28,7 @@ interface BotInfo {
   pinned: boolean
   section: string
   hidden: boolean
+  motionPhase?: 'active'|'working'
   status: 'idle' | 'working'
   accessMode?: 'full' | 'review'
   currentWorkTitle?: string | null
@@ -41,6 +48,8 @@ interface BotInfo {
 }
 
 interface BotRating {
+  growth?: {latestUrl?:string|null;exp:number;reviews:number;verified:number;latest?:{score:number|null}|null}
+
   level: number
   title: string
   stars?: number
@@ -72,6 +81,7 @@ interface RoutineInfo {
 }
 
 interface ApprovalInfo {
+  ruleCandidate?:{workspace:string;mode:string;label:string}|null
   stage?: 'chief' | 'user'
   botName?: string
   reviewReason?: string
@@ -115,6 +125,7 @@ interface ChatMessage {
 }
 
 interface GrokbotState {
+  stale?:boolean
   accessControl?: {supported:boolean}
   lastTarget?: { kind: string; id: string } | null
   bots: BotInfo[]
@@ -155,34 +166,34 @@ const GROKBOT_CSS = BOARD_CSS + APPROVAL_CSS + `
 .grokbot-sidebar, .grokbot-chat, .grokbot-wizard { font-family: var(--gk-font); color: var(--gk-text); }
 .grokbot-sidebar { display:flex; flex-direction:column; min-height:0; flex:1; background:var(--gk-bg-side); }
 .grokbot-sidebar__top { display:flex; align-items:center; justify-content:flex-end; gap:2px; padding:16px 12px 6px; }
-.grokbot-iconbtn { border:none; background:none; cursor:pointer; color:var(--gk-text-2); font-size:15px; width:30px; height:30px; display:inline-flex; align-items:center; justify-content:center; border-radius:9px; transition:all .16s cubic-bezier(.4,0,.2,1); }
+.grokbot-iconbtn { border:none; background:none; cursor:pointer; color:var(--gk-text-2); font-size:var(--gk-font-body); width:30px; height:30px; display:inline-flex; align-items:center; justify-content:center; border-radius:9px; transition:all .16s cubic-bezier(.4,0,.2,1); }
 .grokbot-iconbtn:hover { color:var(--gk-text); background:rgba(29,29,31,.07); }
 .grokbot-sidebar__search { margin:4px 12px 10px; }
-.grokbot-sidebar__search input { width:100%; box-sizing:border-box; border:none; border-radius:9px; background:rgba(29,29,31,.06); padding:7px 12px; font:inherit; font-size:13px; color:var(--gk-text); outline:none; transition:all .16s; }
+.grokbot-sidebar__search input { width:100%; box-sizing:border-box; border:none; border-radius:9px; background:rgba(29,29,31,.06); padding:7px 12px; font:inherit; font-size:var(--gk-font-label); color:var(--gk-text); outline:none; transition:all .16s; }
 .grokbot-sidebar__search input:focus { background:#fff; box-shadow:0 0 0 3px var(--gk-accent-soft); }
 .grokbot-sidebar__search input::placeholder { color:var(--gk-text-3); }
 .grokbot-sidebar__list { flex:1; overflow-y:auto; padding:0 8px 8px; scrollbar-width:thin; }
 .grokbot-sidebar__list::-webkit-scrollbar { width:4px; }
 .grokbot-sidebar__list::-webkit-scrollbar-thumb { background:rgba(29,29,31,.15); border-radius:4px; }
-.grokbot-sidebar__section { font-size:11px; font-weight:600; color:var(--gk-text-3); margin:12px 8px 4px; letter-spacing:.06em; text-transform:uppercase; }
+.grokbot-sidebar__section { font-size:var(--gk-font-meta); font-weight:600; color:var(--gk-text-3); margin:12px 8px 4px; letter-spacing:.06em; text-transform:uppercase; }
 .grokbot-chatrow { display:flex; align-items:center; gap:10px; width:100%; padding:8px 10px; border:none; border-radius:11px; background:transparent; cursor:pointer; text-align:left; font:inherit; color:inherit; position:relative; transition:background .14s; }
 .grokbot-chatrow:hover { background:rgba(29,29,31,.05); }
 .grokbot-chatrow.active { background:var(--gk-accent-soft); }
 .grokbot-chatrow.active::before { content:""; position:absolute; left:-2px; top:22%; bottom:22%; width:3px; border-radius:3px; background:linear-gradient(180deg,var(--gk-accent-2),var(--gk-accent)); }
 .grokbot-avatar { position:relative; flex:none; }
-.grokbot-avatar__circle { width:36px; height:36px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:16px; color:#fff; box-shadow:inset 0 -1px 2px rgba(0,0,0,.12), var(--gk-shadow-sm); }
+.grokbot-avatar__circle { width:36px; height:36px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:var(--gk-font-body); color:#fff; box-shadow:inset 0 -1px 2px rgba(0,0,0,.12), var(--gk-shadow-sm); }
 .grokbot-avatar__dot { position:absolute; right:-1px; bottom:-1px; width:11px; height:11px; border-radius:50%; background:var(--gk-green); border:2.5px solid var(--gk-bg-side); box-sizing:content-box; }
 .grokbot-avatar__dot.working { background:var(--gk-amber); animation:grokbot-pulse 1.3s ease-in-out infinite; }
 .grokbot-chatrow__main { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; }
 .grokbot-chatrow__line1 { display:flex; align-items:baseline; gap:6px; }
-.grokbot-chatrow__name { font-size:13.5px; font-weight:600; letter-spacing:-.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.grokbot-chatrow__time { margin-left:auto; font-size:10.5px; color:var(--gk-text-3); flex:none; font-variant-numeric:tabular-nums; }
-.grokbot-chatrow__preview { font-size:12px; color:var(--gk-text-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.grokbot-sidebar__computer { display:flex; align-items:center; justify-content:space-between; width:100%; padding:8px 10px; border:none; border-radius:9px; background:transparent; cursor:pointer; font:inherit; font-size:13px; color:var(--gk-text); transition:background .12s; }
+.grokbot-chatrow__name { font-size:var(--gk-font-label); font-weight:600; letter-spacing:-.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.grokbot-chatrow__time { margin-left:auto; font-size:var(--gk-font-meta); color:var(--gk-text-3); flex:none; font-variant-numeric:tabular-nums; }
+.grokbot-chatrow__preview { font-size:var(--gk-font-meta); color:var(--gk-text-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.grokbot-sidebar__computer { display:flex; align-items:center; justify-content:space-between; width:100%; padding:8px 10px; border:none; border-radius:9px; background:transparent; cursor:pointer; font:inherit; font-size:var(--gk-font-label); color:var(--gk-text); transition:background .12s; }
 .grokbot-sidebar__computer:hover { background:rgba(29,29,31,.06); }
 .grokbot-sidebar__computer-status { width:8px; height:8px; border-radius:50%; background:var(--gk-green); }
 .grokbot-sidebar__foot { border-top:1px solid var(--gk-line); padding:10px 14px; display:flex; align-items:center; gap:8px; }
-.gk-ico { display:inline-flex; align-items:center; justify-content:center; width:26px; height:26px; font-size:16px; line-height:1; flex:none; }
+.gk-ico { display:inline-flex; align-items:center; justify-content:center; width:26px; height:26px; font-size:var(--gk-font-body); line-height:1; flex:none; }
 .gk-lbl { flex:1; text-align:left; }
 .gk-foot-ico { width:34px; height:34px; padding:0; display:inline-flex; align-items:center; justify-content:center; }
 /* 窄窗 rail 模式：宿主折叠侧栏列（~79px）时只保留头像/图标列 */
@@ -198,22 +209,22 @@ const GROKBOT_CSS = BOARD_CSS + APPROVAL_CSS + `
 .gk-rail .grokbot-routinemenu { display:none !important; }
 .gk-rail .grokbot-sidebar__computer { padding:6px; font-size:0; }
 .gk-rail .grokbot-sidebar__computer-status { display:none; }
-.grokbot-sidebar__user { display:flex; align-items:center; gap:8px; flex:1; min-width:0; font-size:12.5px; font-weight:600; color:var(--gk-text-2); }
-.grokbot-sidebar__user .uavatar { width:26px; height:26px; border-radius:50%; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:#fff; display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; }
+.grokbot-sidebar__user { display:flex; align-items:center; gap:8px; flex:1; min-width:0; font-size:var(--gk-font-label); font-weight:600; color:var(--gk-text-2); }
+.grokbot-sidebar__user .uavatar { width:26px; height:26px; border-radius:50%; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:#fff; display:flex; align-items:center; justify-content:center; font-size:var(--gk-font-meta); font-weight:700; }
 @keyframes grokbot-pulse { 0%,100% { opacity:1; transform:scale(1) } 50% { opacity:.4; transform:scale(.85) } }
 .grokbot-newmenu { display:flex; flex-direction:column; gap:2px; margin:0 10px 10px; padding:6px; border:1px solid var(--gk-line); border-radius:13px; background:#fff; box-shadow:var(--gk-shadow-md); }
-.grokbot-newmenu__item { display:flex; align-items:center; gap:9px; width:100%; padding:8px 10px; border:none; border-radius:9px; background:transparent; cursor:pointer; font:inherit; font-size:13px; color:var(--gk-text); text-align:left; transition:background .12s; }
+.grokbot-newmenu__item { display:flex; align-items:center; gap:9px; width:100%; padding:8px 10px; border:none; border-radius:9px; background:transparent; cursor:pointer; font:inherit; font-size:var(--gk-font-label); color:var(--gk-text); text-align:left; transition:background .12s; }
 .grokbot-newmenu__item:hover { background:var(--gk-bg-soft); }
 .grokbot-newmenu__item:disabled { opacity:.5; }
-.grokbot-newmenu__icon { width:24px; height:24px; border-radius:8px; display:inline-flex; align-items:center; justify-content:center; font-size:14px; flex:none; background:var(--gk-bg-soft); }
+.grokbot-newmenu__icon { width:24px; height:24px; border-radius:8px; display:inline-flex; align-items:center; justify-content:center; font-size:var(--gk-font-label); flex:none; background:var(--gk-bg-soft); }
 .grokbot-newmenu__divider { height:1px; background:var(--gk-line); margin:4px 6px; }
 .grokbot-form { display:flex; flex-direction:column; gap:8px; padding:12px; margin:0 10px 8px; border:1px solid var(--gk-line); border-radius:13px; background:#fff; box-shadow:var(--gk-shadow-sm); }
 .grokbot-form__row { display:flex; gap:6px; }
-.grokbot-form input, .grokbot-form textarea, .grokbot-form select { flex:1; min-width:0; border:1px solid var(--gk-line); border-radius:9px; padding:7px 10px; font:inherit; font-size:13px; background:var(--gk-bg); color:var(--gk-text); transition:border-color .14s, box-shadow .14s; }
+.grokbot-form input, .grokbot-form textarea, .grokbot-form select { flex:1; min-width:0; border:1px solid var(--gk-line); border-radius:9px; padding:7px 10px; font:inherit; font-size:var(--gk-font-label); background:var(--gk-bg); color:var(--gk-text); transition:border-color .14s, box-shadow .14s; }
 .grokbot-form input:focus, .grokbot-form textarea:focus, .grokbot-form select:focus { outline:none; border-color:var(--gk-accent-2); box-shadow:0 0 0 3px var(--gk-accent-soft); }
 .grokbot-form textarea { resize:vertical; min-height:52px; }
 .grokbot-form__actions { display:flex; gap:8px; justify-content:flex-end; }
-.grokbot-form__actions button { border:none; border-radius:9px; padding:6px 16px; font-size:12.5px; cursor:pointer; font-weight:600; transition:all .14s; }
+.grokbot-form__actions button { border:none; border-radius:9px; padding:6px 16px; font-size:var(--gk-font-label); cursor:pointer; font-weight:600; transition:all .14s; }
 .grokbot-form__submit { background:linear-gradient(135deg,var(--gk-accent-2),var(--gk-accent)); color:#fff; box-shadow:0 2px 8px rgba(37,99,235,.28); }
 .grokbot-form__submit:hover { filter:brightness(1.06); box-shadow:0 4px 12px rgba(37,99,235,.36); }
 .grokbot-form__submit:disabled { opacity:.5; box-shadow:none; }
@@ -221,125 +232,125 @@ const GROKBOT_CSS = BOARD_CSS + APPROVAL_CSS + `
 .grokbot-form__cancel:hover { background:rgba(29,29,31,.10); }
 .grokbot-chat { width:100%; height:100%; min-height:0; overflow:hidden; display:flex; flex-direction:column; background:var(--gk-bg); }
 .grokbot-chat__head { display:flex; align-items:center; gap:11px; padding:13px 20px; border-bottom:1px solid var(--gk-line); background:rgba(255,255,255,.85); backdrop-filter:blur(12px); }
-.grokbot-chat__avatar { width:38px; height:38px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:18px; color:#fff; box-shadow:inset 0 -1px 2px rgba(0,0,0,.12), var(--gk-shadow-sm); }
+.grokbot-chat__avatar { width:38px; height:38px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:var(--gk-font-title); color:#fff; box-shadow:inset 0 -1px 2px rgba(0,0,0,.12), var(--gk-shadow-sm); }
 .grokbot-chat__title { flex:1; display:flex; flex-direction:column; min-width:0; cursor:pointer; }
-.grokbot-chat__name { font-weight:650; font-size:15px; letter-spacing:-.015em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.grokbot-chat__meta { font-size:12px; color:var(--gk-text-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:1px; }
-.grokbot-chat__stop { border:1px solid rgba(239,68,68,.35); background:rgba(239,68,68,.08); color:var(--gk-red); border-radius:9px; padding:5px 14px; font-size:12px; cursor:pointer; font-weight:600; transition:all .14s; }
+.grokbot-chat__name { font-weight:650; font-size:var(--gk-font-body); letter-spacing:-.015em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.grokbot-chat__meta { font-size:var(--gk-font-meta); color:var(--gk-text-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:1px; }
+.grokbot-chat__stop { border:1px solid rgba(239,68,68,.35); background:rgba(239,68,68,.08); color:var(--gk-red); border-radius:9px; padding:5px 14px; font-size:var(--gk-font-meta); cursor:pointer; font-weight:600; transition:all .14s; }
 .grokbot-chat__stop:hover { background:rgba(239,68,68,.16); }
-.grokbot-chat__close { border:none; background:none; cursor:pointer; color:var(--gk-text-2); font-size:15px; width:30px; height:30px; display:inline-flex; align-items:center; justify-content:center; border-radius:9px; transition:all .14s; }
+.grokbot-chat__close { border:none; background:none; cursor:pointer; color:var(--gk-text-2); font-size:var(--gk-font-body); width:30px; height:30px; display:inline-flex; align-items:center; justify-content:center; border-radius:9px; transition:all .14s; }
 .grokbot-chat__close:hover { color:var(--gk-text); background:rgba(29,29,31,.07); }
 .grokbot-body { position:relative; flex:1; display:flex; min-height:0; }
 .grokbot-log { flex:1; min-width:0; min-height:0; overflow-y:auto; padding:26px 20px; display:flex; flex-direction:column; gap:13px; scrollbar-width:thin; }
-.grokbot-jump-latest { position:absolute; bottom:14px; left:50%; transform:translateX(-50%); z-index:3; border:1px solid var(--gk-line); border-radius:99px; padding:10px 16px; background:var(--gk-bg); color:var(--gk-text); box-shadow:0 3px 14px #0002; font:inherit; font-size:12px; cursor:pointer; }
+.grokbot-jump-latest { position:absolute; bottom:14px; left:50%; transform:translateX(-50%); z-index:3; border:1px solid var(--gk-line); border-radius:99px; padding:10px 16px; background:var(--gk-bg); color:var(--gk-text); box-shadow:0 3px 14px #0002; font:inherit; font-size:var(--gk-font-meta); cursor:pointer; }
 .grokbot-log > * { flex-shrink:0; }
 .grokbot-log::-webkit-scrollbar { width:5px; }
 .grokbot-log::-webkit-scrollbar-thumb { background:rgba(29,29,31,.15); border-radius:5px; }
 .grokbot-msg { max-width:72%; }
 .grokbot-msg.approval { align-self:flex-start; border:1px solid rgba(245,158,11,.4); background:linear-gradient(180deg,#fffbeb,#fff8e6); border-radius:14px; padding:11px 15px; box-shadow:var(--gk-shadow-sm); }
-.grokbot-approval__title { font-size:13px; font-weight:650; margin-bottom:4px; }
-.grokbot-approval__reason { font-size:12.5px; color:var(--gk-text-2); margin-bottom:10px; white-space:pre-wrap; }
+.grokbot-approval__title { font-size:var(--gk-font-label); font-weight:650; margin-bottom:4px; }
+.grokbot-approval__reason { font-size:var(--gk-font-label); color:var(--gk-text-2); margin-bottom:10px; white-space:pre-wrap; }
 .grokbot-approval__actions { display:flex; gap:8px; }
-.grokbot-approval__actions button { border:none; border-radius:9px; padding:6px 18px; font-size:12.5px; font-weight:600; cursor:pointer; transition:all .14s; }
+.grokbot-approval__actions button { border:none; border-radius:9px; padding:6px 18px; font-size:var(--gk-font-label); font-weight:600; cursor:pointer; transition:all .14s; }
 .grokbot-approval__ok { background:linear-gradient(135deg,#34d399,#22c55e); color:#fff; box-shadow:0 2px 8px rgba(34,197,94,.3); }
 .grokbot-approval__ok:hover { filter:brightness(1.05); }
 .grokbot-approval__no { background:var(--gk-bg-soft); color:var(--gk-text); }
-.grokbot-empty { margin:auto; text-align:center; color:var(--gk-text-3); font-size:13px; line-height:1.7; }
+.grokbot-empty { margin:auto; text-align:center; color:var(--gk-text-3); font-size:var(--gk-font-label); line-height:1.7; }
 .grokbot-details { width:272px; flex:none; border-left:1px solid var(--gk-line); overflow-y:auto; padding:16px 16px 24px; display:flex; flex-direction:column; gap:18px; background:#fafafc; }
 .grokbot-rating { border:1px solid var(--gk-line); border-radius:12px; padding:11px 13px; background:#fff; }
 .grokbot-rating__head { display:flex; align-items:center; gap:8px; }
-.grokbot-rating__level { background:linear-gradient(135deg,var(--gk-accent-2),var(--gk-accent)); color:#fff; font-size:11px; font-weight:700; border-radius:7px; padding:2px 8px; }
-.grokbot-rating__title { font-size:13px; font-weight:650; }
-.grokbot-rating__stars { margin-left:auto; color:#f5a623; font-size:12px; letter-spacing:1px; }
+.grokbot-rating__level { background:linear-gradient(135deg,var(--gk-accent-2),var(--gk-accent)); color:#fff; font-size:var(--gk-font-meta); font-weight:700; border-radius:7px; padding:2px 8px; }
+.grokbot-rating__title { font-size:var(--gk-font-label); font-weight:650; }
+.grokbot-rating__stars { margin-left:auto; color:#f5a623; font-size:var(--gk-font-meta); letter-spacing:1px; }
 .grokbot-rating__bar { height:6px; border-radius:3px; background:var(--gk-bg-soft); margin:9px 0 6px; overflow:hidden; }
 .grokbot-rating__fill { height:100%; border-radius:3px; background:linear-gradient(90deg,var(--gk-accent-2),var(--gk-accent)); transition:width .3s; }
-.grokbot-rating__nums { font-size:11px; color:var(--gk-text-3); font-variant-numeric:tabular-nums; }
+.grokbot-rating__nums { font-size:var(--gk-font-meta); color:var(--gk-text-3); font-variant-numeric:tabular-nums; }
 .grokbot-fb { margin-left:8px; white-space:nowrap; }
-.grokbot-fb button { border:none; background:none; cursor:pointer; font-size:11px; opacity:.4; padding:0 2px; transition:opacity .12s, transform .12s; }
+.grokbot-fb button { border:none; background:none; cursor:pointer; font-size:var(--gk-font-meta); opacity:.4; padding:0 2px; transition:opacity .12s, transform .12s; }
 .grokbot-fb button:hover { opacity:1; transform:scale(1.2); }
-.grokbot-details__title { font-size:11px; font-weight:700; color:var(--gk-text-3); letter-spacing:.07em; text-transform:uppercase; }
-.grokbot-member { display:flex; align-items:center; gap:10px; padding:7px 6px; font-size:13px; font-weight:500; border-radius:9px; }
+.grokbot-details__title { font-size:var(--gk-font-meta); font-weight:700; color:var(--gk-text-3); letter-spacing:.07em; text-transform:uppercase; }
+.grokbot-member { display:flex; align-items:center; gap:10px; padding:7px 6px; font-size:var(--gk-font-label); font-weight:500; border-radius:9px; }
 .grokbot-member:hover { background:rgba(29,29,31,.04); }
-.grokbot-member .mavatar { width:30px; height:30px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:14px; color:#fff; box-shadow:var(--gk-shadow-sm); }
-.grokbot-details__hint { font-size:11.5px; color:var(--gk-text-3); padding:4px 6px 0; line-height:1.5; }
-.grokbot-routine { border:1px solid var(--gk-line); border-radius:11px; padding:9px 11px; font-size:12px; background:#fff; }
+.grokbot-member .mavatar { width:30px; height:30px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:var(--gk-font-label); color:#fff; box-shadow:var(--gk-shadow-sm); }
+.grokbot-details__hint { font-size:var(--gk-font-meta); color:var(--gk-text-3); padding:4px 6px 0; line-height:1.5; }
+.grokbot-routine { border:1px solid var(--gk-line); border-radius:11px; padding:9px 11px; font-size:var(--gk-font-meta); background:#fff; }
 .grokbot-routine__prompt { color:var(--gk-text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.grokbot-routine__sched { font-size:11px; color:var(--gk-text-3); margin-top:3px; }
-.grokbot-details__new { border:1px dashed rgba(37,99,235,.4); border-radius:11px; background:rgba(37,99,235,.04); color:var(--gk-accent); padding:8px; font-size:12.5px; font-weight:600; cursor:pointer; width:100%; transition:all .14s; }
+.grokbot-routine__sched { font-size:var(--gk-font-meta); color:var(--gk-text-3); margin-top:3px; }
+.grokbot-details__new { border:1px dashed rgba(37,99,235,.4); border-radius:11px; background:rgba(37,99,235,.04); color:var(--gk-accent); padding:8px; font-size:var(--gk-font-label); font-weight:600; cursor:pointer; width:100%; transition:all .14s; }
 .grokbot-details__new:hover { background:var(--gk-accent-soft); border-color:var(--gk-accent-2); }
 .gk-modelbar { display:flex; align-items:center; gap:8px; padding:5px 20px; border-bottom:1px solid var(--gk-line); background:#fafafc; font-family:ui-monospace,"SF Mono",Menlo,monospace; }
-.gk-modelbar__label { font-size:9.5px; font-weight:700; color:var(--gk-text-3); letter-spacing:.1em; }
-.gk-modelbar__select { border:1px solid var(--gk-line); border-radius:6px; padding:2px 8px; font:inherit; font-size:11px; background:#fff; color:var(--gk-text); outline:none; cursor:pointer; max-width:280px; }
+.gk-modelbar__label { font-size:var(--gk-font-meta); font-weight:700; color:var(--gk-text-3); letter-spacing:.1em; }
+.gk-modelbar__select { border:1px solid var(--gk-line); border-radius:6px; padding:2px 8px; font:inherit; font-size:var(--gk-font-meta); background:#fff; color:var(--gk-text); outline:none; cursor:pointer; max-width:280px; }
 .gk-modelbar__select:focus { border-color:var(--gk-accent-2); }
-.gk-modelbar__custom { font-size:9.5px; color:var(--gk-accent); font-weight:700; }
-.gk-modelbar__default { font-size:9.5px; color:var(--gk-text-3); }
+.gk-modelbar__custom { font-size:var(--gk-font-meta); color:var(--gk-accent); font-weight:700; }
+.gk-modelbar__default { font-size:var(--gk-font-meta); color:var(--gk-text-3); }
 .grokbot-md__p { white-space:pre-wrap; }
 .grokbot-md__h1, .grokbot-md__h2, .grokbot-md__h3, .grokbot-md__h4 { font-weight:700; margin:8px 0 3px; letter-spacing:-.01em; }
-.grokbot-md__h1 { font-size:17px; } .grokbot-md__h2 { font-size:15.5px; } .grokbot-md__h3 { font-size:14.5px; } .grokbot-md__h4 { font-size:13.5px; }
+.grokbot-md__h1 { font-size:var(--gk-font-title); } .grokbot-md__h2 { font-size:var(--gk-font-body); } .grokbot-md__h3 { font-size:var(--gk-font-body); } .grokbot-md__h4 { font-size:var(--gk-font-label); }
 .grokbot-md__ul { margin:3px 0; padding-left:19px; }
 .grokbot-md__ul li { margin:2px 0; }
 .grokbot-md__quote { border-left:3px solid var(--gk-line); margin:5px 0; padding:2px 11px; color:var(--gk-text-2); }
 .grokbot-md__hr { border:none; border-top:1px solid var(--gk-line); margin:9px 0; }
 .grokbot-md__spacer { height:6px; }
-.grokbot-md__icode { background:rgba(29,29,31,.07); border-radius:6px; padding:1.5px 6px; font-size:12.5px; font-family:ui-monospace,"SF Mono",Menlo,monospace; }
+.grokbot-md__icode { background:rgba(29,29,31,.07); border-radius:6px; padding:1.5px 6px; font-size:var(--gk-font-label); font-family:ui-monospace,"SF Mono",Menlo,monospace; }
 .grokbot-md__link { color:var(--gk-accent); text-decoration:none; font-weight:500; }
 .grokbot-md__link:hover { text-decoration:underline; }
 .grokbot-code { align-self:stretch; max-width:100%; border:1px solid var(--gk-line); border-radius:13px; overflow:hidden; margin:5px 0; background:#fafafc; box-shadow:var(--gk-shadow-sm); }
-.grokbot-code__bar { display:flex; align-items:center; justify-content:space-between; padding:5px 12px; border-bottom:1px solid var(--gk-line); font-size:10.5px; }
+.grokbot-code__bar { display:flex; align-items:center; justify-content:space-between; padding:5px 12px; border-bottom:1px solid var(--gk-line); font-size:var(--gk-font-meta); }
 .grokbot-code__lang { color:var(--gk-text-3); text-transform:uppercase; letter-spacing:.07em; font-weight:700; font-family:ui-monospace,Menlo,monospace; }
 .grokbot-code__actions { display:flex; gap:8px; }
-.grokbot-code__actions button { border:none; background:none; cursor:pointer; font-size:11px; color:var(--gk-accent); font-weight:600; padding:2px 4px; }
+.grokbot-code__actions button { border:none; background:none; cursor:pointer; font-size:var(--gk-font-meta); color:var(--gk-accent); font-weight:600; padding:2px 4px; }
 .grokbot-code__actions button:hover { text-decoration:underline; }
-.grokbot-code__pre { margin:0; padding:11px 14px; overflow-x:auto; font-family:ui-monospace,"SF Mono",Menlo,monospace; font-size:12.5px; line-height:1.55; white-space:pre; color:var(--gk-text); }
+.grokbot-code__pre { margin:0; padding:11px 14px; overflow-x:auto; font-family:ui-monospace,"SF Mono",Menlo,monospace; font-size:var(--gk-font-label); line-height:1.55; white-space:pre; color:var(--gk-text); }
 .grokbot-code__pre.collapsed { display:none; }
-.grokbot-code__peek { border:none; background:none; cursor:pointer; text-align:left; padding:9px 14px; font-family:ui-monospace,Menlo,monospace; font-size:11.5px; color:var(--gk-text-3); width:100%; }
+.grokbot-code__peek { border:none; background:none; cursor:pointer; text-align:left; padding:9px 14px; font-family:ui-monospace,Menlo,monospace; font-size:var(--gk-font-meta); color:var(--gk-text-3); width:100%; }
 .grokbot-chips { display:flex; flex-wrap:wrap; gap:7px; margin-top:9px; }
-.grokbot-chips__item { border:1px solid rgba(37,99,235,.35); background:var(--gk-accent-soft); color:var(--gk-accent); border-radius:16px; padding:5px 16px; font-size:12.5px; cursor:pointer; font-weight:600; transition:all .14s; }
+.grokbot-chips__item { border:1px solid rgba(37,99,235,.35); background:var(--gk-accent-soft); color:var(--gk-accent); border-radius:16px; padding:5px 16px; font-size:var(--gk-font-label); cursor:pointer; font-weight:600; transition:all .14s; }
 .grokbot-chips__item:hover { background:rgba(37,99,235,.18); transform:translateY(-1px); }
 .grokbot-chips__item:disabled { opacity:.45; cursor:default; transform:none; }
 .grokbot-blank { flex:1; }
 .grokbot-home { flex:1; overflow-y:auto; display:flex; flex-direction:column; align-items:center; gap:34px; padding:72px 32px; background:radial-gradient(1200px 500px at 50% 20%, #f8f9fc 0%, var(--gk-bg) 60%); }
 .grokbot-home__hero { text-align:center; display:flex; flex-direction:column; align-items:center; gap:10px; }
-.grokbot-home__title { font-size:26px; font-weight:750; letter-spacing:-.02em; }
-.grokbot-home__sub { font-size:13.5px; color:var(--gk-text-2); }
-.grokbot-home__new { margin-top:10px; border:none; border-radius:99px; padding:11px 26px; font:inherit; font-size:14px; font-weight:650; cursor:pointer; background:#111; color:#fff; transition:transform .14s, filter .14s; }
+.grokbot-home__title { font-size:var(--gk-font-display); font-weight:750; letter-spacing:-.02em; }
+.grokbot-home__sub { font-size:var(--gk-font-label); color:var(--gk-text-2); }
+.grokbot-home__new { margin-top:10px; border:none; border-radius:99px; padding:11px 26px; font:inherit; font-size:var(--gk-font-label); font-weight:650; cursor:pointer; background:#111; color:#fff; transition:transform .14s, filter .14s; }
 .grokbot-home__new:hover { transform:translateY(-1px); filter:brightness(1.15); }
 .grokbot-home__grid { display:flex; flex-wrap:wrap; gap:14px; justify-content:center; max-width:720px; }
 .grokbot-home__card { width:158px; display:flex; flex-direction:column; align-items:center; gap:6px; padding:20px 12px 14px; border:1px solid var(--gk-line); border-radius:16px; background:#fff; cursor:pointer; font:inherit; color:inherit; transition:all .16s cubic-bezier(.4,0,.2,1); box-shadow:var(--gk-shadow-sm); }
 .grokbot-home__card:hover { border-color:rgba(29,29,31,.22); transform:translateY(-2px); box-shadow:0 8px 22px rgba(29,29,31,.10); }
-.grokbot-home__name { font-size:13.5px; font-weight:650; }
-.grokbot-home__desc { font-size:11px; color:var(--gk-text-3); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:130px; }
-.grokbot-creating { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; font-size:13.5px; color:var(--gk-text-2); font-weight:500; }
+.grokbot-home__name { font-size:var(--gk-font-label); font-weight:650; }
+.grokbot-home__desc { font-size:var(--gk-font-meta); color:var(--gk-text-3); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:130px; }
+.grokbot-creating { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; font-size:var(--gk-font-label); color:var(--gk-text-2); font-weight:500; }
 .grokbot-creating__spinner { width:28px; height:28px; border-radius:50%; border:3px solid var(--gk-accent-soft); border-top-color:var(--gk-accent); animation:grokbot-spin .75s linear infinite; }
 @keyframes grokbot-spin { to { transform:rotate(360deg) } }
 .grokbot-wizard { flex:1; overflow-y:auto; display:flex; flex-direction:column; align-items:center; gap:22px; padding:52px 32px; font-family:var(--gk-font); color:var(--gk-text); background:radial-gradient(900px 380px at 50% 12%, #f6f8ff 0%, #fff 55%); }
-.grokbot-wizard__steps { display:flex; gap:16px; font-size:12px; color:var(--gk-text-3); font-weight:600; letter-spacing:.02em; }
+.grokbot-wizard__steps { display:flex; gap:16px; font-size:var(--gk-font-meta); color:var(--gk-text-3); font-weight:600; letter-spacing:.02em; }
 .grokbot-wizard__steps .on { color:var(--gk-accent); font-weight:700; }
 .grokbot-wizard__steps .ok { color:var(--gk-text-2); }
 .grokbot-wizard__steps .ok::after { content:" ✓"; color:var(--gk-green); font-weight:700; }
-.grokbot-wizard__title { font-size:22px; font-weight:750; letter-spacing:-.02em; }
+.grokbot-wizard__title { font-size:var(--gk-font-title); font-weight:750; letter-spacing:-.02em; }
 .grokbot-wizard__roles { display:flex; flex-wrap:wrap; gap:13px; justify-content:center; max-width:660px; }
 .grokbot-role { width:152px; display:flex; flex-direction:column; align-items:center; gap:7px; padding:20px 10px 15px; border:1px solid var(--gk-line); border-radius:16px; background:#fff; cursor:pointer; font:inherit; color:inherit; transition:all .18s cubic-bezier(.4,0,.2,1); box-shadow:var(--gk-shadow-sm); }
 .grokbot-role:hover { border-color:var(--gk-accent-2); transform:translateY(-3px); box-shadow:0 10px 28px rgba(37,99,235,.16); }
 .grokbot-role:disabled { opacity:.5; cursor:default; transform:none; }
 .grokbot-role__avatar { width:48px; height:48px; border-radius:16px; display:flex; align-items:center; justify-content:center; box-shadow:var(--gk-shadow-sm); }
 .grokbot-role__avatar svg { width:58%; height:58%; }
-.grokbot-role__name { font-size:14.5px; font-weight:700; letter-spacing:-.01em; }
-.grokbot-role__desc { font-size:11.5px; color:var(--gk-text-3); }
+.grokbot-role__name { font-size:var(--gk-font-body); font-weight:700; letter-spacing:-.01em; }
+.grokbot-role__desc { font-size:var(--gk-font-meta); color:var(--gk-text-3); }
 .grokbot-wizard__names { display:flex; gap:9px; flex-wrap:wrap; justify-content:center; }
 .grokbot-wizard__custom { display:flex; gap:8px; width:min(380px,90%); }
-.grokbot-wizard__custom input { flex:1; min-width:0; border:1px solid var(--gk-line); border-radius:11px; padding:10px 14px; font:inherit; font-size:13.5px; background:#fff; color:var(--gk-text); outline:none; transition:all .16s; }
+.grokbot-wizard__custom input { flex:1; min-width:0; border:1px solid var(--gk-line); border-radius:11px; padding:10px 14px; font:inherit; font-size:var(--gk-font-label); background:#fff; color:var(--gk-text); outline:none; transition:all .16s; }
 .grokbot-wizard__custom input:focus { border-color:var(--gk-accent-2); box-shadow:0 0 0 4px var(--gk-accent-soft); }
-.grokbot-wizard__skip { border:none; background:none; color:var(--gk-text-3); font-size:12.5px; cursor:pointer; padding:4px 10px; transition:color .14s; }
+.grokbot-wizard__skip { border:none; background:none; color:var(--gk-text-3); font-size:var(--gk-font-label); cursor:pointer; padding:4px 10px; transition:color .14s; }
 .grokbot-wizard__skip:hover { color:var(--gk-accent); }
-.grokbot-wizard__hint { font-size:12.5px; color:var(--gk-text-3); }
+.grokbot-wizard__hint { font-size:var(--gk-font-label); color:var(--gk-text-3); }
 `
 
 
 
 
 
-let openTarget: { kind: 'conversation' | 'computer' | 'routines' | 'settings'; id: string } | null = null
+let openTarget: { kind: 'conversation' | 'computer' | 'routines' | 'settings' | 'permissions'; id: string } | null = null
 let creatingUi = false
 let nativeSidebarVisible = false
 const listeners = new Set<() => void>()
@@ -410,7 +421,7 @@ function toggleNativeSidebar(): void {
   notify()
 }
 
-function useOpenTarget(): { kind: 'conversation' | 'computer' | 'routines' | 'settings'; id: string } | null {
+function useOpenTarget(): { kind: 'conversation' | 'computer' | 'routines' | 'settings' | 'permissions'; id: string } | null {
   const [, force] = useState(0)
   useEffect(() => {
     const listener = (): void => force((n) => n + 1)
@@ -481,15 +492,17 @@ let lastKnownState: GrokbotState | null = null
 function useGrokbotState(): GrokbotState | null {
   const [state, setState] = useState<GrokbotState | null>(null)
   useEffect(() => {
-    let alive = true
+    let alive = true, inFlight=false
     const tick = (): void => {
+      if(inFlight)return
+      inFlight=true
       api('/state').then((next) => {
         if (alive) {
           const s = next as GrokbotState
           setState(s)
           lastKnownState = s
         }
-      }).catch(() => undefined)
+      }).catch(() => {if(alive){setState(previous=>previous?{...previous,stale:true}:null);if(lastKnownState)lastKnownState={...lastKnownState,stale:true}}}).finally(()=>{inFlight=false})
     }
     tick()
     refreshState = tick
@@ -569,11 +582,13 @@ export function ModelSettingsView({accessSupported=false}:{accessSupported?:bool
       {saved ? <p role="status">默认模型已保存，下次对话或任务生效。</p> : null}
     </div>} />
     {error ? <p role="alert">{error} <button onClick={()=>void load()}>重新加载</button></p> : null}
+    <MotionSettings/>
+    <button className="grokbot-home__textlink" onClick={()=>{openTarget={kind:'permissions',id:'permissions'};notify()}}>授权规则 →</button>
     {accessSupported?<AccessSettings/>:null}
   </section>
 }
 
-function BotForm(props: {
+export function BotForm(props: {
   initial?: BotInfo | null
   onCancel: () => void
   onSaved: (bot: BotInfo) => void
@@ -583,10 +598,19 @@ function BotForm(props: {
   const [name, setName] = useState(initial?.name ?? '')
   const [title, setTitle] = useState(initial?.title ?? '')
   const [persona, setPersona] = useState('')
+  const [profileLoaded,setProfileLoaded]=useState(!initial)
+  const [roleTemplate,setRoleTemplate]=useState(initial?.roleTemplate||'')
+  const [roleOptions,setRoleOptions]=useState<{id:string;title:string}[]>([])
+  useEffect(()=>{
+    let alive=true
+    void api('/bot-templates').then(r=>{if(alive)setRoleOptions(Array.isArray(r)?r:r.templates||[])}).catch(()=>{})
+    if(initial)void api(`/bots/${encodeURIComponent(initial.id)}`).then(r=>{if(alive){setPersona(r.bot.persona||'');setProfileLoaded(true)}}).catch(()=>{if(alive)setError('资料读取失败，请关闭后重试；未保存任何修改')})
+    return()=>{alive=false}
+  },[initial?.id])
   const [advanced, setAdvanced] = useState(false)
   const [providers, setProviders] = useState<CatalogProvider[]>([])
-  const [providerId, setProviderId] = useState('')
-  const [modelId, setModelId] = useState('')
+  const [providerId, setProviderId] = useState(initial?.model?.provider ?? '')
+  const [modelId, setModelId] = useState(initial?.model?.model ?? '')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
 
@@ -606,7 +630,9 @@ function BotForm(props: {
         avatar: avatar.trim() || '🤖',
         title: title.trim(),
       }
-      if (persona.trim()) payload.persona = persona.trim()
+      if(profileLoaded)payload.persona=persona.trim()
+      payload.roleTemplate=roleTemplate||null
+      if (providerId && !modelId) { setError('请选择模型，或选择跟随团队默认'); setBusy(false); return }
       if (providerId && modelId) payload.model = { provider: providerId, model: modelId }
       else if (initial && !providerId) payload.model = null
       const outcome = initial
@@ -618,16 +644,22 @@ function BotForm(props: {
     } finally {
       setBusy(false)
     }
-  }, [avatar, name, title, persona, providerId, modelId, busy, initial, props])
+  }, [avatar, name, title, persona, providerId, modelId, busy, initial, props,profileLoaded,roleTemplate])
 
   return (
-    <div className="grokbot-form">
+    <div className="grokbot-form gk-profile-form" role="region" aria-label="成员资料">
+      <header><strong>{initial ? '编辑成员资料' : '创建成员'}</strong><p>名称和职位决定身份，补充职责用于约定工作方式。</p></header>
+      <label>头像与名称</label>
       <div className="grokbot-form__row">
         <input style={{ maxWidth: 52, textAlign: 'center' }} value={avatar} onChange={(e) => setAvatar(e.target.value)} aria-label="头像" />
         <input value={name} onChange={(e) => setName(e.target.value)} placeholder="名称（必填）" aria-label="名称" />
       </div>
+      <label>职位</label>
       <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="头衔，如：检索与情报专家" aria-label="头衔" />
-      <textarea value={persona} onChange={(e) => setPersona(e.target.value)} placeholder={initial ? '补充职责/规则（留空不改）' : '职责与持久规则：它负责什么、怎么做事、安全边界'} aria-label="职责" />
+      <label>专业角色模板</label>
+      <select aria-label="专业角色模板" value={roleTemplate} disabled={initial?.id==='chief'} onChange={e=>setRoleTemplate(e.target.value)}><option value="">按职位识别</option>{roleOptions.map(r=><option key={r.id} value={r.id}>{r.title}</option>)}</select>
+      <label>补充职责</label>
+      <textarea value={persona} onChange={(e) => setPersona(e.target.value)} placeholder={initial ? '补充预置职责与工作偏好；清空后恢复预置职责' : '职责与持久规则：它负责什么、怎么做事、安全边界'} aria-label="职责" />
       <button type="button" className="grokbot-form__cancel" style={{ alignSelf: 'flex-start' }} onClick={() => setAdvanced((v) => !v)}>{advanced ? '收起高级设置' : '高级设置（模型）'}</button>
       {advanced
         ? (
@@ -645,10 +677,10 @@ function BotForm(props: {
           </div>
         )
         : null}
-      {error ? <span style={{ color: '#cf1322', fontSize: 11.5 }}>{error}</span> : null}
+      {error ? <span style={{ color: '#cf1322', fontSize: 12 }}>{error}</span> : null}
       <div className="grokbot-form__actions">
         <button type="button" className="grokbot-form__cancel" onClick={props.onCancel}>取消</button>
-        <button type="button" className="grokbot-form__submit" disabled={busy} onClick={() => void submit()}>{initial ? '保存' : '创建'}</button>
+        <button type="button" className="grokbot-form__submit" disabled={busy||!profileLoaded} onClick={() => void submit()}>{busy?'正在保存…':initial ? '保存' : '创建'}</button>
       </div>
     </div>
   )
@@ -690,13 +722,13 @@ function RoomForm(props: {
     <div className="grokbot-form">
       <input value={name} onChange={(e) => setName(e.target.value)} placeholder="群聊名称（可空）" aria-label="群聊名称" />
       {props.bots.map((bot) => (
-        <label key={bot.id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5, cursor: 'pointer' }}>
+        <label key={bot.id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 14, cursor: 'pointer' }}>
           <input type="checkbox" style={{ width: 'auto', flex: 'none' }} checked={selected.includes(bot.id)} onChange={() => toggle(bot.id)} />
           <AvatarView seed={bot.id} name={bot.name} glyph={bot.roleTemplate || bot.avatar} size={17} />
           <span>{bot.name}</span>
         </label>
       ))}
-      {error ? <span style={{ color: '#cf1322', fontSize: 11.5 }}>{error}</span> : null}
+      {error ? <span style={{ color: '#cf1322', fontSize: 12 }}>{error}</span> : null}
       <div className="grokbot-form__actions">
         <button type="button" className="grokbot-form__cancel" onClick={props.onCancel}>取消</button>
         <button type="button" className="grokbot-form__submit" disabled={busy} onClick={() => void submit()}>创建群聊</button>
@@ -729,7 +761,7 @@ function RoutineForm(props: { botId: string; onCancel: () => void; onSaved: () =
     <div className="grokbot-form">
       <input value={every} onChange={(e) => setEvery(e.target.value)} placeholder="间隔（分钟）" aria-label="间隔分钟" />
       <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="每次运行做什么？" aria-label="任务" />
-      {error ? <span style={{ color: '#cf1322', fontSize: 11.5 }}>{error}</span> : null}
+      {error ? <span style={{ color: '#cf1322', fontSize: 12 }}>{error}</span> : null}
       <div className="grokbot-form__actions">
         <button type="button" className="grokbot-form__cancel" onClick={props.onCancel}>取消</button>
         <button type="button" className="grokbot-form__submit" disabled={busy} onClick={() => void submit()}>创建例行任务</button>
@@ -860,7 +892,7 @@ export function GrokbotSidebarCrew(): ReactNode {
 
   return (
     <div className="grokbot-sidebar" ref={rootRef}>
-      <div className="grokbot-sidebar__top">
+      <div className="grokbot-sidebar__top"><button className="grokbot-brand" onClick={closeTarget} aria-label="DeepSeekBot 首页">DeepSeekBot</button>
         <button type="button" className="grokbot-iconbtn" title="新建：召唤专家 / 拉群聊 / 与 Bot 单聊" onClick={() => setMenuOpen((v) => !v)}>＋</button>
         <button type="button" className="grokbot-iconbtn" title={nativeVisible ? '隐藏原始列表' : '显示原始工作区/会话列表'} onClick={() => toggleNativeSidebar()}>⇆</button>
       </div>
@@ -878,7 +910,7 @@ export function GrokbotSidebarCrew(): ReactNode {
                 <span className="grokbot-newmenu__icon">➕</span>
                 <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
                   <span style={{ fontWeight: 600 }}>{creatingBot ? '正在创建…' : '创建新 Bot'}</span>
-                  <span style={{ fontSize: 11, opacity: .55 }}>立即开聊，在对话里选角色和名字</span>
+                  <span style={{ fontSize: 12, opacity: .55 }}>立即开聊，在对话里选角色和名字</span>
                 </span>
               </button>
               <button type="button" className="grokbot-newmenu__item" onClick={() => { setMenuOpen(false); setGrouping(true) }}>
@@ -916,6 +948,8 @@ export function GrokbotSidebarCrew(): ReactNode {
               preview={rowPreview(conversation)}
               time={timeLabel(conversation.lastAt)}
               working={working}
+              activity={bot?characterActivity(bot,state):undefined}
+              specialty={bot?.title}
               level={!isGroup ? bot?.rating?.level : undefined}
               active={target?.id === conversation.id}
               onClick={() => openConversation(conversation.id)}
@@ -960,10 +994,10 @@ export function RoutinesView({ bots }: { bots: BotInfo[] }): ReactNode {
   }, [revision])
   return <section style={{ padding: '28px 32px', overflowY: 'auto', height: '100%', boxSizing: 'border-box' }} aria-label="例行任务">
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-      <h1 style={{ fontSize: 20, margin: 0 }}>例行任务</h1>
-      <button type="button" style={{ border: '1px solid var(--gk-line)', background: 'transparent', color: 'inherit', borderRadius: 8, padding: '7px 14px', font: 'inherit', fontSize: 13, cursor: 'pointer' }} onClick={() => setRevision((v) => v + 1)}>刷新</button>
+      <h1 style={{ fontSize: 18, margin: 0 }}>例行任务</h1>
+      <button type="button" style={{ border: '1px solid var(--gk-line)', background: 'transparent', color: 'inherit', borderRadius: 8, padding: '7px 14px', font: 'inherit', fontSize: 14, cursor: 'pointer' }} onClick={() => setRevision((v) => v + 1)}>刷新</button>
     </div>
-    <p style={{ color: 'var(--gk-text-2)', fontSize: 13 }}>查看助手的定时安排。打开对应助手，在详情中管理例行任务。</p>
+    <p style={{ color: 'var(--gk-text-2)', fontSize: 14 }}>查看助手的定时安排。打开对应助手，在详情中管理例行任务。</p>
     {error ? <p role="alert">加载失败：{error}。请刷新重试。</p> : items === null ? <p role="status">加载中…</p> : items.length === 0 ? <p>还没有例行任务。在助手右上角打开详情，即可创建。</p> :
       <div style={{ display: 'grid', gap: 10 }}>{items.map((r) => {
         const bot = bots.find((b) => b.id === r.botId)
@@ -978,52 +1012,7 @@ export function RoutinesView({ bots }: { bots: BotInfo[] }): ReactNode {
 /* ---------------- 共享电脑 · 本机工作区（R-UI） ---------------- */
 
 export function ComputerView(): ReactNode {
-  const [data, setData] = useState<{ workspace: string; computer: { enabled: boolean; local: boolean; vncUrl: string | null }; artifacts: { id: string; name: string; size: number; mime: string; taskId: string | null; createdAt: number | null }[] } | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const [revealing, setRevealing] = useState(false)
-  useEffect(() => {
-    let alive = true
-    api('/workspace').then((r) => { if (alive) setData(r) }).catch((e) => { if (alive) setError(String(e?.message ?? e)) })
-    return () => { alive = false }
-  }, [])
-  const fmtSize = (n: number) => n > 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : n > 1024 ? `${(n / 1024).toFixed(0)} KB` : `${n} B`
-  const fmtTime = (ts: number | null) => ts ? new Date(ts).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : ''
-  return (
-    <div className="grokbot-computer" style={{ padding: '28px 32px', overflowY: 'auto', height: '100%', boxSizing: 'border-box' }}>
-      <div style={{ fontSize: 19, fontWeight: 700, marginBottom: 4 }}>本机工作区</div>
-      <div style={{ fontSize: 12.5, color: 'var(--gk-text-2, #6b6b70)', marginBottom: 20 }}>团队成员在本机 Mac 工作区直接执行任务；任务交付的成果原件保存在下方，可预览或保存副本。</div>
-      {error ? <div style={{ fontSize: 13, color: '#cf1322' }}>加载失败：{error}</div> : null}
-      {data ? (
-        <>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 14px', border: '1px solid rgba(29,29,31,.12)', borderRadius: 12, marginBottom: 22, background: 'rgba(255,255,255,.7)' }}>
-            <span aria-hidden style={{ fontSize: 22 }}>📁</span>
-            <span style={{ flex: 1, minWidth: 0 }}>
-              <span style={{ display: 'block', fontSize: 13, fontWeight: 600 }}>工作区目录</span>
-              <span style={{ display: 'block', fontSize: 11.5, opacity: .6, fontFamily: 'ui-monospace,Menlo,monospace', overflowWrap: 'anywhere' }}>{data.workspace}</span>
-            </span>
-            <button type="button" disabled={revealing} onClick={() => { setRevealing(true); api('/workspace/reveal', { method: 'POST' }).catch((e) => window.alert(`打开失败：${String(e)}`)).finally(() => setRevealing(false)) }} style={{ border: '1px solid rgba(29,29,31,.18)', background: '#fff', borderRadius: 9, padding: '7px 14px', fontSize: 12.5, cursor: 'pointer' }}>{revealing ? '打开中…' : '在 Finder 中显示'}</button>
-          </div>
-          <div style={{ fontSize: 14, fontWeight: 650, margin: '0 0 10px' }}>最近成果</div>
-          {data.artifacts.length === 0
-            ? <div style={{ fontSize: 12.5, opacity: .55, padding: '18px 14px', border: '1px dashed rgba(29,29,31,.15)', borderRadius: 12 }}>还没有成果——给助手派个任务，让它交付文件后会出现在这里。</div>
-            : (
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(190px, 1fr))', gap: 10 }}>
-                {data.artifacts.map((a) => (
-                  <button key={a.id} type="button" onClick={() => window.open(`/api/plugins/grokbot/artifacts/${a.id}`, '_blank')} style={{ textAlign: 'left', border: '1px solid rgba(29,29,31,.12)', borderRadius: 12, padding: '12px 13px', background: '#fff', cursor: 'pointer' }}>
-                    <span style={{ display: 'block', fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.name}</span>
-                    <span style={{ display: 'block', fontSize: 11, opacity: .55, marginTop: 4 }}>{fmtSize(a.size)}{a.createdAt ? ` · ${fmtTime(a.createdAt)}` : ''}</span>
-                    <span style={{ display: 'inline-block', marginTop: 8, fontSize: 11, color: '#1f6feb' }}>预览 / 保存副本 ↗</span>
-                  </button>
-                ))}
-              </div>
-            )}
-          {data.computer.vncUrl
-            ? <div style={{ marginTop: 22 }}><a href={data.computer.vncUrl} target="_blank" rel="noreferrer" style={{ fontSize: 12.5, color: '#1f6feb' }}>打开远程桌面（已在 computer.json 显式配置）↗</a></div>
-            : null}
-        </>
-      ) : !error ? <div style={{ fontSize: 13, opacity: .5 }}>加载中…</div> : null}
-    </div>
-  )
+  return <ArchiveComputer api={api} onConversation={id=>openConversation(id)} />
 }
 
 /* ---------------- 私聊视图 ---------------- */
@@ -1178,13 +1167,13 @@ function MembersPanel(props: { conversation: { id: string; name: string; memberB
 }
 
 function ApprovalCard(props: {approval:ApprovalInfo}):ReactNode {
- return <ApprovalView approval={props.approval} onDecision={async(outcome)=>{await api(`/approvals/${encodeURIComponent(props.approval.id)}`,{method:'POST',body:JSON.stringify({outcome})});refreshState?.()}}/>
+ return <ApprovalView approval={props.approval} onDecision={async(outcome,remember)=>{await api(`/approvals/${encodeURIComponent(props.approval.id)}`,{method:'POST',body:JSON.stringify({outcome,remember})});refreshState?.()}}/>
 }
 function AccessSettings():ReactNode {
  const [bots,setBots]=useState<{id:string;name:string;mode:string}[]>([]),[error,setError]=useState(''),[busy,setBusy]=useState('')
  const load=()=>api('/access-control').then(r=>setBots(r.bots||[])).catch(e=>setError(e.message))
  useEffect(()=>{void load()},[])
- return <section className="gk-access-settings"><h3>成员权限</h3><p>插件完全访问已停用。操作仍需审核；持久权限请通过宿主原生授权管理。</p>{bots.map(b=><div key={b.id}><span>{b.name}<small>{b.mode==='full'?'完全访问已开启':'由幕僚长审核，必要时交给你'}</small></span>{b.mode==='full'?<button disabled={!!busy} onClick={()=>{setBusy(b.id);setError('');void api(`/bots/${encodeURIComponent(b.id)}/access`,{method:'POST',body:JSON.stringify({mode:'review'})}).then(load).catch(e=>setError(e.message)).finally(()=>setBusy(''))}}>关闭完全访问</button>:null}</div>)}{error?<p role="alert">{error}</p>:null}</section>
+ return <section className="gk-access-settings"><h3>成员权限</h3><p>插件完全访问已停用。操作仍需审核；相同操作可在审批卡中明确记住 24 小时，并在授权规则中撤销。</p>{bots.map(b=><div key={b.id}><span>{b.name}<small>{b.mode==='full'?'完全访问已开启':'由幕僚长审核，必要时交给你'}</small></span>{b.mode==='full'?<button disabled={!!busy} onClick={()=>{setBusy(b.id);setError('');void api(`/bots/${encodeURIComponent(b.id)}/access`,{method:'POST',body:JSON.stringify({mode:'review'})}).then(load).catch(e=>setError(e.message)).finally(()=>setBusy(''))}}>关闭完全访问</button>:null}</div>)}{error?<p role="alert">{error}</p>:null}</section>
 }
 
 export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null }): ReactNode {
@@ -1361,22 +1350,22 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
 
   return (
     <div className="grokbot-chat" onKeyDown={(event) => { if (event.key === 'Escape' && !detailsOpen && !editing) closeTarget() }}>
-      <div className="grokbot-chat__head">
-        <AvatarView seed={bot.id} name={bot.name} glyph={bot.roleTemplate || bot.avatar} size={38} level={bot.rating?.level} />
+      <div className="grokbot-chat__head" data-working={bot.status==='working'}>
+        <AvatarView seed={bot.id} name={bot.name} glyph={bot.roleTemplate || bot.avatar} size={48} level={bot.rating?.level} activity={characterActivity(bot,state)} specialty={bot.title}/>
         <span className="grokbot-chat__title" onClick={() => setDetailsOpen((v) => !v)}>
           <span className="grokbot-chat__name">{bot.name}</span>
           <span className="grokbot-chat__meta">
-            {bot.status === 'working' ? '正在执行任务…' : (bot.title || '常驻待命')}
+            {characterActivity(bot,state).state!=='idle'?characterActivity(bot,state).label:(bot.title || '常驻待命')}
           </span>
         </span>
         {sending
           ? <button type="button" className="grokbot-chat__stop" onClick={() => void stop()}>停止</button>
           : null}
         <button type="button" className="grokbot-iconbtn" title="编辑资料" onClick={() => setEditing((v) => !v)}>⚙</button>
-        <button type="button" className="grokbot-chat__close" onClick={closeTarget} aria-label="关闭">✕</button>
+        <button type="button" className="grokbot-chat__close" onClick={closeTarget} aria-label="返回会话首页" title="返回会话首页">←</button>
       </div>
       <BotWorkPanel botId={bot.id} botName={bot.name} />
-      {editing ? <div style={{ padding: '0 20px' }}><BotForm initial={bot} onCancel={() => setEditing(false)} onSaved={() => setEditing(false)} /></div> : null}
+      {editing ? <div className="gk-profile-overlay"><BotForm key={bot.id} initial={bot} onCancel={() => setEditing(false)} onSaved={() => setEditing(false)} /></div> : null}
           {bot.accessMode==='full'?<div className="gk-access-banner"><span>此 Bot 完全访问已开启</span><button onClick={()=>{void api(`/bots/${encodeURIComponent(bot.id)}/access`,{method:'POST',body:JSON.stringify({mode:'review'})}).then(()=>refreshState?.()).catch(e=>window.alert(e.message))}}>关闭完全访问</button></div>:null}
       {bot.setupStage
         ? (
@@ -1487,6 +1476,7 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
                   <div className="grokbot-rating__nums">
                     {bot.rating.nextAt ? `经验 ${bot.rating.exp}/${bot.rating.nextAt}` : '已满级'}
                     {'　'}任务 {bot.rating.tasksDone}✓ {bot.rating.tasksFailed}✗
+                    {bot.rating.growth?.reviews ? <div>复盘 {bot.rating.growth.reviews} 次 · 最近 {bot.rating.growth.latest?.score ?? '证据不足'}{bot.rating.growth.latest?.score != null ? '/100' : ''}<br/>改进验证 {bot.rating.growth.verified} 项 · 成长经验 +{bot.rating.growth.exp}{bot.rating.growth.latestUrl?<a href={bot.rating.growth.latestUrl} target="_blank" rel="noreferrer" style={{display:"block",marginTop:6}}>查看最近复盘 ↗</a>:null}</div> : null}
                     {bot.rating.thumbsUp + bot.rating.thumbsDown > 0 ? `　👍${bot.rating.thumbsUp} 👎${bot.rating.thumbsDown}` : ''}
                   </div>
                 </div>
@@ -1542,6 +1532,7 @@ export function BotChatView(props: { bot: BotInfo; state: GrokbotState | null })
         )
         : null}
       <Composer
+        conversationId={bot.id}
         draft={draft}
         onDraft={setDraft}
         onSend={() => void send()}
@@ -1665,7 +1656,7 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
     <div className="grokbot-group-shell">
     <div className="grokbot-chat" onKeyDown={(event) => { if (event.key === 'Escape' && !detailsOpen) closeTarget() }}>
       <div className="grokbot-chat__head">
-        <GroupAvatarView name={room.name} members={room.memberBotIds.map(id => { const m = bots.find(b => b.id === id); return { seed: id, name: m?.name, glyph: m?.roleTemplate || m?.avatar } })} size={38} />
+        <GroupAvatarView name={room.name} members={room.memberBotIds.map(id => { const m = bots.find(b => b.id === id); return { seed: id, name: m?.name, glyph: m?.roleTemplate || m?.avatar } })} size={48} />
         <span className="grokbot-chat__title" onClick={() => setDetailsOpen((v) => !v)}>
           <span className="grokbot-chat__name">{room.name}</span>
           <span className="grokbot-chat__meta">
@@ -1675,8 +1666,8 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
             })}
           </span>
         </span>
-        <button type="button" className="gk-board-toggle" aria-expanded={boardOpen} onClick={()=>setBoardOpen(v=>!v)}>{boardOpen?'收起列表':'任务列表'}</button>
-        <button type="button" className="grokbot-chat__close" onClick={closeTarget} aria-label="关闭">✕</button>
+        <button type="button" className="gk-board-toggle" aria-expanded={boardOpen} onClick={()=>setBoardOpen(v=>!v)}>{boardOpen?'隐藏任务进展':'查看任务进展'}</button>
+        <button type="button" className="grokbot-chat__close" onClick={closeTarget} aria-label="返回会话首页" title="返回会话首页">←</button>
       </div>
       <div className="grokbot-body">
       {scrollPaused ? <button type="button" className="grokbot-jump-latest" onClick={jumpToLatest}>↓ 回到最新消息</button> : null}
@@ -1784,6 +1775,7 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
         )
         : null}
       <Composer
+        conversationId={room.id}
         draft={draft}
         onDraft={setDraft}
         onSend={() => void send()}
@@ -1798,7 +1790,7 @@ export function GroupChatView(props: { conversation: ConversationInfo; bots: Bot
         )
         : null}
     </div>
-    {boardOpen?<ProjectBoard conversationId={room.id} bots={bots.filter(b=>room.memberBotIds.includes(b.id))} load={loadBoard} onApproval={()=>openBot('chief')}/>:null}
+    {boardOpen?<ProjectBoard conversationId={room.id} bots={bots.filter(b=>room.memberBotIds.includes(b.id))} load={loadBoard} onBot={id=>{focusBotWork(id);openBot(id)}} onApproval={()=>openBot('chief')}/>:null}
     </div>
   )
 }
@@ -1824,30 +1816,22 @@ function startCreatingBot(): void {
 }
 
 /* 空态欢迎页：可见的新建/选助手入口（Codex R1 收尾：不把空白当欢迎页） */
-function HomeBlank(props: { bots: BotInfo[] }): ReactNode {
-  const bots = props.bots.filter((bot) => !bot.hidden).slice(0, 6)
-  return (
-    <div className="grokbot-home">
-      <div className="grokbot-home__hero">
-        <div className="grokbot-home__title">今天想做点什么？</div>
-        <div className="grokbot-home__sub">从左侧选择一位助手开始，或新建一个</div>
-        <button type="button" className="grokbot-home__new" onClick={() => startCreatingBot()}>＋ 召唤新助手</button>
-      </div>
-      {bots.length > 0
-        ? (
-          <div className="grokbot-home__grid">
-            {bots.map((bot) => (
-              <button key={bot.id} type="button" className="grokbot-home__card" onClick={() => openConversation(bot.id)}>
-                <AvatarView seed={bot.id} name={bot.name} glyph={bot.roleTemplate || bot.avatar} size={44} level={bot.rating?.level} />
-                <span className="grokbot-home__name">{bot.name}</span>
-                <span className="grokbot-home__desc">{bot.title || '常驻待命'}</span>
-              </button>
-            ))}
-          </div>
-        )
-        : null}
-    </div>
-  )
+function HomeBlank({bots:allBots,state}:{bots:BotInfo[];state:GrokbotState|null}):ReactNode {
+ const bots=allBots.filter(b=>!b.hidden),chief=bots.find(b=>b.id==='chief'),members=bots.filter(b=>b.id!=='chief')
+ const lead=chief?.status==='working'?chief.id:members.find(b=>b.status==='working')?.id||chief?.id
+ const avatar=(bot:BotInfo,size:number)=><AvatarView seed={bot.id} name={bot.name} glyph={bot.roleTemplate||bot.avatar} size={size} level={bot.rating?.level} activity={characterActivity(bot,state)} quiet={bot.id!==lead} specialty={bot.title}/>
+ const description=(bot:BotInfo)=>{const activity=characterActivity(bot,state);return activity.state==='idle'?(bot.title||'团队成员'):activity.label}
+ return <div className="grokbot-home"><section className="grokbot-home__content">
+  <div className="grokbot-home__eyebrow">DEEPSEEKBOT / TEAM</div>
+  <h1 className="grokbot-home__title">今天，一起做点什么。</h1>
+  <p className="grokbot-home__sub">{state?.stale?'正在重新同步团队状态。':'你的团队已就位。'}</p>
+  {chief?<button className="grokbot-home__chief" onClick={()=>openConversation(chief.id)} aria-label={`与${chief.name}对话`}>
+   {avatar(chief,64)}<span><strong>{chief.name}</strong><small>{characterActivity(chief,state).state==='idle'?'把想法交给我。':description(chief)}</small></span><span className="grokbot-home__arrow" aria-hidden="true">→</span>
+  </button>:<button className="grokbot-home__textlink" onClick={()=>startCreatingBot()}>添加第一位成员 →</button>}
+  <div className="grokbot-home__section"><span>团队</span><button className="grokbot-home__textlink" onClick={()=>startCreatingBot()}>添加成员 ↗</button></div>
+  <div className="grokbot-home__grid">{members.map(bot=><button className="grokbot-home__member" key={bot.id} onClick={()=>openConversation(bot.id)}>{avatar(bot,52)}<span><strong>{bot.name}</strong><small>{description(bot)}</small></span></button>)}</div>
+  <div className="grokbot-home__utilities"><button onClick={()=>{openTarget={kind:'settings',id:'settings'};notify()}}>团队设置</button><button onClick={()=>{openTarget={kind:'permissions',id:'permissions'};notify()}}>授权规则</button></div>
+ </section></div>
 }
 
 export function GrokbotMainView(): ReactNode {
@@ -1938,6 +1922,7 @@ export function GrokbotMainView(): ReactNode {
       style={{ position: 'fixed', left: box.left, top: box.top, width: box.width, height: box.height, zIndex: 900 }}
     >
       {(() => {
+        if(target?.kind==='permissions')return <PermissionRules api={api} bots={state?.bots||[]} onBack={closeTarget}/>
         if (target?.kind === 'settings') return <ModelSettingsView accessSupported={state?.accessControl?.supported} />
         if (target?.kind === 'routines') return <RoutinesView bots={state?.bots ?? []} />
         if (isComputer) return <ComputerView />
@@ -1951,7 +1936,7 @@ export function GrokbotMainView(): ReactNode {
             </div>
           )
         }
-        return <HomeBlank bots={state?.bots ?? []} />
+        return <HomeBlank bots={state?.bots ?? []} state={state} />
       })()}
     </div>
   )
@@ -1969,7 +1954,7 @@ export function apply(ctx: any): void {
     style.dataset.dshGrokbot = ''
     document.head.append(style)
     const update = (): void => {
-      const css = GROKBOT_CSS + GKF_CSS + (nativeSidebarVisible ? '' : '\n.grokbot-takeover [class*="centerCol"] > * { display: none !important; }\n.grokbot-takeover [class*="detailsCol"] { display: none !important; }')
+      const css = GROKBOT_CSS + GKF_CSS + UX_CSS + CHARACTER_CSS + (nativeSidebarVisible ? '' : '\n.grokbot-takeover [class*="centerCol"] > * { display: none !important; }\n.grokbot-takeover [class*="detailsCol"] { display: none !important; }')
       if (style.textContent !== css) style.textContent = css
     }
     update()

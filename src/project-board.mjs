@@ -1,3 +1,4 @@
+import {currentProjectEvidence} from './project-evidence.mjs'
 import {currentStepJobs,reworkView,affectedSteps} from './project-rework.mjs'
 import {readLifecycle,acceptedStep,withActiveProject,stepFingerprint,deliveryFingerprint,stepGeneration,reviewModeOf} from './project-lifecycle.mjs'
 import {readFile,mkdir} from 'node:fs/promises'
@@ -20,6 +21,13 @@ async function savePlanActive(root,id,steps,members,jobs,state,expectedRevision)
   for(const j of jobIds){if(usedJobs.has(j)||!jobs.some(x=>x.jobId===j&&x.toBot===s.botId))throw Error('关联任务不存在、不属本群负责人或重复关联');usedJobs.add(j)}
   const previousStep=previous.steps.find(p=>p.id===s.id)
   let reviewMode=s.reviewMode??previousStep?.reviewMode
+  // The board exposes the effective reviewer. Round-trip it only when the
+  // host really delegates this gate; retain the stored policy/fingerprint.
+  if(reviewMode==='codex'){
+   const stored=previousStep?.reviewMode??'user'
+   if(reviewModeOf(state,{...s,reviewMode:stored})!=='codex')throw Error('codex 验收仅适用于宿主已配置 externalReviewer 的外部关卡；普通阶段使用 user 或 chief')
+   reviewMode=stored
+  }
   // Missing means user, not a different policy. Preserve legacy representation
   // so a routine plan save cannot invalidate existing execution or acceptance.
   if(previousStep&&!previousStep.reviewMode&&reviewMode==='user')reviewMode=undefined
@@ -62,7 +70,7 @@ export async function projectBoard({stateDir,inboxRoot,conversationId,bots,runni
  const [lifecycle,jobs,tasks,plan]=await Promise.all([readLifecycle(stateDir,conversationId),readProjectJobs(inboxRoot,conversationId),listTasks(stateDir,{conversationId}),readPlan(stateDir,conversationId)])
  const running=new Set(runningIds),queued=new Set(queuedIds)
  const statusOf=j=>({replied:'done',failed:'failed',cancelled:'cancelled'}[j.record.status])||(running.has(j.jobId)?'running':lifecycle.status!=='active'&&(!j.record.status||j.record.status==='queued'||queued.has(j.jobId))?'held':queued.has(j.jobId)||!j.record.status||j.record.status==='queued'?'queued':'unknown')
- const rows=jobs.map(j=>({id:j.jobId,title:String(j.text||'任务').replace(/^\[[^\]]+\]\s*/, '').slice(0,120),botId:j.record.botId||j.toBot,status:statusOf(j),checkpoint:j.checkpoint,progress:running.has(j.jobId)?j.progress:null,reason:String(j.record.error||j.record.reason||'').slice(0,300),createdAt:j.createdAt||0,updatedAt:j.record.endedAt||j.record.startedAt||j.createdAt||0,dependsOn:[],artifacts:0,source:'job'}))
+ const rows=jobs.map(j=>({id:j.jobId,title:String(j.text||'任务').replace(/^\[[^\]]+\]\s*/, '').slice(0,120),botId:j.record.botId||j.toBot,status:statusOf(j),checkpoint:j.checkpoint,progress:running.has(j.jobId)?j.progress:null,reason:String(j.record.error||j.record.reason||'').slice(0,300),createdAt:j.createdAt||0,startedAt:j.record.startedAt||null,endedAt:j.record.endedAt||null,updatedAt:j.record.endedAt||j.record.startedAt||j.createdAt||0,dependsOn:[],artifacts:0,source:'job'}))
  for(const t of tasks){
   const run=t.runs?.at(-1),job=rows.find(r=>r.id===run?.executor?.jobId||jobs.find(j=>j.jobId===r.id)?.taskId===t.id)
   if(job){job.taskId=t.id;job.artifacts=t.artifacts?.length||0;continue}
@@ -74,18 +82,20 @@ export async function projectBoard({stateDir,inboxRoot,conversationId,bots,runni
   const current=currentStepJobs(lifecycle,s,jobs),linked=current.map(j=>rows.find(r=>r.id===j.jobId)).filter(Boolean)
   current.forEach(j=>used.add(j.jobId))
   const observed=linked.some(r=>['running','queued','approval','review'].includes(r.status))?linked.find(r=>['running','queued','approval','review'].includes(r.status)).status:linked.at(-1)?.status||'planned'
-  const rework=reworkView(lifecycle,s,jobs)
-  let checkpoint=linked.at(-1)?.checkpoint||null
+  const rework=reworkView(lifecycle,s,jobs),registered=currentProjectEvidence(lifecycle,s,plan.steps,jobs)
+  let checkpoint=registered?{completed:registered.evidence,files:registered.artifacts,validation:'已有成果重新核验登记；尚需独立验收',remaining:'',blockers:'',verified:false}:linked.at(-1)?.checkpoint||null
   if(rework&&checkpoint){
    const repaired=current.filter(j=>j.projectStep?.phase==='repair').at(-1)?.checkpoint
    checkpoint={...checkpoint,files:[...new Set([...(repaired?.files||[]),...(checkpoint.files||[])])]}
   }
   let status=observed==='done'?(acceptedStep(lifecycle,s,plan.steps)?'done':'awaiting_acceptance'):observed
+  if(registered)status=acceptedStep(lifecycle,s,plan.steps)?'done':'awaiting_acceptance'
+  if(s.finalDelivery&&lifecycle.externalReviewer?.kind==='codex'&&!s.jobIds?.length&&s.dependsOn.length&&s.dependsOn.every(id=>acceptedStep(lifecycle,plan.steps.find(d=>d.id===id),plan.steps)))status=jobs.some(j=>(j.projectEpoch||0)===lifecycle.epoch&&!['replied','failed','cancelled'].includes(j.record.status))?'blocked':acceptedStep(lifecycle,s,plan.steps)?'done':'awaiting_acceptance'
   if(rework&&!acceptedStep(lifecycle,s,plan.steps)&&!['approval','review','held'].includes(observed))status=rework.status
-  return {...s,reviewMode:reviewModeOf(lifecycle,s),accepted:acceptedStep(lifecycle,s,plan.steps),executionStatus:observed,latestJobId:current.at(-1)?.jobId||null,retryable:['failed','cancelled'].includes(observed),fingerprint:deliveryFingerprint(lifecycle,s),generation:stepGeneration(lifecycle,s.id),rework,status,source:'plan',artifacts:linked.reduce((n,r)=>n+r.artifacts,0),reason:rework?.reason||linked.at(-1)?.reason||'',updatedAt:Math.max(rework?.updatedAt||0,...linked.map(r=>r.updatedAt||0)),checkpoint,progress:linked.at(-1)?.progress||null}
+  return {...s,deliveryEvidence:registered,dependencyFingerprints:Object.fromEntries(s.dependsOn.map(id=>[id,lifecycle.reviews?.[id]?.fingerprint])),reviewMode:reviewModeOf(lifecycle,s),accepted:acceptedStep(lifecycle,s,plan.steps),executionStatus:observed,latestJobId:current.at(-1)?.jobId||null,retryable:['failed','cancelled'].includes(observed),fingerprint:deliveryFingerprint(lifecycle,s),generation:stepGeneration(lifecycle,s.id),rework,status,source:'plan',artifacts:linked.reduce((n,r)=>n+r.artifacts,0),reason:status==='done'||rework?.status==='awaiting_acceptance'?'':rework?.reason||linked.at(-1)?.reason||'',updatedAt:Math.max(rework?.updatedAt||0,...linked.map(r=>r.updatedAt||0)),checkpoint,progress:linked.at(-1)?.progress||null}
 
  })
  for(const p of planned)if(!['running','approval','review'].includes(p.status)&&p.dependsOn.some(id=>planned.find(r=>r.id===id)?.status!=='done')){p.status='blocked';p.reason='等待前置阶段验收通过'}
  const ordered=[],seen=new Set();function add(p){if(seen.has(p.id))return;seen.add(p.id);p.dependsOn.forEach(id=>{const d=planned.find(r=>r.id===id);if(d)add(d)});ordered.push(p)}planned.forEach(add)
- return {conversationId,lifecycle,planRevision:plan.revision||0,updatedAt:Date.now(),hasPlan:planned.length>0,rows:[...ordered,...rows.filter(r=>!used.has(r.id)).sort((a,b)=>(b.updatedAt||0)-(a.updatedAt||0))],members:bots.map(b=>({id:b.id,name:b.name,status:b.status}))}
+ return {conversationId,lifecycle,executionHistory:jobs.slice(-200).map(j=>({jobId:j.jobId,stepId:j.projectStep?.id||null,phase:j.projectStep?.phase||'normal',epoch:j.projectEpoch||0,botId:j.toBot,status:j.record.status||'queued',createdAt:j.createdAt||null,startedAt:j.record.startedAt||null,endedAt:j.record.endedAt||null})),executionHistoryTotal:jobs.length,executionHistoryNote:'最多最近200次派发，包含失败、取消、返工和复测；不含幕僚长无job的协调回合，未提供模型token用量。',planRevision:plan.revision||0,updatedAt:Date.now(),hasPlan:planned.length>0,rows:[...ordered,...rows.filter(r=>!used.has(r.id)).sort((a,b)=>(b.updatedAt||0)-(a.updatedAt||0))],members:bots.map(b=>({id:b.id,name:b.name,status:b.status}))}
 }

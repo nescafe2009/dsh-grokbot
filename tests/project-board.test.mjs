@@ -1,12 +1,27 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import {mkdtemp,rm,readFile,writeFile} from 'node:fs/promises'
+import {mkdtemp,rm,readFile,writeFile,mkdir} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {enqueueJob,failJob,completeJob,claimJob} from '../src/inbox.mjs'
 import {savePlan,projectBoard} from '../src/project-board.mjs'
 import {createTask,startRun,endRun} from '../src/tasks.mjs'
 import vm from 'node:vm'
+
+test('effective Codex reviewer round-trips without changing stored policy or delivery identity',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'board-reviewer-'))
+ try{
+  const step={id:'final',title:'deliver',botId:'chief',dependsOn:[],jobIds:[],finalDelivery:true}
+  const first=await savePlan(root,'g',[step],['chief'],[])
+  await assert.rejects(savePlan(root,'g',[{...step,reviewMode:'codex'}],['chief'],[]),/宿主已配置/)
+  await mkdir(join(root,'project-lifecycle'),{recursive:true})
+  await writeFile(join(root,'project-lifecycle','g.json'),JSON.stringify({version:1,conversationId:'g',status:'active',epoch:0,revision:0,history:[],externalReviewer:{kind:'codex',threadId:'test'},reviews:{}}))
+  const board=await projectBoard({stateDir:root,inboxRoot:join(root,'inbox'),conversationId:'g',bots:[]})
+  assert.equal(board.rows[0].reviewMode,'codex')
+  const saved=await savePlan(root,'g',board.rows,['chief'],[],first.revision)
+  assert.deepEqual(saved.steps,first.steps)
+ }finally{await rm(root,{recursive:true,force:true})}
+})
 
 test('project board: group isolation, real lifecycle, dependencies, retry recovery, approvals and stale running',async()=>{
  const root=await mkdtemp(join(tmpdir(),'gk-board-')),inboxRoot=join(root,'inbox')

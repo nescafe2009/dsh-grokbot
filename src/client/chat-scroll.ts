@@ -3,6 +3,7 @@ import { useCallback, useLayoutEffect, useRef, useState } from 'react'
 // Follow new content only while the reader stays at the end of this conversation.
 export function useChatScroll(revision: string, conversationId: string) {
   const ref = useRef<HTMLDivElement | null>(null)
+  const schedule = useRef<() => void>(() => {})
   const following = useRef(true)
   const resumeIntent = useRef(false)
   const [paused, setPaused] = useState(false)
@@ -20,7 +21,7 @@ export function useChatScroll(revision: string, conversationId: string) {
     let frame = 0
     let lastTop = node.scrollTop
     let touchY = 0
-    const pause = () => { following.current = false; resumeIntent.current = false; setPaused(true); cancelAnimationFrame(frame) }
+    const pause = () => { following.current = false; resumeIntent.current = false; setPaused(true); cancelAnimationFrame(frame); frame = 0 }
     const onScroll = () => {
       const top = node.scrollTop
       if (Math.abs(top - lastTop) < 1) return
@@ -45,15 +46,15 @@ export function useChatScroll(revision: string, conversationId: string) {
     const onPointerDown = () => { resumeIntent.current = true }
     const scroll = () => {
       if (!following.current) return
-      node.scrollTop = node.scrollHeight
-      lastTop = node.scrollTop
-      cancelAnimationFrame(frame)
+      if (frame) return
       frame = requestAnimationFrame(() => {
+        frame = 0
         if (!following.current) return
         node.scrollTop = node.scrollHeight
         lastTop = node.scrollTop
       })
     }
+    schedule.current = scroll
     node.addEventListener('pointerdown', onPointerDown, {passive:true})
     node.addEventListener('scroll', onScroll, { passive: true })
     node.addEventListener('wheel', onWheel, { passive: true })
@@ -75,12 +76,14 @@ export function useChatScroll(revision: string, conversationId: string) {
     })
     mutations?.observe(node, { childList: true, subtree: true, characterData: true })
     return () => {
+      schedule.current = () => {}
       cancelAnimationFrame(frame); observer?.disconnect(); mutations?.disconnect()
       node.removeEventListener('pointerdown', onPointerDown)
       node.removeEventListener('scroll', onScroll); node.removeEventListener('wheel', onWheel)
       node.removeEventListener('touchstart', onTouchStart); node.removeEventListener('touchmove', onTouchMove)
       node.removeEventListener('keydown', onKeyDown)
     }
-  }, [revision, conversationId])
+  }, [conversationId])
+  useLayoutEffect(() => { schedule.current() }, [revision])
   return { ref, paused, jumpToLatest }
 }

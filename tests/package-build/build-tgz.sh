@@ -15,7 +15,7 @@ git -C "$PROJ" archive "$SHA" | tar -x -C "$WORK/pkg"
 # 2. 干净依赖 + 从源码构建（npm run build 已加固：失败立即退出、唯一临时输出、成功才替换 lib/）
 cd "$WORK/pkg"
 command -v pnpm >/dev/null || { echo "pnpm not found"; exit 1; }
-pnpm install --prefer-offline --ignore-scripts >/dev/null 2>&1 || { echo "PNPM INSTALL FAILED"; exit 1; }
+pnpm install --frozen-lockfile --prefer-offline --ignore-scripts >/dev/null 2>&1 || { echo "PNPM INSTALL FAILED"; exit 1; }
 npm run build >/dev/null 2>&1 || { echo "BUILD FAILED (from source)"; exit 1; }
 for f in lib/index.mjs lib/client.js; do
   [ -f "$f" ] || { echo "BUILT OUTPUT MISSING: $f"; exit 1; }
@@ -83,7 +83,7 @@ manifest = {
     'runtimeDeps': [],
     'testEnvPinned': {'react': '19.2.8', 'react-dom': '19.2.8', 'happy-dom': '20.14.0'},
     'clientExternals': ['react', 'react-dom', '@deepseek-ai/dsh-client-*（由宿主 ModuleLoader 提供）'],
-    'hostVerified': {'app': 'DSH Desktop 0.7.2', 'dshBase': '0.1.2-alpha.1', 'dshWebApp': '0.1.2-alpha.1'},
+    'hostCompatibilityTarget': {'app': 'DSH Desktop 0.8.1', 'os': 'macOS', 'arch': 'arm64'},
 }
 open(os.path.join(out, 'manifest.json'), 'w').write(json.dumps(manifest, ensure_ascii=False, indent=1) + '\n')
 print(json.dumps({'tgz': manifest['tgz'], 'tgzSha256': manifest['tgzSha256'], 'files': len(files), 'gitSha': sha, 'builtFromSource': True}))

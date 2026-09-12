@@ -19,8 +19,8 @@ import { fileURLToPath } from 'node:url'
 
 const TGZ = resolve(process.argv[2] ?? '')
 if (!TGZ.endsWith('.tgz')) { console.error('usage: r3-accept.mjs <path-to-tgz>'); process.exit(2) }
-const DSH_BIN = '/Applications/DSH Desktop.app/Contents/Resources/app/node_modules/@deepseek-ai/dsh/lib/bin.js'
-const SHARED_MODULES = `${process.env.HOME}/.dsh/profiles/node_modules`
+const DSH_BIN = process.env.DSH_TEST_BIN || '/Applications/DSH Desktop.app/Contents/Resources/app/node_modules/@deepseek-ai/dsh/lib/bin.js'
+const SHARED_MODULES = process.env.DSH_TEST_MODULES || `${process.env.HOME}/.dsh/profiles/node_modules`
 const PORT = 8794
 const sanitize = (s) => String(s).replace(/token=[A-Za-z0-9_-]+/g, 'token=***')
 const fetchBounded = (url, opts = {}, ms = 8000) => fetch(url, { ...opts, signal: AbortSignal.timeout(ms) }).catch((e) => ({ status: 0, error: String(e), headers: { get: () => null }, text: async () => '' }))

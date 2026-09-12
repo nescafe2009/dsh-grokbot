@@ -1,3 +1,4 @@
+import { ROLE_PROFILES } from './roles.mjs'
 import { mkdir, readFile, writeFile, rename } from 'node:fs/promises'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -40,6 +41,8 @@ function normalizeBot(raw, index) {
   if (!SAFE_ID_RE.test(id)) {
     throw new Error(`crew.bots[${index}].id 非法：${id}（只允许字母数字._-）`)
   }
+  const roleTemplate = String(raw.roleTemplate || '').trim()
+  if (roleTemplate && roleTemplate !== 'blank' && !ROLE_PROFILES[roleTemplate]) throw new Error('未知角色模板：' + roleTemplate)
   const model = raw.model && (raw.model.provider || raw.model.model)
     ? { provider: String(raw.model.provider || ''), model: String(raw.model.model || '') }
     : null
@@ -49,6 +52,7 @@ function normalizeBot(raw, index) {
     avatar: String(raw.avatar || '🤖').trim() || '🤖',
     title: String(raw.title || '').trim(),
     persona: String(raw.persona || '').trim(),
+    roleTemplate,
     workspace: String(raw.workspace || '').trim(),
     model,
     pinned: raw.pinned === true,
@@ -201,6 +205,7 @@ export function createBot(crew, input) {
     avatar: String(input?.avatar || '🤖').trim() || '🤖',
     title: String(input?.title || '').trim(),
     persona: String(input?.persona || '').trim(),
+    roleTemplate: input?.roleTemplate || input?.templateId || '',
     workspace: String(input?.workspace || '').trim(),
     model: input?.model && (input.model.provider || input.model.model)
       ? { provider: String(input.model.provider || ''), model: String(input.model.model || '') }
@@ -220,7 +225,7 @@ export function createBot(crew, input) {
   return bot
 }
 
-const EDITABLE_FIELDS = ['name', 'avatar', 'title', 'persona', 'workspace', 'pinned', 'section', 'hidden', 'model']
+const EDITABLE_FIELDS = ['name', 'avatar', 'title', 'persona', 'roleTemplate', 'workspace', 'pinned', 'section', 'hidden', 'model']
 
 export function updateBot(crew, botId, patch) {
   const bot = crew.bots.find((entry) => entry.id === botId)
@@ -266,6 +271,7 @@ export function duplicateBot(crew, botId) {
     avatar: source.avatar,
     title: source.title,
     persona: source.persona,
+    roleTemplate: source.roleTemplate === 'chief' ? '' : source.roleTemplate,
     workspace: source.workspace,
     model: source.model,
     pinned: false,

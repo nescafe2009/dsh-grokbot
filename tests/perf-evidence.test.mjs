@@ -375,11 +375,13 @@ test('real lifecycle tool rejects stale revision and cannot report fake archive 
  try{
   const member=(await(await post('/bots',{name:'工程师'})).json()).bot
   projectId=(await(await post('/conversations',{name:'待归档',memberBotIds:['chief',member.id]})).json()).conversation.id
-  let r=await(await post('/conversations/chief/chat',{text:'#CONTROL_TEST',requestId:'stale-control'})).json()
-  assert.match(r.reply,/项目状态操作未完成/);assert.doesNotMatch(r.reply,/归档完成/)
+  let r=await(await post('/conversations/chief/chat',{text:'归档当前项目 #CONTROL_TEST',requestId:'stale-control'})).json()
+  assert.match(r.reply,/项目状态尚未变更/);assert.doesNotMatch(r.reply,/归档完成/)
   assert.equal((await(await inst.api(`/conversations/${projectId}/board`)).json()).lifecycle.status,'active')
   revision=0
-  r=await(await post('/conversations/chief/chat',{text:'#CONTROL_TEST',requestId:'valid-control'})).json()
+  r=await(await post('/conversations/chief/chat',{text:'通过 #CONTROL_TEST',requestId:'accept-not-archive'})).json()
+  assert.match(r.reply,/不代表归档/);assert.equal((await(await inst.api(`/conversations/${projectId}/board`)).json()).lifecycle.status,'active')
+  r=await(await post('/conversations/chief/chat',{text:'归档当前项目 #CONTROL_TEST',requestId:'valid-control'})).json()
   assert.match(r.reply,/归档完成/)
   assert.equal((await(await inst.api(`/conversations/${projectId}/board`)).json()).lifecycle.status,'archived')
  }finally{await inst.close()}
@@ -638,5 +640,22 @@ test('真实HTTP：常用模型持久化及Bot分配返回准确模型',async()=
   await patch('/crew',{modelPresets:[]});assert.deepEqual((await(await inst.api('/bots/chief')).json()).bot.model,model)
   assert.equal((await(await patch('/bots/chief',{model:null})).json()).bot.model,null)
   const invalid=await patch('/crew',{modelPresets:[{provider:'p',model:''}]});assert.equal(invalid.status,400)
+ }finally{await inst.close()}
+})
+
+test('explicit remembered approval reuses native one-time decision; changed command and revocation prompt again',async()=>{
+ const inst=await startInstance();const post=(path,body)=>inst.api(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})
+ try{
+ await post('/conversations/chief/chat',{text:'#ECHO',requestId:'rules-setup'})
+ const agent=inst.nativeAgents.at(-1);agent.session.header={cwd:inst.stateDir}
+ const ask=(id,command='npm run build')=>{const callId='c-'+id;agent.session.append('tool/call',{callId,name:'bash',arguments:{command,sandbox_permissions:'workspace-write',justification:'build'}});agent.session.append('approval/asked',{id,callId});return inst.listeners.get('approval/request')({agent,callId,toolName:'bash',reason:'escalate sandbox to workspace-write: build'},()=>{throw Error('unexpected fallback')})}
+ const waitUser=async id=>{for(let i=0;i<80;i++){const entry=(await(await inst.api('/state')).json()).approvals.find(a=>a.id===id);if(entry?.stage==='user')return entry;await new Promise(r=>setTimeout(r,5))}assert.fail('missing user approval')}
+ const first=ask('remember-first');const request=await waitUser('remember-first');assert.ok(request.ruleCandidate)
+ assert.equal((await post('/approvals/remember-first',{outcome:'allowed-once',remember:true})).status,200);assert.equal(await first,'allowed-once')
+ assert.equal(await ask('repeat-identical'),'allowed-once')
+ const changed=ask('changed','npm run test');await waitUser('changed');await post('/approvals/changed',{outcome:'rejected'});assert.equal(await changed,'rejected')
+ const rules=(await(await inst.api('/approval-rules')).json()).rules;assert.equal(rules.length,1)
+ assert.equal((await inst.api('/approval-rules/'+rules[0].id,{method:'DELETE'})).status,200)
+ const revoked=ask('after-revoke');await waitUser('after-revoke');await post('/approvals/after-revoke',{outcome:'rejected'});assert.equal(await revoked,'rejected')
  }finally{await inst.close()}
 })
