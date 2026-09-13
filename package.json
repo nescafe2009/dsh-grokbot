@@ -1,7 +1,7 @@
 {
   "name": "dsh-grokbot",
-  "version": "0.5.0",
-  "description": "Always-on named agent crew for DeepSeek Harness — replicate the Grok Bot mode as a pure out-of-tree plugin",
+  "version": "0.6.0",
+  "description": "DeepSeekBot: persistent agent teams, project workflows, context governance and evidence-based retrospectives for DSH",
   "keywords": [
     "deepseek",
     "dsh",
@@ -24,8 +24,11 @@
     "GOALS.md",
     "LICENSE",
     "CHANGELOG.md",
-    "assets-design",
-    "docs"
+    "docs",
+    "assets-design/avatars",
+    "assets-design/states",
+    "assets-design/rating",
+    "assets-design/parts"
   ],
   "scripts": {
     "build": "set -e; TMP=$(mktemp -d \"${TMPDIR:-/tmp}/grokbot-lib.XXXXXX\"); trap 'rm -rf \"$TMP\"' EXIT; npx tsdown --config ./tsdown.config.ts --outDir \"$TMP\"; for f in index.mjs client.js; do if [ ! -f \"$TMP/$f\" ]; then echo \"BUILD OUTPUT MISSING: $f\"; exit 1; fi; done; rm -rf lib.old; mv lib lib.old 2>/dev/null || true; mv \"$TMP\" lib; rm -rf lib.old; echo deployed",

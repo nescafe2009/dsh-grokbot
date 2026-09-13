@@ -83,7 +83,7 @@ manifest = {
     'runtimeDeps': [],
     'testEnvPinned': {'react': '19.2.8', 'react-dom': '19.2.8', 'happy-dom': '20.14.0'},
     'clientExternals': ['react', 'react-dom', '@deepseek-ai/dsh-client-*（由宿主 ModuleLoader 提供）'],
-    'hostVerified': {'app': 'DSH Desktop 0.7.2', 'dshBase': '0.1.2-alpha.1', 'dshWebApp': '0.1.2-alpha.1'},
+    'hostVerified': {'app': 'DSH Desktop 0.8.2', 'dshBase': '0.1.2-rc.1', 'dshWebApp': '0.1.2-rc.1'},
 }
 open(os.path.join(out, 'manifest.json'), 'w').write(json.dumps(manifest, ensure_ascii=False, indent=1) + '\n')
 print(json.dumps({'tgz': manifest['tgz'], 'tgzSha256': manifest['tgzSha256'], 'files': len(files), 'gitSha': sha, 'builtFromSource': True}))

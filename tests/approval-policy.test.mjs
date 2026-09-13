@@ -1,3 +1,5 @@
+import {sessionEvents} from '../src/session-events.mjs'
+import {ApprovalRules,approvalRuleCandidate} from '../src/approval-rules.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {mkdtemp,writeFile,symlink,rm,readFile} from 'node:fs/promises'
@@ -12,7 +14,7 @@ const end=source.indexOf('  const ROLE_TEMPLATES',start)
 assert.ok(start>0 && end>start)
 function harness(root,stream) {
  const pending=new Map(), notices=[], cleanups=[]; let handler, timer
- const context={botAccess:{isFull:()=>false},decodeToolArguments,activeTurnCtx:new Map(),botState:()=>({}),approvalScope,parseApprovalReview,AbortController,
+ const context={sessionEvents,approvalChecks:new Map(),permissionRules:new ApprovalRules(root),approvalRuleCandidate,botAccess:{isFull:()=>false},decodeToolArguments,activeTurnCtx:new Map(),botState:()=>({}),approvalScope,parseApprovalReview,AbortController,
  setTimeout:f=>{timer=f;return 1},clearTimeout(){},
  approvalBotByAgent:new Map([['agent','member']]),pendingApprovals:pending,
  crewState:{crew:{bots:[{id:'chief'},{id:'member',name:'成员'}]}},

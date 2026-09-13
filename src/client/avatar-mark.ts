@@ -14,12 +14,16 @@ const roles: Record<string, [number, number]> = {
   blank:[5,0], 'kw-shield':[5,4], 'kw-scales':[6,3], 'kw-book':[0,4],
   'kw-gear':[1,2], 'kw-note':[3,0], 'kw-flame':[7,2],
 }
-export function identityMark(role: string | undefined, identity: string): string {
+export function identityParts(role: string | undefined, identity: string) {
   let hash = 2166136261
   for (const ch of identity.normalize('NFC')) hash = Math.imul(hash ^ ch.codePointAt(0)!, 16777619) >>> 0
   hash = Math.imul(hash ^ (hash >>> 16), 2246822507) >>> 0
   hash = (hash ^ (hash >>> 13)) >>> 0
   const [color, shape] = (role !== 'blank' ? roles[role || ''] : undefined) || [hash % colors.length || 2, (hash >>> 8) % shapes.length]
   const eyes = shape === 3 ? 'M27 34l2 5m10-5 2 5' : 'M27 28l2 5m10-5 2 5'
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><path d="${shapes[shape]}" fill="${colors[color]}"/><path d="${eyes}" fill="none" stroke="white" stroke-width="4.5" stroke-linecap="round"/></svg>`
+  return {shape: shapes[shape], color: colors[color], eyes, triangle: shape === 3}
+}
+export function identityMark(role: string | undefined, identity: string): string {
+  const parts=identityParts(role,identity)
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><path d="${parts.shape}" fill="${parts.color}"/><path d="${parts.eyes}" fill="none" stroke="white" stroke-width="4.5" stroke-linecap="round"/></svg>`
 }

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import {chiefBrief,managementRoom} from '../src/chief-context.mjs'
+import {chiefBrief,managementRoom,currentBoardContext,projectResultJSON} from '../src/chief-context.mjs'
 const crew={bots:[{id:'chief',name:'幕僚长'},{id:'a',name:'工程师'}],conversations:[{id:'chief',memberBotIds:['chief']},{id:'g',name:'传输应用',memberBotIds:['a','chief']},{id:'g2',name:'其他项目',memberBotIds:['chief','a']},{id:'private',memberBotIds:['a']}]}
 test('chief DM project targeting is explicit and group/specialist boundaries remain enforced',()=>{
  assert.equal(managementRoom(crew,'chief','chief','g').id,'g')
@@ -18,6 +18,15 @@ test('brief recovers scope and actual status despite empty long-term memory; rea
  await assert.rejects(chiefBrief({crew,projectId:'private'}),/管理范围/)
 })
 
+test('project authority uses a bounded catalogue for cross-scope chief DM',async()=>{
+ const long='不得自动发布'.repeat(500)
+ const b=await chiefBrief({crew,projectId:'g',detail:'working',selection:null,board:async()=>({rows:[]}),history:async()=>[],dm:async()=>[{role:'user',text:long,ts:1,requestId:'global-rule'},...Array.from({length:5},(_,i)=>({role:'user',text:`后续 ${i}`,ts:i+2}))]})
+ assert.equal(b.recentChiefConversation[0].requestId,'global-rule')
+ assert.equal(b.recentChiefConversation[0].contentLength,long.length)
+ assert.ok(b.recentChiefConversation[0].text.length<long.length)
+ assert.equal(b.chiefInstructionHistory.sourceRef.message_count,6)
+})
+
 test('brief retains authorship and marks truncated member reports and past chief claims as unverified',async()=>{
  const b=await chiefBrief({crew,projectId:'g',board:async()=>({rows:[],members:[{id:'a',name:'工程师',status:'idle'}]}),history:async()=>[{role:'bot',botId:'a',text:'文件已经写好'.repeat(500),ts:1},{role:'user',text:'只设计，等我确认',ts:2},{role:'system',text:'保存了成员回复',ts:3}],dm:async()=>[{role:'bot',text:'已完成',ts:4},{role:'user',text:'继续',ts:5}]})
  assert.equal(b.projects[0].liveMembers[0].status,'idle')
@@ -32,4 +41,47 @@ test('archived projects leave the active briefing but retain an explicit restore
  assert.equal(result.projects.length,0)
  assert.equal(result.archivedProjects[0].id,'g')
  assert.ok(!JSON.stringify(result).includes('PRIVATE_OLD_TASK'))
+})
+
+test('recent archived rooms cannot evict an older active project',async()=>{
+ const conversations=[{id:'active-old',name:'仍在推进',memberBotIds:['chief','dev']},...Array.from({length:13},(_,i)=>({id:`archived-${i}`,name:`归档${i}`,memberBotIds:['chief','dev']}))]
+ const result=await chiefBrief({crew:{bots:[{id:'chief'}],conversations},board:async id=>({lifecycle:{status:id==='active-old'?'active':'archived',revision:1},rows:[],members:[]}),history:async()=>[],dm:async()=>[],selection:null})
+ assert.deepEqual(result.projects.map(project=>project.id),['active-old'])
+ assert.equal(result.archivedProjectCount,13)
+ assert.equal(result.archivedProjects.length,12)
+})
+
+test('current context preserves decision identities without duplicating old iterations',async()=>{
+ const lifecycle={status:'active',revision:23,epoch:1,iteration:2,externalReviewer:{kind:'codex',threadId:'thread'},stepGenerations:{scripts:2},reviews:{qa:{fingerprint:'qa-fp',dependencyFingerprints:{scripts:'dev-fp'},actor:'chief',evidence:'e'.repeat(5000)}},reworks:{scripts:{generation:2,phase:'repair',scopeFingerprint:'scope',ownerBotId:'a',testerBotId:'qa',criteria:'c'.repeat(5000)}},history:[{previousReviews:'old'.repeat(50000)}],iterations:[{baseline:'snapshot'.repeat(10000)}],snapshot:{old:'old'}}
+ const full={lifecycle,rows:[{id:'scripts',source:'plan',fingerprint:'current-fp',status:'repair'},{id:'old',source:'job'},{id:'new',source:'job'}],executionHistory:[{jobId:'old',epoch:0},{jobId:'new',epoch:1}]}
+ const original=JSON.stringify(full),small=currentBoardContext(full)
+ assert.equal(JSON.stringify(full),original)
+ assert.equal(small.lifecycle.reworks.scripts.scopeFingerprint,'scope')
+ assert.equal(small.lifecycle.reworks.scripts.generation,2)
+ assert.equal(small.lifecycle.reviews.qa.dependencyFingerprints.scripts,'dev-fp')
+ assert.deepEqual(small.lifecycle.externalReviewer,{kind:'codex',threadId:'thread'})
+ assert.deepEqual(small.rows.map(r=>r.id),['scripts','new'])
+ assert.deepEqual(small.executionHistory.map(r=>r.jobId),['new'])
+ assert.equal(small.lifecycle.reworks.scripts.criteria,lifecycle.reworks.scripts.criteria)
+ assert.equal(small.historyOmitted.iterations,1)
+ assert.ok(JSON.stringify(small).length<original.length/10)
+ const args={crew,projectId:'g',board:async()=>full,history:async()=>[],dm:async()=>[]}
+ const detailed=await chiefBrief({...args,detail:'full'})
+ assert.deepEqual(detailed.projects[0].lifecycle.history,lifecycle.history)
+ assert.deepEqual(detailed.projects[0].tasks.map(r=>r.id),['scripts','old','new'])
+ assert.equal(detailed.projectIndex[0].lifecycle.history,undefined)
+})
+
+test('mutation receipts preserve current decisions and resumption while omitting history',()=>{
+ const result={ok:true,lifecycle:{revision:9,epoch:2,status:'active',reviews:{a:{fingerprint:'fp',actor:'codex'}},reworks:{b:{generation:3,criteria:'must-keep'.repeat(1000)}},history:[{old:'x'.repeat(100000)}],iterations:[{old:'snapshot'}]},resumed:[{jobId:'new-job'}],notificationPending:true}
+ const receipt=JSON.parse(projectResultJSON(result))
+ assert.equal(receipt.lifecycle.revision,9)
+ assert.equal(receipt.lifecycle.reworks.b.criteria,result.lifecycle.reworks.b.criteria)
+ assert.deepEqual(receipt.lifecycle.reviews,result.lifecycle.reviews)
+ assert.deepEqual(receipt.resumed,result.resumed)
+ assert.equal(receipt.notificationPending,true)
+ assert.equal(receipt.historyOmitted.lifecycleEvents,1)
+ assert.equal(receipt.lifecycle.history,undefined)
+ assert.equal(result.lifecycle.history.length,1)
+ assert.deepEqual(JSON.parse(projectResultJSON({ok:false,error:'revision conflict'})),{ok:false,error:'revision conflict'})
 })

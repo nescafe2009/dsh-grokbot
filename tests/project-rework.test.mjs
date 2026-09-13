@@ -57,6 +57,10 @@ test('failed retest opens next cycle, rejects old results and persists evidence'
  await assert.rejects(f.result(old,'passed'),/当前轮次/)
  await f.dispatch('repair');const fresh=await f.dispatch('retest');await f.result(fresh,'passed')
  assert.equal((await readLifecycle(f.root,'g')).reworks.core.testJobId,fresh.jobId)
+ assert.equal((await f.board()).rows.find(r=>r.id==='core').reason,'')
+ await f.accept('core')
+ const row=(await f.board()).rows.find(r=>r.id==='core');assert.equal(row.status,'done');assert.equal(row.reason,'')
+ assert.ok((await f.state()).history.some(h=>h.action==='retest'&&h.result==='failed'))
 }))
 test('stale queued and late-running jobs cannot count after return; unrelated branches retain eligibility',()=>fixture(async f=>{
  const state0=await f.state(),step=f.steps[0],old={projectStep:{id:'core',fingerprint:stepFingerprint({...step,jobIds:[]}),generation:0}}

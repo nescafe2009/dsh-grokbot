@@ -1,3 +1,6 @@
+import {Character} from './character'
+import type {CharacterActivity} from './character-state'
+import {useScreenshot} from './screenshot-control'
 /*
  * 冻结组件（R1-c）：SidebarRow / MessageView / Composer / TaskCard / ArtifactCard
  * 视觉契约来自 Grok Bot 0.39.0 实测 token（./tokens.ts，design-ref/NOTES.md）。
@@ -12,12 +15,12 @@ import { TOKENS } from './tokens'
 
 /* ---------------- 头像 ---------------- */
 
-export function AvatarView(props: { seed: string; name?: string; glyph?: string; size: number; fontSize?: number; level?: number }): ReactNode {
+export function AvatarView(props: { seed: string; name?: string; glyph?: string; size: number; fontSize?: number; level?: number; activity?: CharacterActivity; quiet?:boolean; specialty?:string }): ReactNode {
   const role = resolveGlyph(props.glyph)
   const label = props.name || (role === 'chief' ? '幕僚长' : 'Bot')
   return <span className="gk-avatar-mark" style={{ width: props.size, height: props.size, display: 'inline-flex', flex: 'none', position: 'relative' }}>
-    <img src={`data:image/svg+xml,${encodeURIComponent(identityMark(role, props.name || props.seed))}`} data-avatar-role={role || 'custom'} width={props.size} height={props.size} alt={label} draggable={false} style={{ display: 'block', width: '100%', height: '100%' }} />
-    {props.level && props.level >= 4 && props.size >= 30 ? <span aria-label={`等级 ${props.level}`} style={{ position: 'absolute', right: -1, bottom: -1, borderRadius: 5, background: 'var(--gk-bg-side, #f7f7f7)', color: '#947126', fontSize: 10, fontWeight: 700, padding: '0 2px', lineHeight: '13px' }}>★</span> : null}
+    {props.activity && props.size>=30 ? <Character seed={props.seed} name={label} role={role} size={props.size} activity={props.activity} quiet={props.quiet} specialty={props.specialty}/> : <img src={`data:image/svg+xml,${encodeURIComponent(identityMark(role, props.name || props.seed))}`} data-avatar-role={role || 'custom'} width={props.size} height={props.size} alt={label} draggable={false} style={{ display: 'block', width: '100%', height: '100%' }} />}
+    {props.level && props.level >= 4 && props.size >= 30 ? <span aria-label={`等级 ${props.level}`} style={{ position: 'absolute', right: -1, bottom: -1, borderRadius: 5, background: 'var(--gk-bg-side, #f7f7f7)', color: '#947126', fontSize: 12, fontWeight: 700, padding: '0 2px', lineHeight: '13px' }}>★</span> : null}
   </span>
 }
 
@@ -32,8 +35,8 @@ export function GroupAvatarView({ members, size, name }: { members: AvatarMember
 
 /* ---------------- 轻量 Markdown ---------------- */
 
-let mdKeySeed = 0
 function renderInline(text: string): ReactNode[] {
+  let mdKeySeed = 0
   const parts: ReactNode[] = []
   const re = /(\*\*[^*]+\*\*|`[^`\n]+`|\[[^\]\n]+\]\((?:https?:\/\/[^\s)]+|\/api\/plugins\/grokbot\/artifacts\/[a-z0-9-]+)\)|https?:\/\/[^\s)]+)/g
   let last = 0
@@ -60,6 +63,7 @@ function renderInline(text: string): ReactNode[] {
 }
 
 function MarkdownText(props: { text: string }): ReactNode {
+  let mdKeySeed = 0
   const lines = props.text.split('\n')
   const out: ReactNode[] = []
   let list: string[] = []
@@ -159,6 +163,8 @@ export interface SidebarRowProps {
   unread?: boolean
   active?: boolean
   working?: boolean
+  activity?: CharacterActivity
+  specialty?:string
   level?: number
   stack?: { seed: string; name?: string; glyph?: string }[]
   onClick?: () => void
@@ -168,9 +174,9 @@ export function SidebarRow(props: SidebarRowProps): ReactNode {
   const size = TOKENS.size.avatarRow
   const avatar = props.stack && props.stack.length > 1
     ? <GroupAvatarView members={props.stack} size={size} name={props.name} />
-    : <AvatarView seed={props.seed} name={props.name} glyph={props.glyph} size={size} level={props.working ? undefined : props.level} />
+    : <AvatarView seed={props.seed} name={props.name} glyph={props.glyph} size={size} activity={props.activity} specialty={props.specialty} quiet level={props.working ? undefined : props.level} />
   return (
-    <button type="button" className={`gkf-row${props.active ? ' active' : ''}`} onClick={props.onClick}>
+    <button type="button" data-working={!!props.working} className={`gkf-row${props.active ? ' active' : ''}`} onClick={props.onClick}>
       {avatar}
       <span className="gkf-row__main">
         <span className="gkf-row__line1">
@@ -219,7 +225,7 @@ export function MessageView(props: MessageViewProps): ReactNode {
     return (
       <div className="gkf-msg gkf-msg--user">
         {time ? <div className="gkf-msg__meta gkf-msg__meta--right">{time}</div> : null}
-        <div className="gkf-msg__bubble">{props.text}</div>
+        <div className="gkf-msg__bubble">{props.text.replace(/\[截图\]\(\/api\/plugins\/grokbot\/artifacts\/art-[a-z0-9-]+\)/g,'').trim()}{[...props.text.matchAll(/\[截图\]\((\/api\/plugins\/grokbot\/artifacts\/art-[a-z0-9-]+)\)/g)].map((m,i)=><a key={i} href={m[1]} target="_blank" rel="noreferrer"><img src={m[1]} alt="截图附件" style={{display:'block',maxWidth:'100%',maxHeight:260,borderRadius:10,marginTop:8}}/></a>)}</div>
       </div>
     )
   }
@@ -273,35 +279,47 @@ export interface ComposerProps {
   placeholder?: string
   plusTitle?: string
   onPlus?: () => void
+  conversationId?: string
 }
 
 export function Composer(props: ComposerProps): ReactNode {
+  const screenshot=useScreenshot(props)
+  const text = props.draft.replace(/\n?\[截图\]\(\/api\/plugins\/grokbot\/artifacts\/art-[a-z0-9-]+\)/g, '')
+  const shots=[...props.draft.matchAll(/\[截图\]\((\/api\/plugins\/grokbot\/artifacts\/art-[a-z0-9-]+)\)/g)]
+
   const ref = useRef<HTMLTextAreaElement | null>(null)
   useEffect(() => {
     const el = ref.current
     if (!el) return
     el.style.height = 'auto'
-    el.style.height = `${Math.min(160, el.scrollHeight)}px`
+    el.style.height = `${Math.min(200, Math.max(56, el.scrollHeight))}px`
   }, [props.draft])
   return (
-    <div className="gkf-composer">
+    <div className="gkf-composer" onPaste={screenshot.onPaste}>
       <div className="gkf-composer__pill">
-        <button type="button" className="gkf-composer__plus" title={props.plusTitle ?? '附件（待实现）'} disabled={!props.onPlus} onClick={props.onPlus}>＋</button>
+      {shots.length?<div className="gk-capture-preview">{shots.map((shot,i)=><figure key={i}><img src={shot[1]} alt="待发送截图"/><button type="button" aria-label="移除截图" onClick={()=>props.onDraft(props.draft.replace('\n'+shot[0], '').replace(shot[0], ''))}>移除</button></figure>)}<span>截图将在发送消息时提交</span></div>:null}
+      {screenshot.status}
         <textarea
           ref={ref}
           className="gkf-composer__input"
           rows={1}
-          value={props.draft}
+          value={text}
+          aria-label={props.placeholder ?? "消息内容"}
           placeholder={props.placeholder ?? '发消息…'}
-          onChange={(event) => props.onDraft(event.target.value)}
+          onChange={(event) => props.onDraft([event.target.value,...shots.map(s=>s[0])].filter(Boolean).join('\n'))}
           onKeyDown={(event) => {
             if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
               event.preventDefault()
-              if (!props.sending) props.onSend()
+              if (!props.sending && props.draft.trim()) props.onSend()
             }
           }}
         />
-        <button type="button" className="gkf-composer__send" disabled={props.sending || !props.draft.trim()} title="发送" onClick={props.onSend}>↑</button>
+        <div className="gkf-composer__toolbar">
+          {props.onPlus?<button type="button" className="gkf-composer__plus" title={props.plusTitle ?? '添加附件'} aria-label={props.plusTitle ?? '添加附件'} onClick={props.onPlus}>＋</button>:null}
+          {screenshot.control}
+          <span className="gkf-composer__hint">{props.sending?'正在回复，可先写下一条消息':'Shift + Enter 换行'}</span>
+        <button type="button" aria-label="发送消息" className="gkf-composer__send" disabled={props.sending || !props.draft.trim()} title="发送" onClick={props.onSend}><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><path d="m6 12 6-6 6 6M12 6v13"/></svg></button>
+        </div>
       </div>
     </div>
   )

@@ -18,6 +18,19 @@ function makeCounter() {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+test('user command overtakes queued background work without interrupting active work', async () => {
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  const order = []
+  const active = runExclusively({ botId: 'priority' }, async () => { order.push('active'); await gate })
+  await Promise.resolve()
+  const background = runExclusively({ botId: 'priority' }, () => order.push('background'))
+  const user = runExclusively({ botId: 'priority', priority: 100 }, () => order.push('user'))
+  release()
+  await Promise.all([active, background, user])
+  assert.deepEqual(order, ['active', 'user', 'background'])
+})
+
 test('runExclusively：同 (task,bot) 聊天+inbox 并发 → 最大执行数 1（入口级阻塞）', async () => {
   const c = makeCounter()
   await Promise.all([

@@ -235,7 +235,7 @@ test('chief DM production path restores project facts, live tool access and unpo
  const {savePlan}=await import('../src/project-board.mjs')
  await savePlan(inst.stateDir,id,[{id:'arch',title:'架构阶段',botId:member.bot.id,dependsOn:[],jobIds:[]}],['chief',member.bot.id],[])
  const reply=await post('/conversations/chief/chat',{text:'继续',requestId:'restore-project'});assert.equal(reply.status,200)
- const prompt=inst.prompts.at(-1);assert.match(prompt,/已有传输项目/);assert.match(prompt,/只出架构设计/);assert.match(prompt,/架构阶段/);assert.match(prompt,/【当前用户消息】\n继续$/)
+ const prompt=inst.prompts.at(-1);assert.equal(prompt,'继续')
  const history=await(await inst.api('/conversations/chief')).json();assert.equal(history.messages.find(m=>m.role==='user').text,'继续');assert.ok(!JSON.stringify(history).includes('【幕僚长全局工作简报】'))
  const statusTool=inst.registered.at(-1).get('team_project_status');assert.ok(statusTool)
  const status=JSON.parse(await statusTool.execute({conversation_id:id}));assert.equal(status.projects[0].id,id)
@@ -243,7 +243,8 @@ test('chief DM production path restores project facts, live tool access and unpo
  const sent=JSON.parse(await inst.registered.at(-1).get('team_send_task').execute({conversation_id:id,member_id:member.bot.id,task:'Isolated mock task',deliverable:'fixture report',acceptance:'contains fixture result'}));assert.equal(sent.replyTo,id);assert.ok(sent.jobId)
  const savedJob=JSON.parse(await (await import('node:fs/promises')).readFile(join(inst.stateDir,'inbox',sent.jobId,'job.json'),'utf8'));assert.equal(savedJob.conversationId,id);assert.equal(savedJob.toBot,member.bot.id)
  const update=inst.registered.at(-1).get('team_update_plan');const changed=JSON.parse(await update.execute({conversation_id:id,expectedPlanRevision:1,steps:[{id:'arch',title:'新的阶段标题',botId:member.bot.id,dependsOn:[],jobIds:[]}]}));assert.equal(changed.ok,true)
- await post('/conversations/chief/chat',{text:'进展呢',requestId:'refresh-project'});assert.match(inst.prompts.at(-1),/新的阶段标题/)
+ await post('/conversations/chief/chat',{text:'进展呢',requestId:'refresh-project'});assert.equal(inst.prompts.at(-1),'进展呢')
+ const refreshed=JSON.parse(await statusTool.execute({conversation_id:id}));assert.equal(refreshed.projects[0].tasks[0].title,'新的阶段标题')
  }finally{await inst.close()}
 })
 
@@ -375,11 +376,13 @@ test('real lifecycle tool rejects stale revision and cannot report fake archive 
  try{
   const member=(await(await post('/bots',{name:'工程师'})).json()).bot
   projectId=(await(await post('/conversations',{name:'待归档',memberBotIds:['chief',member.id]})).json()).conversation.id
-  let r=await(await post('/conversations/chief/chat',{text:'#CONTROL_TEST',requestId:'stale-control'})).json()
-  assert.match(r.reply,/项目状态操作未完成/);assert.doesNotMatch(r.reply,/归档完成/)
+  let r=await(await post('/conversations/chief/chat',{text:'归档当前项目 #CONTROL_TEST',requestId:'stale-control'})).json()
+  assert.match(r.reply,/项目状态尚未变更/);assert.doesNotMatch(r.reply,/归档完成/)
   assert.equal((await(await inst.api(`/conversations/${projectId}/board`)).json()).lifecycle.status,'active')
   revision=0
-  r=await(await post('/conversations/chief/chat',{text:'#CONTROL_TEST',requestId:'valid-control'})).json()
+  r=await(await post('/conversations/chief/chat',{text:'通过 #CONTROL_TEST',requestId:'accept-not-archive'})).json()
+  assert.match(r.reply,/不代表归档/);assert.equal((await(await inst.api(`/conversations/${projectId}/board`)).json()).lifecycle.status,'active')
+  r=await(await post('/conversations/chief/chat',{text:'归档当前项目 #CONTROL_TEST',requestId:'valid-control'})).json()
   assert.match(r.reply,/归档完成/)
   assert.equal((await(await inst.api(`/conversations/${projectId}/board`)).json()).lifecycle.status,'archived')
  }finally{await inst.close()}
@@ -638,5 +641,22 @@ test('真实HTTP：常用模型持久化及Bot分配返回准确模型',async()=
   await patch('/crew',{modelPresets:[]});assert.deepEqual((await(await inst.api('/bots/chief')).json()).bot.model,model)
   assert.equal((await(await patch('/bots/chief',{model:null})).json()).bot.model,null)
   const invalid=await patch('/crew',{modelPresets:[{provider:'p',model:''}]});assert.equal(invalid.status,400)
+ }finally{await inst.close()}
+})
+
+test('explicit remembered approval reuses native one-time decision; changed command and revocation prompt again',async()=>{
+ const inst=await startInstance();const post=(path,body)=>inst.api(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})
+ try{
+ await post('/conversations/chief/chat',{text:'#ECHO',requestId:'rules-setup'})
+ const agent=inst.nativeAgents.at(-1);agent.session.header={cwd:inst.stateDir}
+ const ask=(id,command='npm run build')=>{const callId='c-'+id;agent.session.append('tool/call',{callId,name:'bash',arguments:{command,sandbox_permissions:'workspace-write',justification:'build'}});agent.session.append('approval/asked',{id,callId});return inst.listeners.get('approval/request')({agent,callId,toolName:'bash',reason:'escalate sandbox to workspace-write: build'},()=>{throw Error('unexpected fallback')})}
+ const waitUser=async id=>{for(let i=0;i<80;i++){const entry=(await(await inst.api('/state')).json()).approvals.find(a=>a.id===id);if(entry?.stage==='user')return entry;await new Promise(r=>setTimeout(r,5))}assert.fail('missing user approval')}
+ const first=ask('remember-first');const request=await waitUser('remember-first');assert.ok(request.ruleCandidate)
+ assert.equal((await post('/approvals/remember-first',{outcome:'allowed-once',remember:true})).status,200);assert.equal(await first,'allowed-once')
+ assert.equal(await ask('repeat-identical'),'allowed-once')
+ const changed=ask('changed','npm run test');await waitUser('changed');await post('/approvals/changed',{outcome:'rejected'});assert.equal(await changed,'rejected')
+ const rules=(await(await inst.api('/approval-rules')).json()).rules;assert.equal(rules.length,1)
+ assert.equal((await inst.api('/approval-rules/'+rules[0].id,{method:'DELETE'})).status,200)
+ const revoked=ask('after-revoke');await waitUser('after-revoke');await post('/approvals/after-revoke',{outcome:'rejected'});assert.equal(await revoked,'rejected')
  }finally{await inst.close()}
 })

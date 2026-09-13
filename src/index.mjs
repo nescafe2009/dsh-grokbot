@@ -1,13 +1,33 @@
+import { openSessionHandle } from './session-handle.mjs'
+import {rememberFact,memoryPrompt} from './bot-memory.mjs'
+import {currentProjectEvidence,registerProjectEvidence} from './project-evidence.mjs'
+import {syncExternalReviews,readExternalReviews,decideExternalReview} from './external-review.mjs'
+import {sessionEvents} from './session-events.mjs'
+import {readCharacterPhase} from './character-phase.mjs'
+import {ApprovalRules,approvalRuleCandidate} from './approval-rules.mjs'
+import {assertArchiveRequest,CONTINUITY_RULES} from './project-continuity.mjs'
+import {RETRO_RULES,retrospectiveEvidence,readRetrospectives,publishRetrospective,updateLearning,growthOf,learningPrompt,renderRetrospective} from './retrospective.mjs'
+import {captureScreenshot,importScreenshot} from './screenshots.mjs'
+import {exactMember, prepareTeam, setupJobId, teamName} from './team-setup.mjs'
+import { archiveLibrary } from './archive-library.mjs'
+import { ROLE_PROFILES, resolveRole } from './roles.mjs'
+import { customPersona, rolePrompt, refreshIdentity } from './role-prompt.mjs'
 import {factualProjectStatus,eligibleDependencyRetry} from './project-status.mjs'
 import {migrateDeliveryIdentity} from './project-identity.mjs'
 import { botWork, workActivity, workText } from './bot-work.mjs'
+import {workUsage} from './work-usage.mjs'
+import {contextEvidencePage} from './context-policy.mjs'
+import {compactWithDecisionGuard,contextDecisionManifest} from './context-maintenance.mjs'
+import {contextHistoryPage,relevantUserHistory,userDirectiveView} from './context-view.mjs'
+import {resolveSessionOwner} from './session-scope.mjs'
+import {saveContextMetrics,readContextMetrics} from './context-metrics.mjs'
 import {appendTranscript} from './transcript.mjs'
 import {returnProjectStep,recordRetest,currentStepJobs,validateDispatch,jobMatchesStep} from './project-rework.mjs'
 import {bindProjectOrigin,readHandoff,prepareHandoff,flushHandoff,reviewRequest} from './project-handoff.mjs'
 import {readLifecycle,withActiveProject,admitProject,transitionProject,acceptProjectStep,acceptedStep,stepFingerprint,deliveryFingerprint,stepGeneration,reviewModeOf,setReviewPolicy} from './project-lifecycle.mjs'
 import {JobProgress,LONG_TASK_RULES,checkpointRecord} from './job-progress.mjs'
 import {BotAccess,decodeToolArguments} from './bot-access.mjs'
-import {chiefBrief,managementRoom,CHIEF_CONTEXT_RULES,CHIEF_COMMUNICATION_RULES} from './chief-context.mjs'
+import {chiefBrief,currentPlanContext,projectResultJSON,managementRoom,CHIEF_CONTEXT_RULES,CHIEF_COMMUNICATION_RULES} from './chief-context.mjs'
 import {projectBoard,readProjectJobs,savePlan,readPlan} from './project-board.mjs'
 import { existsSync, watch } from 'node:fs'
 import { appendFile, mkdir, readFile, writeFile, stat, realpath, rm } from 'node:fs/promises'
@@ -172,8 +192,20 @@ export function apply(ctx, config = {}) {
   const stateDir = resolve(String(config.stateDir || join(process.cwd(), '.dsh-grokbot')))
   const inboxRoot = resolve(String(config.inboxDir || join(stateDir, 'inbox')))
   async function enqueueJob(root,job){return withActiveProject(stateDir,job.conversationId,async()=>{
+    if(job.jobId){
+      const queued=(await readFile(join(root,'queue.jsonl'),'utf8').catch(e=>{if(e.code==='ENOENT')return '';throw e})).split('\n').filter(Boolean).map(line=>JSON.parse(line))
+      const existing=queued.find(old=>old.jobId===job.jobId)
+      if(existing)return {...existing,reused:true}
+    }
     const lifecycle=job.conversationId?await readLifecycle(stateDir,job.conversationId):null
     if(job.conversationId){
+      if(!job.retryOf && (!job.workKind || job.workKind==='normal')) {
+        const deliverable=String(job.text||'').split('【本轮产物】')[1]?.trim()
+        if(deliverable){
+          const previous=(await readProjectJobs(root,job.conversationId)).find(old=>old.toBot===job.toBot&&(old.projectEpoch||0)===(lifecycle.epoch||0)&&(!old.projectStep||old.projectStep.phase==='normal')&&(!job.stepId||!old.projectStep||old.projectStep.id===job.stepId)&&String(old.text||'').split('【本轮产物】')[1]?.trim()===deliverable&&['queued','claimed'].includes(old.record.status||'queued'))
+          if(previous)return {...previous,reused:true}
+        }
+      }
       const plan=await readPlan(stateDir,job.conversationId)
       if(plan.steps.length){
         const phase=job.workKind||'normal'
@@ -229,6 +261,8 @@ export function apply(ctx, config = {}) {
   const chatSessionIds = new Map()
   // 请求去重：在途共享 + 成功/失败分级 TTL（重启即清）
   const chatRequestRegistry = new ChatRequestRegistry()
+  const contextMaintenanceRuns = new Map()
+  const authorityAssemblyStats = new Map()
   const pendingJobs = []
   // R2-B：调度占位——pump 已提交但尚未 claim 的 job（含等待 task/bot/workspace 锁者）。
   // 状态三处可见：/state.queued、/queue/:id/cancel、锁内执行前取消检查。
@@ -260,6 +294,7 @@ export function apply(ctx, config = {}) {
   const skillsDir = join(stateDir, 'skills')
   const roomsDir = join(stateDir, 'rooms')
   const routinesStatePath = join(stateDir, 'routines-state.json')
+  const contextMaintenancePath = join(stateDir, 'context-maintenance.jsonl')
 
   const roomTranscriptPath = (roomId) => join(roomsDir, `${roomId}.transcript.jsonl`)
 
@@ -301,11 +336,39 @@ export function apply(ctx, config = {}) {
     return appendTranscript(roomTranscriptPath(roomId), entry)
   }
 
-  async function readRoomMsgs(roomId, limit = 200) {
+  function ownerOfSession(sessionId){
+    return resolveSessionOwner(chatSessionIds.entries(),sessionId)
+  }
+
+  async function recordContextMaintenance(entry){
+    const messageId=entry.messageId||(entry.kind==='request'&&entry.requestId?`context-request-${entry.requestId}-${entry.status}`:entry.compactionId?`context-event-${entry.compactionId}-${entry.type}`:undefined)
+    await appendTranscript(contextMaintenancePath,{...entry,at:entry.at||Date.now(),...(messageId?{messageId}:{})})
+  }
+
+  async function readContextMaintenance(botId,limit=40){
+    try{
+      const lines=(await readFile(contextMaintenancePath,'utf8')).split('\n').filter(Boolean)
+      return lines.map(line=>JSON.parse(line)).filter(entry=>entry.botId===botId).slice(-limit)
+    }catch{return []}
+  }
+
+  async function contextMaintenanceRequest(requestId){
+    try{
+      const lines=(await readFile(contextMaintenancePath,'utf8')).split('\n').filter(Boolean)
+      const events=lines.map(line=>JSON.parse(line)).filter(entry=>entry.requestId===requestId&&entry.kind==='request')
+      return events.at(-1)||null
+    }catch(error){
+      if(error?.code==='ENOENT')return null
+      throw Error(`CONTEXT_MAINTENANCE_LEDGER_UNAVAILABLE：${safeError(error)}`)
+    }
+  }
+
+  async function readRoomMsgs(roomId, limit = 200, strict = false) {
     try {
       const lines = (await readFile(roomTranscriptPath(roomId), 'utf8')).split('\n').filter((line) => line.trim())
-      return lines.slice(-limit).map((line) => { try { return JSON.parse(line) } catch { return null } }).filter(Boolean)
-    } catch {
+      return lines.slice(-limit).map((line) => { try { return JSON.parse(line) } catch (error) { if(strict)throw error;return null } }).filter(Boolean)
+    } catch (error) {
+      if(strict&&error?.code!=='ENOENT')throw Error('项目原始指令读取失败；不能推定没有约束')
       return []
     }
   }
@@ -883,15 +946,36 @@ export function apply(ctx, config = {}) {
     ]
   }
 
-  async function chiefProjectContext(projectId = null) {
-    const brief=await chiefBrief({crew:crewState.crew,projectId,selection:selectedModel(crewState.crew.bots.find(b=>b.id==='chief') || {}),
-      board:id=>projectBoard({stateDir,inboxRoot,conversationId:id,bots:crewState.crew.bots.map(publicBot),runningIds:[...runningJobs.keys()],queuedIds:[...pendingJobs.map(j=>j.jobId),...waitingJobs.keys()],approvals:[...pendingApprovals.values()].filter(a=>a.conversationId===id),active:[...activeTurnCtx.entries()].filter(([,a])=>a.conversationId===id).map(([key,a])=>({...a,botId:key.split(':').at(-1),jobId:a.executorJobId}))}),
-      history:id=>readRoomMsgs(id,80),dm:()=>readDm('chief',8)})
+  async function contextBoard(id) {
+    return projectBoard({stateDir,inboxRoot,conversationId:id,bots:crewState.crew.bots.map(publicBot),runningIds:[...runningJobs.keys()],queuedIds:[...pendingJobs.map(j=>j.jobId),...waitingJobs.keys()],approvals:[...pendingApprovals.values()].filter(a=>a.conversationId===id),active:[...activeTurnCtx.entries()].filter(([,a])=>a.conversationId===id).map(([key,a])=>({...a,botId:key.split(':').at(-1),jobId:a.executorJobId}))})
+  }
+  async function chiefProjectContext(projectId = null, detail = 'working') {
+    const brief=await chiefBrief({crew:crewState.crew,projectId,detail,selection:selectedModel(crewState.crew.bots.find(b=>b.id==='chief') || {}),
+      board:contextBoard,
+      history:id=>readRoomMsgs(id,detail==='working'?Number.MAX_SAFE_INTEGER:80,detail==='working'),dm:()=>readDm('chief',detail==='working'?Number.MAX_SAFE_INTEGER:8,detail==='working')})
     for(const project of brief.projects){
       const h=await readHandoff(stateDir,project.id)
       project.handoff={originConversationId:h.originConversationId,requests:h.requests.filter(r=>!r.superseded&&project.tasks?.some(t=>t.id===r.stepId&&t.status==='awaiting_acceptance')).slice(-12).map(({requestId,stepId,fingerprint,status,error,deliveredAt})=>({requestId,stepId,fingerprint,status,error,deliveredAt}))}
     }
     return brief
+  }
+
+  async function sessionAuthorityBrief(bot, conversationId = null) {
+    if(bot.id==='chief'){
+      const brief=await chiefProjectContext(conversationId||null)
+      brief.sessionScope={botId:bot.id,conversationId:conversationId||bot.id,kind:conversationId?'project':'dm'}
+      return brief
+    }
+    const messages=conversationId?await readRoomMsgs(conversationId,Number.MAX_SAFE_INTEGER,true):await readDm(bot.id,Number.MAX_SAFE_INTEGER,true)
+    const directives=userDirectiveView(messages,{scope:conversationId||bot.id})
+    let projects=[],projectIndex=[]
+    if(conversationId){
+      const board=await contextBoard(conversationId)
+      const project={id:conversationId,lifecycle:board.lifecycle,planRevision:board.planRevision||0,tasks:board.rows||[],userInstructions:directives.items,handoff:null}
+      projects=[project]
+      projectIndex=[{id:conversationId,lifecycle:board.lifecycle?{status:board.lifecycle.status,revision:board.lifecycle.revision,epoch:board.lifecycle.epoch,iteration:board.lifecycle.iteration}:null}]
+    }
+    return {sessionScope:{botId:bot.id,conversationId:conversationId||bot.id,kind:conversationId?'project':'dm'},currentModel:selectedModel(bot),projectIndex,projects,roleDirectives:{...directives,items:directives.items}}
   }
 
   async function lifecycleAction(id,params){
@@ -909,14 +993,14 @@ export function apply(ctx, config = {}) {
       chiefWake.drop(id)
       const probe=busyProbes.get(id);if(probe){clearInterval(probe);busyProbes.delete(id)}
     }else void scan()
-    return {ok:true,lifecycle:await readLifecycle(stateDir,id),note:'状态已持久化并回读；归档不删除文件，恢复后先暂停，需明确继续。'}
+    return {ok:true,lifecycle:await readLifecycle(stateDir,id),note:params.action==='iterate'?'已在原项目开启新迭代，原成员和旧版验收保留；请登记本轮范围并由原团队实现和独立测试。尚未自动派工。':'状态已持久化并回读；验收不解散团队。归档不删除文件，restore先暂停；产品后续优化可用iterate开启原项目新迭代。'}
   }
   async function lifecycleAccept(id,params,actor='user'){
     const result={ok:true,lifecycle:await acceptProjectStep(stateDir,id,{...params,actor},async stepId=>{
       const plan=await readPlan(stateDir,id),step=plan.steps.find(s=>s.id===stepId),state=await readLifecycle(stateDir,id),jobs=await readProjectJobs(inboxRoot,id)
       if(actor==='chief'&&(step?.finalDelivery||reviewModeOf(state,step||{})!=='chief'||!plan.steps.some(s=>s.dependsOn.includes(stepId))))throw Error('该阶段需要用户决定，幕僚长不能代替用户验收')
       const linked=step?currentStepJobs(state,step,jobs):[]
-      return {step,ready:linked.length>0&&linked.at(-1).record.status==='replied'&&!linked.some(j=>runningJobs.has(j.jobId)||waitingJobs.has(j.jobId)||!j.record.status||j.record.status==='queued')&&step.dependsOn.every(id=>{const dep=plan.steps.find(s=>s.id===id);return dep&&acceptedStep(state,dep,plan.steps)})}
+      return {step,ready:(Boolean(step&&currentProjectEvidence(state,step,plan.steps,jobs))||(linked.length>0&&linked.at(-1).record.status==='replied'))&&!linked.some(j=>runningJobs.has(j.jobId)||waitingJobs.has(j.jobId)||!j.record.status||j.record.status==='queued')&&step.dependsOn.every(id=>{const dep=plan.steps.find(s=>s.id===id);return dep&&acceptedStep(state,dep,plan.steps)})}
     })}
     // Resume only previously admitted, unstarted dependency-cancelled attempts.
     // Fresh scope/generation is validated; user-cancelled or failed jobs are never revived.
@@ -932,6 +1016,36 @@ export function apply(ctx, config = {}) {
     return result
   }
 
+  let teamMutationQueue = Promise.resolve()
+  function serializeTeamMutation(fn) {
+    const result=teamMutationQueue.then(fn,fn)
+    teamMutationQueue=result.catch(()=>{})
+    return result
+  }
+  async function ensureTeam(params) {
+    const baseline=JSON.stringify(crewState.crew)
+    const existingRoomIds=[]
+    for(const room of crewState.crew.conversations||[]) {
+      if(room.memberBotIds.length>1&&teamName(room.name)===teamName(params.name)) {
+        const state=await readLifecycle(stateDir,room.id)
+        if(['archived','cancelled'].includes(state.status))throw Error(`同名项目已存在（${room.id}，${state.status}），不能重建团队；后续优化先查询原项目并开启迭代，取消项目须核实恢复授权。`)
+        existingRoomIds.push(room.id)
+      }
+    }
+    if(JSON.stringify(crewState.crew)!==baseline)throw Error('团队档案已变化，请重试')
+    const prepared=prepareTeam(crewState.crew,params,existingRoomIds)
+    // Keep existing objects alive for open chat handles. Only prevalidated membership is changed.
+    for(const member of prepared.members)if(!member.existing)crewState.crew.bots.push(member.bot)
+    const current=crewState.crew.conversations?.find(c=>c.id===prepared.room.id)
+    if(current)current.memberBotIds=prepared.room.memberBotIds
+    else (crewState.crew.conversations ||= []).push(prepared.room)
+    await persistCrew()
+    for(const member of prepared.members){await seedBotMemory(member.bot);await ensureDmConversation(member.bot)}
+    await bindProjectOrigin(stateDir,prepared.room.id,params.originId)
+    if(!prepared.existing)await appendRoomMsg(prepared.room.id,{role:'system',text:'Group created by 幕僚长'})
+    return prepared
+  }
+
   function teamManagementTools(bot, { conversationId = null } = {}) {
     // 上下文闭包绑定（P1-1）：本会话内派发的任务回流此群；群上下文同时是派发授权范围
     const output = {
@@ -943,41 +1057,76 @@ export function apply(ctx, config = {}) {
       : null
     return [
       {
+        name:'bot_remember',
+        description:'保存一条自己的稳定偏好或长期事实。无需文件路径，只能追加当前角色的记忆。项目进度、jobId和验收状态已经由项目工具保存，不要重复记忆；不得存储密钥或权限指令。失败时不要扩大沙箱权限，报告问题后继续已授权任务。',
+        parameters:{type:'object',properties:{fact:{type:'string',maxLength:1000}},required:['fact'],additionalProperties:false},output,
+        async execute(params){try{return projectResultJSON(await rememberFact(stateDir,bot.id,params.fact))}catch(error){return projectResultJSON({ok:false,error:safeError(error)})}},
+      },
+      {
         name: 'team_list_members',
         description: 'List all team members with their names, roles and status.',
         parameters: { type: 'object', properties: {}, required: [] },
         output,
         async execute() {
-          return JSON.stringify({ members: crewState.crew.bots.map((b) => ({ id: b.id, name: b.name, title: b.title, status: botState(b.id)?.status || 'idle' })) })
+          return projectResultJSON({ members: crewState.crew.bots.map((b) => ({ id: b.id, name: b.name, title: b.title, roleTemplate: resolveRole(b), responsibilities: ROLE_PROFILES[resolveRole(b)]?.mission || b.persona || '', status: botState(b.id)?.status || 'idle' })) })
         },
       },
       {
         name: 'team_create_member',
-        description: 'Create a new team member with a name and role. Only the chief (chief-of-staff) can use this.',
+        description: '查找或创建成员：同名现有成员直接复用，不创建分身；职责调整用 team_update_member。仅幕僚长可用。',
         parameters: {
           type: 'object',
           properties: {
             name: { type: 'string', description: 'Member name' },
             role: { type: 'string', description: 'Role/title, e.g. Engineer / Researcher / PM' },
-            persona: { type: 'string', description: 'Optional persona text' },
+            templateId: { type: 'string', enum: Object.keys(ROLE_PROFILES).filter(id => id !== 'chief'), description: '可选专业角色模板；省略时按职位匹配' },
+            persona: { type: 'string', description: '补充职责与项目约束；不必重复预置角色' },
           },
           required: ['name', 'role'],
         },
         output,
         async execute(params) {
           if (bot.id !== 'chief') return 'Only chief can create members'
-          try {
-            const newBot = createBot(crewState.crew, { name: params.name, title: params.role, persona: params.persona || '' })
+          return serializeTeamMutation(async()=>{try {
+            const {bot:newBot,existing}=exactMember(crewState.crew,{name:params.name},{create:true,role:params.role,templateId:params.templateId,persona:params.persona})
             await persistCrew()
             await seedBotMemory(newBot)
             await ensureDmConversation(newBot)
-            return JSON.stringify({ ok: true, id: newBot.id, name: newBot.name, role: newBot.title })
-          } catch (error) { return JSON.stringify({ ok:false,error: safeError(error) }) }
+            return projectResultJSON({ok:true,id:newBot.id,name:newBot.name,role:newBot.title,existing})
+          }catch(error){return projectResultJSON({ok:false,error:safeError(error)})}})
+
+        },
+      },
+      {
+        name: 'team_update_member',
+        description: '幕僚长调整现有成员的姓名、职位、预置专业职责或补充规则；保留会话、任务与产物，下一回合使用新档案。',
+        parameters: {
+          type:'object', properties: {
+            member_id:{type:'string',description:'精确成员 ID，先通过 team_list_members 查询'},
+            name:{type:'string'}, role:{type:'string',description:'当前职位；变更职位且未指定模板时重新按职位匹配'},
+            templateId:{type:'string',enum:['',...Object.keys(ROLE_PROFILES).filter(id=>id!=='chief')],description:'留空恢复按职位匹配'},
+            persona:{type:'string',description:'完整的用户补充职责；省略保留原文，空字符串清除'},
+          }, required:['member_id'],
+        },
+        output,
+        async execute(params) {
+          if (bot.id !== 'chief') return 'Only chief can update members'
+          try {
+            const patch = {}
+            if (params.name !== undefined) {if (!String(params.name).trim()) throw Error('姓名不能为空');patch.name=params.name}
+            if (params.role !== undefined) {patch.title=params.role;patch.roleTemplate=params.templateId || ''}
+            if (params.templateId !== undefined) patch.roleTemplate=params.templateId
+            if (params.persona !== undefined) patch.persona=params.persona
+            if (!Object.keys(patch).length) throw Error('请指定要调整的档案字段')
+            const member = updateBot(crewState.crew, params.member_id, patch)
+            await persistCrew()
+            return projectResultJSON({ok:true,id:member.id,name:member.name,title:member.title,roleTemplate:resolveRole(member),note:'档案已更新，下一回合生效；历史记录保留'})
+          } catch (error) {return projectResultJSON({ok:false,error:safeError(error)})}
         },
       },
       {
         name: 'team_create_group',
-        description: 'Create a group chat with named members. The caller is automatically included.',
+        description: '幕僚长建立项目群；同名未归档群直接复用并补齐成员，不重建。成员名称必须精确唯一。原有派工继续保留。',
         parameters: {
           type: 'object',
           properties: {
@@ -988,38 +1137,42 @@ export function apply(ctx, config = {}) {
         },
         output,
         async execute(params) {
-          try {
-            const memberIds = params.members.map((nm) => {
-              const f = crewState.crew.bots.find((b) => b.name.includes(nm) || nm.includes(b.name))
-              if (!f) throw new Error('Member not found: ' + nm)
-              return f.id
-            })
-            if (!memberIds.includes(bot.id)) memberIds.push(bot.id)
-            if (memberIds.length < 2) throw new Error('Need at least 2 members')
-            const conv = createConversation(crewState.crew, { name: params.name, memberBotIds: memberIds })
-            await persistCrew()
-            await bindProjectOrigin(stateDir,conv.id,conversationId||bot.id)
-            await appendRoomMsg(conv.id, { role: 'system', text: 'Group created by ' + bot.name })
-            return JSON.stringify({ ok: true, id: conv.id, name: conv.name, memberCount: memberIds.length })
-          } catch (error) { return JSON.stringify({ ok:false,error: safeError(error) }) }
+          if(bot.id!=='chief')return projectResultJSON({ok:false,error:'只有幕僚长可创建或调整项目群'})
+          return serializeTeamMutation(async()=>{try {
+            const result=await ensureTeam({name:params.name,members:params.members.map(name=>({name})),actorId:bot.id,originId:conversationId||bot.id})
+            return projectResultJSON({ok:true,id:result.room.id,name:result.room.name,memberCount:result.room.memberBotIds.length,existing:result.existing,note:result.existing?'已复用现有项目群并补齐成员；原派工保留，不要重复派发':'群已建立'})
+          }catch(error){return projectResultJSON({ok:false,error:safeError(error)})}})
+
         },
       },
       {
         name:'team_project_lifecycle',
-        description:'根据当前用户明确要求，暂停、阻塞、继续、完成、取消、归档或恢复项目。先查询项目 lifecycle.revision，再传 expectedRevision。归档保存快照并停止派工，不删除文件，不代表验收。恢复到暂停，需另行继续。禁止用 bash 写记忆冒充归档；ok=false 必须报告失败，不得宣称完成。自动协调或后台任务无权调用。',
-        parameters:{type:'object',properties:{conversation_id:{type:'string'},action:{type:'string',enum:['pause','block','resume','complete','cancel','archive','restore']},expectedRevision:{type:'integer'},summary:{type:'string'},blocker:{type:'object',properties:{reason:{type:'string'},owner:{type:'string'},resolution:{type:'string'}},required:['reason','owner','resolution']}},required:['conversation_id','action','expectedRevision','summary']},output,
-        async execute(params){try{
+        description:'根据当前用户明确要求，暂停、阻塞、继续、完成、取消、归档或恢复项目。先查询项目 lifecycle.revision，再传 expectedRevision。通过只验收不归档，归档需用户当前明确说归档/封存。iterate用于用户要求继续优化已完成/归档产品，在原群开启新迭代并保留原团队与验收历史，不自动派工。当前仍active且全阶段已验收时，先complete，再用新revision执行iterate；不要拼接新轮计划到旧轮。归档保存快照并停止派工，不删除文件，不代表验收。恢复到暂停，需另行继续。禁止用 bash 写记忆冒充归档；ok=false 必须报告失败，不得宣称完成。自动协调或后台任务无权调用。',
+        parameters:{type:'object',properties:{conversation_id:{type:'string'},action:{type:'string',enum:['pause','block','resume','complete','cancel','archive','restore','iterate']},expectedRevision:{type:'integer'},summary:{type:'string'},blocker:{type:'object',properties:{reason:{type:'string'},owner:{type:'string'},resolution:{type:'string'}},required:['reason','owner','resolution']}},required:['conversation_id','action','expectedRevision','summary']},output,
+        async execute(params,exec){try{
           const current=activeTurnCtx.get(`${conversationId||bot.id}:${bot.id}`)
           if(bot.id!=='chief'||!current?.lifecycleControl)throw Error('生命周期变更仅允许幕僚长在当前用户对话中处理；后台通知没有授权')
           const room=managementRoom(crewState.crew,bot.id,conversationId,params.conversation_id)
+          if(params.action==='archive')assertArchiveRequest(current.userText)
           const result=await lifecycleAction(room?.id,params)
           current.lifecycleResult=result
-          return JSON.stringify(result)
+          if(params.action==='archive'&&result.ok&&current.archiveOnly){
+            current.archiveReceipt=`已归档「${room.name}」。\n\n${result.lifecycle.summary}\n\n可在 Computer 的历史项目中查看；以后继续优化时，可在原项目开启新迭代。`
+            const entry={role:'bot',botId:bot.id,text:current.archiveReceipt,messageId:current.requestId?`chat-${current.requestId}-bot`:`archive-${room.id}-${result.lifecycle.revision}`,...(current.requestId?{requestId:current.requestId}:{})}
+            try{
+              if(conversationOf(conversationId||bot.id)?.memberBotIds.length>1)await appendRoomMsg(conversationId,entry)
+              else await appendDm(bot.id,entry)
+              current.archiveReceiptDelivered=true
+            }catch(error){ctx.logger?.warn?.(`归档已成功，回执将于回合结束重试：${safeError(error)}`)}
+            if(typeof exec?.concludeTurn==='function')exec.concludeTurn()
+            else current.archiveNeedsBoundaryStop=true
+          }
+          return projectResultJSON(result)
         }catch(error){
-          const result={ok:false,error:safeError(error)}
+          const result={ok:false,error:safeError(error),conversationId:params?.conversation_id||conversationId}
           const current=activeTurnCtx.get(`${conversationId||bot.id}:${bot.id}`)
           if(current?.lifecycleControl)current.lifecycleResult=result
-          return JSON.stringify(result)
+          return projectResultJSON(result)
         }}
       },
       {
@@ -1031,8 +1184,8 @@ export function apply(ctx, config = {}) {
           if(params.kind==='scope'&&!current.lifecycleControl)throw Error('范围变更须由当前用户对话明确提出')
           const room=managementRoom(crewState.crew,bot.id,conversationId,params.conversation_id)
           const result={ok:true,lifecycle:await returnProjectStep(stateDir,room.id,{...params,actor:current.lifecycleControl?'user-via-chief':'chief'},async()=>({steps:(await readPlan(stateDir,room.id)).steps,members:room.memberBotIds,jobs:await readProjectJobs(inboxRoot,room.id)}))}
-          current.lifecycleResult=result;return JSON.stringify(result)
-        }catch(error){const result={ok:false,error:safeError(error)};if(current)current.lifecycleResult=result;return JSON.stringify(result)}}
+          current.lifecycleResult=result;return projectResultJSON(result)
+        }catch(error){const result={ok:false,error:safeError(error),conversationId:params?.conversation_id||conversationId};if(current)current.lifecycleResult=result;return projectResultJSON(result)}}
       },
       {
         name:'team_record_retest',
@@ -1046,8 +1199,8 @@ export function apply(ctx, config = {}) {
             try{await prepareProjectHandoff(room.id,`本轮修复与复测已由幕僚长核实。复测依据：${params.evidence}。阶段仍需按原验收分工确认。`)}
             catch(error){result.notificationPending=true;ctx.logger?.warn?.(`复测审阅交接待重试：${safeError(error)}`)}
           }
-          current.lifecycleResult=result;return JSON.stringify(result)
-        }catch(error){const result={ok:false,error:safeError(error)};if(current)current.lifecycleResult=result;return JSON.stringify(result)}}
+          current.lifecycleResult=result;return projectResultJSON(result)
+        }catch(error){const result={ok:false,error:safeError(error),conversationId:params?.conversation_id||conversationId};if(current)current.lifecycleResult=result;return projectResultJSON(result)}}
       },
       {
         name:'team_set_review_policy',
@@ -1058,8 +1211,8 @@ export function apply(ctx, config = {}) {
           if(bot.id!=='chief'||!current?.lifecycleControl)throw Error('验收委托必须来自当前用户对话')
           const room=managementRoom(crewState.crew,bot.id,conversationId,params.conversation_id)
           const lifecycle=await setReviewPolicy(stateDir,room.id,{...params,userText:current.userText},async()=>(await readPlan(stateDir,room.id)).steps)
-          return JSON.stringify({ok:true,lifecycle})
-        }catch(error){return JSON.stringify({ok:false,error:safeError(error)})}}
+          return projectResultJSON({ok:true,lifecycle})
+        }catch(error){return projectResultJSON({ok:false,error:safeError(error)})}}
       },
       {
         name:'team_retry_step',
@@ -1078,8 +1231,20 @@ export function apply(ctx, config = {}) {
           if(!automatic&&(!current.lifecycleControl||!/继续|重试|再试|恢复|retry|resume/i.test(current.userText||'')))throw Error('用户停止或执行失败须当前用户授权重试')
           const job=await enqueueJob(inboxRoot,{toBot:old.toBot,text:old.text,images:old.images||[],fromBotId:'chief',conversationId:room.id,stepId:old.projectStep.id,workKind:old.projectStep.phase||'normal',retryOf:old.jobId,retryReason:params.reason})
           await appendRoomMsg(room.id,{role:'system',text:`已为${crewState.crew.bots.find(b=>b.id===old.toBot)?.name||'成员'}重新排队；旧取消/失败记录保留。原因：${params.reason}`,jobId:job.jobId,retryOf:old.jobId})
-          void scan();return JSON.stringify({ok:true,jobId:job.jobId,status:'queued',retryOf:old.jobId})
-        }catch(error){return JSON.stringify({ok:false,error:safeError(error)})}}
+          void scan();return projectResultJSON({ok:true,jobId:job.jobId,status:'queued',retryOf:old.jobId})
+        }catch(error){return projectResultJSON({ok:false,error:safeError(error)})}}
+      },
+      {
+        name:'team_register_delivery',
+        description:'复用已有实际交付，不创建执行任务。前置返工导致旧版本失效，但核验文件仍满足当前要求时，先读取当前项目版本、阶段 fingerprint/generation/dependencyFingerprints 和来源任务 checkpoint.files，再登记来源、文件和适用性证据。只变为待审，不代表验收通过，不能替代未完成的修复或复测。不要派零修改确认任务补账。',
+        parameters:{type:'object',properties:{conversation_id:{type:'string'},stepId:{type:'string'},sourceJobId:{type:'string'},expectedRevision:{type:'integer'},expectedEpoch:{type:'integer'},expectedGeneration:{type:'integer'},expectedFingerprint:{type:'string'},dependencyFingerprints:{type:'object',additionalProperties:{type:'string'}},artifacts:{type:'array',items:{type:'string'}},evidence:{type:'string'}},required:['conversation_id','stepId','sourceJobId','expectedRevision','expectedEpoch','expectedGeneration','expectedFingerprint','dependencyFingerprints','artifacts','evidence']},output,
+        async execute(params){try{
+          const current=activeTurnCtx.get(`${conversationId||bot.id}:${bot.id}`)
+          if(bot.id!=='chief'||!current)throw Error('只有执行中的幕僚长可以核验并登记成果')
+          const room=managementRoom(crewState.crew,bot.id,conversationId,params.conversation_id)
+          const lifecycle=await registerProjectEvidence(stateDir,room.id,{...params,actor:'chief'},async()=>({steps:(await readPlan(stateDir,room.id)).steps,jobs:await readProjectJobs(inboxRoot,room.id)}))
+          void scan();return projectResultJSON({ok:true,lifecycle,note:'已有成果已登记待审，未派工、未验收'})
+        }catch(error){return projectResultJSON({ok:false,error:safeError(error)})}}
       },
       {
         name:'team_review_step',
@@ -1092,8 +1257,8 @@ export function apply(ctx, config = {}) {
           const room=managementRoom(crewState.crew,bot.id,conversationId,params.conversation_id)
           const result=await lifecycleAccept(room.id,params,'chief')
           current.lifecycleResult=result
-          return JSON.stringify(result)
-        }catch(error){const result={ok:false,error:safeError(error)};const current=activeTurnCtx.get(`${conversationId||bot.id}:${bot.id}`);if(current)current.lifecycleResult=result;return JSON.stringify(result)}}
+          return projectResultJSON(result)
+        }catch(error){const result={ok:false,error:safeError(error),conversationId:params?.conversation_id||conversationId};const current=activeTurnCtx.get(`${conversationId||bot.id}:${bot.id}`);if(current)current.lifecycleResult=result;return projectResultJSON(result)}}
       },
       {
         name:'team_accept_step',
@@ -1112,20 +1277,91 @@ export function apply(ctx, config = {}) {
             }
             const result=await lifecycleAccept(room.id,{expectedRevision:params.expectedRevision,stepId:request.stepId,expectedFingerprint:request.fingerprint,expectedEpoch:request.epoch,evidence:`${params.evidence}\n用户原话：${current.userText}`})
             current.lifecycleResult=result
-            return JSON.stringify(result)
-          }catch(error){const result={ok:false,error:safeError(error)};if(current?.lifecycleControl)current.lifecycleResult=result;return JSON.stringify(result)}
+            return projectResultJSON(result)
+          }catch(error){const result={ok:false,error:safeError(error),conversationId:params?.conversation_id||conversationId};if(current?.lifecycleControl)current.lifecycleResult=result;return projectResultJSON(result)}
         }
       },
       {
+        name:'team_retrospective',
+        description:'项目复盘与持续成长。inspect读取证据索引、角色职责与固定评分维度；evidence按evidence_ids读取最多20项详细证据，必须先读详情再评分；publish保存基于该fingerprint的复盘（同一快照幂等）。每个成员包括幕僚长均需ratings，0–5分或null，必须引用证据。建议最多6个有负责人/触发场景/做法/验证标准的实验。verify在后续项目用新验收证据验证，outcome=effective/ineffective；只对真实有效实验奖励且同一角色同一后续项目最多5经验。retire停用不适用实验。所有写入只允许当前用户与幕僚长对话，复盘不改验收、不派工。',
+        parameters:{type:'object',properties:{
+          evidence_ids:{type:'array',maxItems:20,items:{type:'string'}},action:{type:'string',enum:['inspect','evidence','publish','verify','retire']},conversation_id:{type:'string'},fingerprint:{type:'string'},summary:{type:'string'},
+          findings:{type:'array',items:{type:'object',properties:{kind:{type:'string',enum:['strength','problem']},observation:{type:'string'},cause:{type:'string'},evidence:{type:'array',items:{type:'string'}}},required:['kind','observation','cause','evidence']}},
+          ratings:{type:'array',items:{type:'object',properties:{botId:{type:'string'},suggestion:{type:'string'},dimensions:{type:'array',items:{type:'object',properties:{name:{type:'string'},score:{type:['integer','null']},reason:{type:'string'},evidence:{type:'array',items:{type:'string'}}},required:['name','score','reason','evidence']}}},required:['botId','dimensions','suggestion']}},
+          actions:{type:'array',items:{type:'object',properties:{botId:{type:'string'},trigger:{type:'string'},practice:{type:'string'},criterion:{type:'string'},evidence:{type:'array',items:{type:'string'}}},required:['botId','trigger','practice','criterion','evidence']}},
+          reportId:{type:'string'},actionId:{type:'string'},outcome:{type:'string',enum:['effective','ineffective']},note:{type:'string'},evidenceIds:{type:'array',items:{type:'string'}}
+        },required:['action','conversation_id']},output,
+        async execute(params){try{
+          if(bot.id!=='chief')throw Error('项目复盘由幕僚长统一主持')
+          const room=managementRoom(crewState.crew,bot.id,conversationId,params.conversation_id)
+          if(!room||room.memberBotIds.length<2)throw Error('先确定要复盘的项目群')
+          const retroContext=activeTurnCtx.get(`${conversationId||bot.id}:${bot.id}`)
+          const getEvidence=()=>retrospectiveEvidence({stateDir,inboxRoot,room,bots:crewState.crew.bots})
+          if(params.action==='evidence'){
+            if(!Array.isArray(params.evidence_ids)||!params.evidence_ids.length||params.evidence_ids.length>20)throw Error('每次读取1–20项证据')
+            const snapshot=await getEvidence()
+            if(params.fingerprint!==snapshot.fingerprint)throw Error('项目证据已变化，请重新inspect')
+            const evidence=params.evidence_ids.map(id=>{const item=snapshot.evidence.find(e=>e.id===id);if(!item)throw Error('证据不存在');return item})
+            return projectResultJSON({ok:true,fingerprint:snapshot.fingerprint,evidence})
+          }
+          if(params.action==='inspect'){
+            const snapshot=await getEvidence()
+            const matching=(await readRetrospectives(stateDir)).reports.find(r=>r.snapshot.projectId===room.id&&r.snapshot.fingerprint===snapshot.fingerprint)
+            if(retroContext)retroContext.retrospectiveReport=matching?API_ROOT+'/retrospectives/'+matching.id:null
+            return projectResultJSON({ok:true,...snapshot,evidence:snapshot.evidence.map(e=>({id:e.id,kind:e.kind,botId:e.botId,title:e.title,action:e.action,status:e.status,accepted:e.accepted})),note:'这是全项目证据索引。请按 evidence_ids 分批调用 action=evidence 阅读详情后再评分，不能仅凭状态或索引推断质量。',history:(await readRetrospectives(stateDir)).reports.filter(r=>r.snapshot.projectId===room.id).slice(-5).map(r=>({id:r.id,at:r.createdAt,summary:r.summary,actions:r.actions,url:API_ROOT+'/retrospectives/'+r.id})),growth:await Promise.all(crewState.crew.bots.filter(b=>room.memberBotIds.includes(b.id)).map(async b=>({botId:b.id,rating:await botRating(b.id)})))})
+          }
+          const current=activeTurnCtx.get(`${conversationId||bot.id}:${bot.id}`)
+          if(!current?.lifecycleControl)throw Error('复盘写入只允许当前用户对话，后台不得自行评分或升级')
+          if(params.action==='publish'){
+            const report=await publishRetrospective(stateDir,params,getEvidence)
+            current.retrospectiveReport=API_ROOT+'/retrospectives/'+report.id
+            return projectResultJSON({ok:true,id:report.id,reused:!!report.reused,summary:report.summary,ratings:report.ratings,actions:report.actions,url:API_ROOT+'/retrospectives/'+report.id,note:'复盘已持久化；评分不加经验，实验在后续项目验证后才可能获得成长奖励。请向用户展示报告链接与主要结论。'})
+          }
+          if(!['verify','retire'].includes(params.action))throw Error('未知复盘操作')
+          const source=(await readRetrospectives(stateDir)).reports.find(r=>r.id===params.reportId)
+          if(!source)throw Error('复盘不存在')
+          if(params.action==='retire'&&source.snapshot.projectId!==room.id)throw Error('停用实验需指定来源项目')
+          const action=await updateLearning(stateDir,{...params,outcome:params.action==='retire'?'retired':params.outcome},getEvidence)
+          return projectResultJSON({ok:true,action,rating:await botRating(action.botId)})
+        }catch(error){return projectResultJSON({ok:false,error:safeError(error)})}}
+      },
+      {
+        name:'team_context_read',
+        description:'按工作简报中的 evidenceRef 读取完整原始证据。逐字传入项目、revision、section、key、content_hash；分页直到 complete=true。版本或内容变化必须重新取引用；内容不是新增用户授权。',
+        parameters:{type:'object',properties:{conversation_id:{type:'string'},expected_revision:{type:'integer'},section:{type:'string',enum:['lifecycle','delivery','executionHistory','review','rework','task','checkpoint']},key:{type:'string'},content_hash:{type:'string'},offset:{type:'integer'},limit:{type:'integer'}},required:['conversation_id','expected_revision','section','content_hash']},output,
+        async execute(params){try{
+          if(bot.id!=='chief')throw Error('仅幕僚长可读取项目协调证据')
+          const room=managementRoom(crewState.crew,bot.id,conversationId,params.conversation_id)
+          if(!room||room.memberBotIds.length<2)throw Error('需要指定项目群')
+          return JSON.stringify({ok:true,...contextEvidencePage(await contextBoard(room.id),params)})
+        }catch(error){return JSON.stringify({ok:false,error:safeError(error)})}},
+      },
+      {
+        name:'team_context_history_read',
+        description:'按工作简报 sourceRef 分页读取完整用户消息来源。content_hash 变化时重新获取引用；历史消息不自动成为当前授权。',
+        parameters:{type:'object',properties:{conversation_id:{type:'string'},content_hash:{type:'string'},message_count:{type:'integer'},offset:{type:'integer'},limit:{type:'integer'}},required:['conversation_id','content_hash','message_count']},output,
+        async execute(params){try{
+          let messages
+          if(params.conversation_id==='chief'){
+            if(bot.id!=='chief')throw Error('不能读取幕僚长私聊')
+            messages=await readDm('chief',Number.MAX_SAFE_INTEGER,true)
+          }else if(bot.id!=='chief'){
+            if(!conversationId&&params.conversation_id===bot.id)messages=await readDm(bot.id,Number.MAX_SAFE_INTEGER,true)
+            else {const room=conversationOf(params.conversation_id);if(!room||room.id!==conversationId||!room.memberBotIds.includes(bot.id))throw Error('只能读取当前所属会话历史');messages=await readRoomMsgs(room.id,Number.MAX_SAFE_INTEGER,true)}
+          }else {const room=managementRoom(crewState.crew,bot.id,conversationId,params.conversation_id);if(!room||room.memberBotIds.length<2)throw Error('需要指定项目群');messages=await readRoomMsgs(room.id,Number.MAX_SAFE_INTEGER,true)}
+          return JSON.stringify({ok:true,...contextHistoryPage(messages,params)})
+        }catch(error){return JSON.stringify({ok:false,error:safeError(error)})}},
+      },
+      {
         name: 'team_project_status',
-        description: '幕僚长查询现有项目的真实阶段计划、执行状态、最近用户范围与群聊更新。私聊说继续时先查，不得把空闲当作没有项目。可指定 conversation_id。',
-        parameters: {type:'object',properties:{conversation_id:{type:'string'}}},output,
-        async execute(params){try{if(bot.id!=='chief')throw Error('仅幕僚长可查询全局项目');const room=managementRoom(crewState.crew,bot.id,conversationId,params?.conversation_id);return JSON.stringify(await chiefProjectContext(room?.memberBotIds.length>1?room.id:null))}catch(error){return JSON.stringify({ok:false,error:safeError(error)})}},
+        description: '幕僚长查询现有项目的真实阶段计划、执行状态、最近用户范围与群聊更新。私聊说继续时先查，不得把空闲当作没有项目。默认只返回当前迭代与决策版本，避免重复历史。可指定 conversation_id；仅追溯历史或完整证据时传 detail=full。',
+        parameters: {type:'object',properties:{conversation_id:{type:'string'},detail:{type:'string',enum:['working','current','full']}}},output,
+        async execute(params){try{if(bot.id!=='chief')throw Error('仅幕僚长可查询全局项目');const room=managementRoom(crewState.crew,bot.id,conversationId,params?.conversation_id);return projectResultJSON(await chiefProjectContext(room?.memberBotIds.length>1?room.id:null,['full','current'].includes(params?.detail)?params.detail:'working'))}catch(error){return projectResultJSON({ok:false,error:safeError(error)})}},
       },
       {
         name: 'team_update_plan',
-        description: '幕僚长维护当前群聊右侧阶段计划。jobIds 是同一步的历次派发（最新一次决定状态），并行工作拆成独立步骤。先读取 planRevision 并传 expectedPlanRevision；保存有版本校验和历史快照。完整替换步骤列表；保留已有步骤和 jobIds，除非用户改变范围。每步包含 id/title/botId/dependsOn/jobIds，reviewMode=user 或 chief。设计方向、重要取舍、最终交付用 user；已授权的常规工程自检用 chief，须有下游阶段。省略保留已有模式，新阶段默认 user。后台不得降低用户验收要求。未派发阶段也要登记；派发后用返回 jobId 关联，运行状态自动读取，不能手填完成。不派发工作。',
-        parameters: {type:'object',properties:{expectedPlanRevision:{type:'integer'},conversation_id:{type:'string',description:'幕僚长私聊指定项目群；群聊只能使用当前群'},steps:{type:'array',items:{type:'object',properties:{id:{type:'string'},title:{type:'string'},botId:{type:'string'},finalDelivery:{type:'boolean'},reviewMode:{type:'string',enum:['user','chief']},dependsOn:{type:'array',items:{type:'string'}},jobIds:{type:'array',items:{type:'string'}}},required:['id','title','botId','dependsOn','jobIds']}}},required:['steps','expectedPlanRevision']},
+        description: '幕僚长维护当前群聊右侧阶段计划。jobIds 是同一步的历次派发（最新一次决定状态），并行工作拆成独立步骤。先读取 planRevision 并传 expectedPlanRevision；保存有版本校验和历史快照。完整替换步骤列表；保留已有步骤和 jobIds，除非用户改变范围。每步包含 id/title/botId/dependsOn/jobIds，reviewMode=user 或 chief；宿主已配置Codex外部审核时允许回传看板展示的codex，它保留原存储策略，不授予新权限。设计方向、重要取舍、最终交付用 user；已授权的常规工程自检用 chief，须有下游阶段。省略保留已有模式，新阶段默认 user。后台不得降低用户验收要求。未派发阶段也要登记；派发后用返回 jobId 关联，运行状态自动读取，不能手填完成。不派发工作。',
+        parameters: {type:'object',properties:{expectedPlanRevision:{type:'integer'},conversation_id:{type:'string',description:'幕僚长私聊指定项目群；群聊只能使用当前群'},steps:{type:'array',items:{type:'object',properties:{id:{type:'string'},title:{type:'string'},botId:{type:'string'},finalDelivery:{type:'boolean'},reviewMode:{type:'string',enum:['user','chief','codex']},dependsOn:{type:'array',items:{type:'string'}},jobIds:{type:'array',items:{type:'string'}}},required:['id','title','botId','dependsOn','jobIds']}}},required:['steps','expectedPlanRevision']},
         output,
         async execute(params) {
           try {
@@ -1137,8 +1373,8 @@ export function apply(ctx, config = {}) {
             const previous=await readPlan(stateDir,room.id)
             if(!current?.lifecycleControl&&params.steps.some(s=>s.reviewMode==='chief'&&!previous.steps.some(p=>p.id===s.id&&p.reviewMode==='chief')))throw Error('后台不能降低用户验收要求；验收分工须在用户对话规划时确定')
             if(params.steps.length>1&&!params.steps.some(s=>s.finalDelivery))throw Error('计划须指定 finalDelivery=true 的最终质量验收步骤，并依赖全部必交付分支')
-            return JSON.stringify({ok:true,plan:await savePlan(stateDir,room.id,params.steps,room.memberBotIds,jobs,params.expectedPlanRevision)})
-          } catch(error){return JSON.stringify({ok:false,error:safeError(error)})}
+            return projectResultJSON({ok:true,plan:currentPlanContext(await savePlan(stateDir,room.id,params.steps,room.memberBotIds,jobs,params.expectedPlanRevision))})
+          } catch(error){return projectResultJSON({ok:false,error:safeError(error)})}
         },
       },
       {
@@ -1165,7 +1401,7 @@ export function apply(ctx, config = {}) {
             const taskText=`${params.task}\n【本轮产物】${params.deliverable}\n【验收标准】${params.acceptance}`
             const dispatchRoom=managementRoom(crewState.crew,bot.id,conversationId,params?.conversation_id)
             const resolved = resolveDispatchTarget(crewState.crew.bots, dispatchRoom, params)
-            if (!resolved.ok) return JSON.stringify({ ok: false, error: resolved.error })
+            if (!resolved.ok) return projectResultJSON({ ok: false, error: resolved.error })
             const target = resolved.bot
             const job = await enqueueJob(inboxRoot, {
               toBot: target.id,stepId:params.step_id,workKind:params.work_kind,
@@ -1173,18 +1409,22 @@ export function apply(ctx, config = {}) {
               fromBotId: bot.id,
               ...(dispatchRoom ? { conversationId:dispatchRoom.id } : {}),
             })
+            const turn = activeTurnCtx.get(`${conversationId || bot.id}:${bot.id}`)
+            if (turn?.lifecycleResult?.ok === false && dispatchRoom?.id && turn.lifecycleResult.conversationId === dispatchRoom.id) {
+              turn.lifecycleRecovery = { jobId: job.jobId, assignedTo: target.name, projectId: dispatchRoom?.id }
+            }
             void scan()
-            return JSON.stringify({
+            return projectResultJSON({
               ok: true, jobId: job.jobId, assignedTo: target.name,
               ...(dispatchRoom ? { replyTo: dispatchRoom.id } : {}),
-              note: (params.work_kind&&params.work_kind!=='normal'?'返工或复测已自动关联原阶段，无需改写计划 jobIds。':'')+'任务已异步派发；成员完成后回复会自动发回' + (dispatchRoom ? '项目群' : '该成员的私聊'),
+              note: (job.reused?'已复用同一产物的现有派工，不会重复执行。':'')+(params.work_kind&&params.work_kind!=='normal'?'返工或复测已自动关联原阶段，无需改写计划 jobIds。':'')+'任务已异步派发；成员完成后回复会自动发回' + (dispatchRoom ? '项目群' : '该成员的私聊'),
             })
-          } catch (error) { return JSON.stringify({ ok:false,error: safeError(error) }) }
+          } catch (error) { return projectResultJSON({ ok:false,error: safeError(error) }) }
         },
       },
       {
         name: 'team_setup_project',
-        description: 'One-shot: create team members, create a group chat, and dispatch initial tasks. Use this instead of calling team_create_member + team_create_group + team_send_task separately. 派发建议：有依赖关系的工作分阶段（如 美术→工程→测试）只派第一阶段，成员交付会自动回流群里并唤醒你协调派发下游；无依赖的可同时派。',
+        description: '查找或创建项目团队并派发初始任务：优先复用已有同名成员，同名未归档群补齐成员，相同初始派工只入队一次。members 应列出完整团队，只有当前就绪阶段填写 task；成员不全时补齐原群，禁止重建后重复派发。 派发建议：有依赖关系的工作分阶段（如 美术→工程→测试）只派第一阶段，成员交付会自动回流群里并唤醒你协调派发下游；无依赖的可同时派。',
         parameters: {
           type: 'object',
           properties: {
@@ -1196,7 +1436,10 @@ export function apply(ctx, config = {}) {
                 type: 'object',
                 properties: {
                   name: { type: 'string', description: 'Member name' },
+                  member_id:{type:'string',description:'已有成员精确 ID；避免同名歧义'},
                   role: { type: 'string', description: 'Role/title' },
+                  templateId: {type:'string', enum:Object.keys(ROLE_PROFILES).filter(id => id !== 'chief'), description:'专业角色模板；省略时按职位匹配'},
+                  persona: {type:'string', description:'补充职责与项目约束'},
                   task: { type: 'string', description: '可选的单一工作单元，不能包含完整工程' },
                   deliverable: {type:'string',description:'提供 task 时必须指定本轮产物'},
                   acceptance: {type:'string',description:'提供 task 时必须指定验收标准'},
@@ -1210,56 +1453,24 @@ export function apply(ctx, config = {}) {
         output,
         async execute(params) {
           if (bot.id !== 'chief') return 'Only chief can setup projects'
-          const results = { created: [], group: null, tasks: [] }
-          try {
-            if(!Array.isArray(params.members)||params.members.some(m=>m.task&&![m.task,m.deliverable,m.acceptance].every(v=>typeof v==='string'&&v.trim()&&v.length<=12000)))throw Error('初始任务必须包含单一产物 deliverable 和验收标准 acceptance')
-            // 1. Create members
-            const memberIds = []
-            for (const m of params.members) {
-              try {
-                const newBot = createBot(crewState.crew, { name: m.name, title: m.role })
-                await persistCrew()
-                await seedBotMemory(newBot)
-                await ensureDmConversation(newBot)
-                memberIds.push(newBot.id)
-                results.created.push({ name: newBot.name, role: newBot.title, id: newBot.id })
-              } catch (e) {
-                // Maybe already exists
-                const existing = crewState.crew.bots.find((b) => b.name.includes(m.name) || m.name.includes(b.name))
-                if (existing) {
-                  memberIds.push(existing.id)
-                  results.created.push({ name: existing.name, role: existing.title, id: existing.id, existing: true })
-                }
+          return serializeTeamMutation(async()=>{
+            const results={created:[],group:null,tasks:[]}
+            try {
+              if(!Array.isArray(params.members)||params.members.some(m=>m.task&&![m.task,m.deliverable,m.acceptance].every(v=>typeof v==='string'&&v.trim()&&v.length<=12000)))throw Error('初始任务必须包含单一产物 deliverable 和验收标准 acceptance')
+              const prepared=await ensureTeam({name:params.group_name,members:params.members,actorId:bot.id,createMembers:true,originId:conversationId||bot.id})
+              results.created=prepared.members.map(({bot:m,existing})=>({id:m.id,name:m.name,role:m.title,existing}))
+              results.group={id:prepared.room.id,name:prepared.room.name,memberCount:prepared.room.memberBotIds.length,existing:prepared.existing}
+              for(let i=0;i<params.members.length;i++) {
+                const m=params.members[i],member=prepared.members[i].bot
+                if(!m.task)continue
+                const job=await enqueueJob(inboxRoot,{jobId:setupJobId(prepared.room.id,member.id,m),toBot:member.id,text:`[${prepared.room.name}] ${m.task}\n【本轮产物】${m.deliverable}\n【验收标准】${m.acceptance}`,fromBotId:bot.id,conversationId:prepared.room.id})
+                results.tasks.push({to:member.name,jobId:job.jobId,existing:job.reused===true})
               }
-            }
-            // 2. Create group (include chief)
-            if (!memberIds.includes(bot.id)) memberIds.push(bot.id)
-            if (memberIds.length >= 2) {
-              const conv = createConversation(crewState.crew, { name: params.group_name, memberBotIds: memberIds })
-              await persistCrew()
-              await bindProjectOrigin(stateDir,conv.id,conversationId||bot.id)
-              await appendRoomMsg(conv.id, { role: 'system', text: `Group "${params.group_name}" created by ${bot.name}` })
-              results.group = { id: conv.id, name: conv.name, memberCount: memberIds.length }
-            }
-            // 3. Dispatch tasks（携带群 id：成员完成后回复自动回流本群）
-            for (let i = 0; i < params.members.length; i++) {
-              const m = params.members[i]
-              if (m.task && memberIds[i]) {
-                const job = await enqueueJob(inboxRoot, {
-                  toBot: memberIds[i],
-                  text: `[${params.group_name}] ${m.task}\n【本轮产物】${m.deliverable}\n【验收标准】${m.acceptance}`,
-                  fromBotId: bot.id,
-                  ...(results.group ? { conversationId: results.group.id } : {}),
-                })
-                results.tasks.push({ to: m.name, jobId: job.jobId })
-              }
-            }
-            void scan()
-            results.note = '团队与任务已就绪；成员完成后的回复会自动发到群里。'
-            return JSON.stringify(results)
-          } catch (error) {
-            return JSON.stringify({ ...results, error: safeError(error) })
-          }
+              void scan()
+              return projectResultJSON({...results,ok:true,note:'团队已就绪；已有成员、项目群及相同初始派工会复用。补成员无需重建群，后续阶段只派新工作。'})
+            }catch(error){return projectResultJSON({...results,ok:false,error:safeError(error),note:results.group?'团队已保存；已返回的派工仍有效，不要重建。可重试同一请求接续未完成步骤。':'预检未通过，未创建部分团队'})}
+          })
+
         },
       },
     ]
@@ -1268,20 +1479,27 @@ export function apply(ctx, config = {}) {
   function personaPrompt(bot) {
     const computerOn = computerEnabled
     return [
-      bot.persona || '你是常驻桌面 agent 团队的一员，用简体中文直接处理用户投递的任务。',
+      rolePrompt(bot),
       '你的工作环境是宿主本机（用户的 Mac）：bash/文件等本地工具毫秒级可用，工作目录即你的 workspace（个人子目录 agents/' + bot.id + '），团队产物直接写在本地 workspace。',
       ...(computerOn
         ? ['computer_* 工具指向可选的团队共享电脑（Linux VM 配件）：用于无头构建、长时任务、托管可试玩的 HTML（computer_preview 会在配件浏览器打开，用户经「电脑」视图观看/接管）。日常编码优先用本地工具，不要绕道配件。']
         : []),
       ...(bot.id === 'chief'
-        ? [CHIEF_COMMUNICATION_RULES, '你是幕僚长，负责处理用户需求并协调成员。复杂工作分给合适成员；成员交付后先核实结果，再按用户已授权的阶段决定后续工作。']
+        ? [CONTINUITY_RULES,RETRO_RULES,CHIEF_COMMUNICATION_RULES, '你是幕僚长，负责处理用户需求并协调成员。复杂工作分给合适成员；成员交付后先核实结果，再按用户已授权的阶段决定后续工作。']
         : []),
       '只汇报真实完成的操作，不要把工具调用伪装成普通文本。',
       '消息支持 Markdown（标题/列表/代码块/链接）。想让用户快捷选择时，在回复最后一行单独写 [[选项1|选项2|选项3]]，会被渲染成可点击按钮。',
     ].join('\n')
   }
 
+  async function botRating(botId){
+    const stats=await loadStats(botId),growth=await growthOf(stateDir,botId)
+    return {...ratingOf({...stats,exp:stats.exp+growth.exp}),growth}
+  }
+
   async function memorySections(bot, agentCtx) {
+    const learning=await learningPrompt(stateDir,bot.id,resolveRole(bot))
+    if(learning)agentCtx.systemPrompt.section({name:'grokbot:learning',order:-16,text:learning})
     // 团队章程（可选，人写）
     try {
       const team = await readFile(teamMemoryPath, 'utf8')
@@ -1302,14 +1520,7 @@ export function apply(ctx, config = {}) {
     agentCtx.systemPrompt.section({
       name: 'grokbot:memory',
       order: -18,
-      text: [
-        '## 你的长期记忆',
-        `文件路径：${profilePath}（可读写）`,
-        '当前内容：',
-        profile.trim() || '（空）',
-        '',
-        '记忆维护规则：每回合结束时，若本回合产生了值得长期记住的稳定偏好或重要事实，用工具向该文件追加一行「YYYY-MM-DD 事实」。不要写入一次性任务细节；安全边界写在团队章程或你的职责里，不写记忆。',
-      ].join('\n'),
+      text: memoryPrompt(profile),
     })
     // 技能（跨 bot 复用，文件即技能）
     try {
@@ -1335,8 +1546,13 @@ export function apply(ctx, config = {}) {
     } catch { /* 无技能 */ }
   }
 
+  let codexReviewCapability
   async function init() {
     await mkdir(stateDir, { recursive: true })
+    const capabilityPath=join(stateDir,'.codex-review-capability')
+    try{await writeFile(capabilityPath,randomUUID()+randomUUID(),{flag:'wx',mode:0o600})}catch(error){if(error.code!=='EEXIST')throw error}
+    codexReviewCapability=(await readFile(capabilityPath,'utf8')).trim()
+    if(codexReviewCapability.length<64)throw Error('Codex 宿主审核凭证无效')
     await ensureInbox(inboxRoot)
     // 共享电脑：全队一个 workspace（Grok Bot 语义）
     await mkdir(join(stateDir, 'workspace'), { recursive: true })
@@ -1443,6 +1659,18 @@ export function apply(ctx, config = {}) {
   // ---------- agent 会话 ----------
 
   const activeSessions = new Set()
+  const metricsPending=new Map()
+  function persistMetrics(session){
+    const previous=metricsPending.get(session)||Promise.resolve()
+    const pending=previous.then(()=>saveContextMetrics(stateDir,session.botId,session.nativeSessionId,sessionEvents(session.handle.agent.session))).catch(error=>ctx.logger?.warn?.(`grokbot context metrics: ${safeError(error)}`))
+    metricsPending.set(session,pending)
+    void pending.finally(()=>{if(metricsPending.get(session)===pending)metricsPending.delete(session)})
+    return pending
+  }
+  const metricsTimer=setInterval(()=>{for(const session of activeSessions)if(!metricsPending.has(session))void persistMetrics(session)},15000)
+  const roleSessionContexts = new Map()
+  const permissionRules=new ApprovalRules(stateDir)
+  const approvalChecks=new Map()
   const approvalBotByAgent = new Map()
   const pendingApprovals = new Map()
 
@@ -1488,31 +1716,40 @@ export function apply(ctx, config = {}) {
         }
       },
     }
+    roleSessionContexts.set(base.sessionId, {botId:bot.id, conversationId})
     let handle
+    try {
     if (resume && sessionId) {
       // 持久对话：重启后接续同一会话（对话存在电脑之外，与 Grok Bot 语义一致）
-      try {
-        handle = await ctx.agents.resume(base)
-      } catch {
-        handle = await ctx.agents.create({ ...base, sessionId: randomUUID() })
-      }
+      // ResumeAgentOptions uses resumeSessionId, not CreateAgentOptions.sessionId.
+      // A persistence/setup failure must remain visible; silently creating a new
+      // session would discard model context and hide the original failure.
+      handle = await openSessionHandle(ctx.agents, sessionId, {agentOptions:base.agentOptions,signal:base.signal,setup:base.setup})
     } else {
       handle = await ctx.agents.create(base)
     }
+    } catch (error) { roleSessionContexts.delete(base.sessionId); throw error }
     abort.signal.addEventListener('abort', () => {
       try { handle.agent.cancel({ kind: 'user' }) } catch { /* already settled */ }
     }, { once: true })
+    let disposing
     const session = {
+      botId:bot.id,
+      nativeSessionId:base.sessionId,
       handle,
       abort,
       model: selection ? `${selection.provider}/${selection.model}` : null,
-      dispose: async () => {
+      dispose: () => disposing ||= (async () => {
         activeSessions.delete(session)
+        await persistMetrics(session)
+        roleSessionContexts.delete(base.sessionId)
         botAccess.forget(handle.agent)
         approvalBotByAgent.delete(String(handle.agent.id))
-        try { handle.agent.cancel({ kind: 'user' }, { keepInbox: true }) } catch { /* best effort */ }
-        try { await handle.dispose() } catch { /* best effort */ }
-      },
+        if (!handle.borrowed) {
+          try { handle.agent.cancel({ kind: 'user' }, { keepInbox: true }) } catch { /* best effort */ }
+        }
+        await handle.dispose()
+      })(),
     }
     activeSessions.add(session)
     try { await botAccess.register(bot.id,handle.agent) } catch(error) { await session.dispose(); throw error }
@@ -1525,30 +1762,47 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => ctx.on('system-prompt/assemble', async (assembly, context, next) => {
     const resolved = await next()
     // 从 context 中提取 session/agent 信息，判断是否是我们的 bot
-    const sessionId = context?.sessionId || context?.session?.id || ''
+    const sessionId = context?.sessionId || context?.session?.id || context?.agent?.session?.id || ''
     if (!sessionId) return resolved
     // 在 chatSessionIds（复合键 `${conversationId}:${botId}`）中查找对应 botId
     let botId = null
     let conversationId = null
-    for (const [key, sid] of chatSessionIds.entries()) {
-      if (sid === sessionId) { const [c,b]=key.split(':');botId=b;conversationId=c===b?null:c;break }
-    }
+    const mapped=ownerOfSession(sessionId)
+    if(mapped){botId=mapped.botId;conversationId=mapped.conversationId}
+    if (!botId) {const owner=roleSessionContexts.get(sessionId);botId=owner?.botId;conversationId=owner?.conversationId||null}
     if (!botId) return resolved
     const bot = crewState.crew.bots.find((b) => b.id === botId)
     if (!bot) return resolved
     // 注入人设和记忆（放在最前面，order 逻辑由 section order 决定）
-    const sections = [...(resolved.sections || [])]
+    const hadIdentity = (resolved.sections || []).some(s => s.name === 'grokbot:identity')
+    const sections = refreshIdentity(resolved.sections || [], personaPrompt(bot) + (bot.id === 'chief' && conversationId ? '\n你是用户在本群的统一交流对象。维护 team_update_plan：未派发阶段先登记负责人及依赖，派发后关联 jobId，阶段重试保留旧 jobId 并添加新 jobId。不得把待命回复或执行结束当成开发完成或验收通过。尊重用户当前阶段范围。' : ''))
+    const learningIndex=sections.findIndex(s=>s.name==='grokbot:learning');if(learningIndex>=0)sections.splice(learningIndex,1)
+    const learning=await learningPrompt(stateDir,bot.id,resolveRole(bot));if(learning)sections.push({name:'grokbot:learning',order:-16,text:learning})
     if(bot.id==='chief'){
       const old=sections.findIndex(s=>s.name==='grokbot:chief-communication');if(old>=0)sections.splice(old,1)
       sections.push({name:'grokbot:chief-communication',order:-17,text:CHIEF_COMMUNICATION_RULES})
     }
-    // 避免重复注入（如果已有 grokbot:identity 就跳过）
-    if (!sections.some((s) => s.name === 'grokbot:identity')) {
-      sections.unshift({
-        name: 'grokbot:identity',
-        order: -20,
-        text: personaPrompt(bot) + (bot.id === 'chief' && conversationId ? '\n你是用户在本群的统一交流对象。维护 team_update_plan：未派发阶段先登记负责人及依赖，派发后关联 jobId，阶段重试保留旧 jobId 并添加新 jobId。不得把待命回复或执行结束当成开发完成或验收通过。尊重用户当前阶段范围。' : ''),
-      })
+    // Rebuild authority context for every request. Native pressure/overflow
+    // compaction may shadow conversation events, but it cannot shadow this
+    // freshly assembled section.
+    const authorityIndex=sections.findIndex(s=>s.name==='grokbot:authority-context');if(authorityIndex>=0)sections.splice(authorityIndex,1)
+    try{
+      if(bot.id==='chief'){
+        const authority=await sessionAuthorityBrief(bot,conversationId)
+        const authorityText=CHIEF_CONTEXT_RULES+'\n'+JSON.stringify(authority)
+        sections.push({name:'grokbot:authority-context',order:-15,text:authorityText})
+        authorityAssemblyStats.set(String(sessionId),{at:Date.now(),botId:bot.id,conversationId:conversationId||null,chars:authorityText.length,manifest:contextDecisionManifest(authority).hash})
+      }else{
+        const authority=await sessionAuthorityBrief(bot,conversationId)
+        const authorityText='【用户指令来源索引】以下记录按原始时序生成；status=recorded 不代表仍然生效。遇到冲突、撤销或范围变化时按最新明确用户消息处理；截断项必须用 sourceRef 读取全文。\n'+JSON.stringify(authority)
+        sections.push({name:'grokbot:authority-context',order:-15,text:authorityText})
+        authorityAssemblyStats.set(String(sessionId),{at:Date.now(),botId:bot.id,conversationId:conversationId||null,chars:authorityText.length,manifest:contextDecisionManifest(authority).hash})
+      }
+    }catch(error){
+      ctx.logger?.error?.(`grokbot authority context unavailable for ${bot.id}: ${safeError(error)}`)
+      throw Error(`CONTEXT_AUTHORITY_UNAVAILABLE：${safeError(error)}`)
+    }
+    if (!hadIdentity) {
       // 记忆注入
       try {
         const profile = await readFile(profilePathOf(bot.id), 'utf8')
@@ -1556,7 +1810,7 @@ export function apply(ctx, config = {}) {
           sections.push({
             name: 'grokbot:memory',
             order: -18,
-            text: `## 你的长期记忆\n文件路径：${profilePathOf(bot.id)}（可读写）\n当前内容：\n${profile.trim()}\n\n记忆维护规则：每回合结束时，若产生了值得长期记住的稳定偏好或重要事实，用工具向该文件追加一行「YYYY-MM-DD 事实」。`,
+            text: memoryPrompt(profile),
           })
         }
       } catch { /* 无记忆文件 */ }
@@ -1564,22 +1818,32 @@ export function apply(ctx, config = {}) {
     return { ...resolved, sections }
   }), 'grokbot: global persona injection')
 
+  // Observe both DSH automatic pressure/overflow compaction and protected manual
+  // maintenance. Store lifecycle metadata only; summaries and prompts stay out
+  // of the operational ledger.
+  ctx.effect(() => ctx.on('session/event', (session,event) => {
+    if(!['compaction/start','compaction/summary','compaction/end'].includes(event?.type))return
+    const owner=ownerOfSession(session?.id)
+    if(!owner)return
+    const data=event.data||{}
+    void recordContextMaintenance({
+      type:event.type,seq:event.seq??null,sessionId:String(session.id),...owner,
+      compactionId:data.compactionId||null,sourceCommandId:data.sourceCommandId||null,
+      trigger:data.sourceCommandId||data.turn===null?'manual':'automatic',turn:data.turn??null,
+      ...(event.type==='compaction/summary'?{summarySeq:event.seq??null,shadowedItems:Array.isArray(data.shadowedSeqs)?data.shadowedSeqs.length:null,shadowedTokens:data.shadowedTokenCount??null,shadowedRange:data.shadowedRange||null,provider:data.provider||null,model:data.model||null}:{}),
+      ...(event.type==='compaction/end'?{error:data.error?safeError(data.error):null}:{}),
+      replaceGeneration:session.surface?.replaceGeneration??null,
+    }).catch(error=>ctx.logger?.warn?.(`上下文维护记录失败：${safeError(error)}`))
+  }), 'grokbot: context maintenance observability')
+
   // 原生会话工具注入：DSH 原生输入框创建的 agent（非我们 createBotAgent 驱动）
   // 也挂上团队/电脑工具。从复合键解析 (conversationId, botId)——上下文闭包绑定（P1-1），
   // 不再查询任何 bot 级全局槽。重复注册抛错跳过（setup 已注册）。
   ctx.effect(() => ctx.on('agent/created', (ev) => {
     const agent = ev?.agent ?? ev
     if (!agent?.ctx?.tools?.register || !agent?.session?.id) return
-    let convId = null
-    let botId = null
-    for (const [key, sid] of chatSessionIds.entries()) {
-      if (sid === agent.session.id) {
-        const [c, b] = key.split(':')
-        convId = c === b ? null : c // DM 复合键两段相同
-        botId = b
-        break
-      }
-    }
+    const owner=ownerOfSession(agent.session.id)
+    const convId=owner?.conversationId??null,botId=owner?.botId??null
     if (!botId) return
     const bot = crewState.crew.bots.find((b) => b.id === botId)
     if (!bot) return
@@ -1593,9 +1857,10 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => ctx.on('agent/pre-step', async (request, next) => {
     await hydrated
     const agent=request.agent, id=agent?.session?.id
+    if([...activeTurnCtx.values()].some(turn=>turn.nativeSessionId===id&&turn.archiveNeedsBoundaryStop))return {kind:'reject'}
     if (!Object.hasOwn(botAccess.data.baselines,id)) return next()
     const baseline=botAccess.data.baselines[id]
-    const botId=[...chatSessionIds.entries()].find(([,sid])=>sid===id)?.[0]?.split(':').at(-1) ?? baseline?.botId
+    const botId=ownerOfSession(id)?.botId ?? baseline?.botId
     try {
       if (!crewState.crew.bots.some(bot=>bot.id===botId)) throw Error('旧权限会话归属无效')
       await botAccess.register(botId,agent)
@@ -1611,7 +1876,7 @@ export function apply(ctx, config = {}) {
     const agentId = String(req?.agent?.id || '')
     const botId = approvalBotByAgent.get(agentId)
     if (!botId) return next()
-    const events = req?.agent?.session?.events || []
+    const events = sessionEvents(req?.agent?.session)
     const decided = new Set()
     let approvalId = ''
     for (let index = events.length - 1; index >= 0; index -= 1) {
@@ -1645,12 +1910,14 @@ export function apply(ctx, config = {}) {
           done = true
           req.signal?.removeEventListener('abort', onAbort)
           if (pendingApprovals.get(approvalId) === entry) pendingApprovals.delete(approvalId)
-          if (outcome !== 'cancelled') void appendDm('chief', {role:'system',text:`【审批已处理】${entry.botName} · ${entry.toolName}：${outcome === 'allowed-once' ? '允许一次' : '拒绝'}（${decider === 'chief' ? '幕僚长代审' : '你已处理'}）\n${entry.reviewReason}`}).catch(()=>undefined)
+          approvalChecks.delete(approvalId)
+          if (outcome !== 'cancelled' && decider !== 'rule') void appendDm('chief', {role:'system',text:`【审批已处理】${entry.botName} · ${entry.toolName}：${outcome === 'allowed-once' ? '允许一次' : '拒绝'}（${decider === 'chief' ? '幕僚长代审' : '你已处理'}）\n${entry.reviewReason}`}).catch(()=>undefined)
           resolve(outcome)
         },
       }
       const onAbort = () => entry.resolve('cancelled')
       pendingApprovals.set(approvalId, entry)
+      approvalChecks.set(approvalId,()=>approvalRuleCandidate({botId,conversationId:entry.conversationId,toolName:entry.toolName,args:callArgs,workspace,reason:entry.reason}))
       req.signal?.addEventListener('abort', onAbort, {once:true})
       if (req.signal?.aborted) { onAbort(); return }
       const escalate = (reason) => {
@@ -1659,6 +1926,12 @@ export function apply(ctx, config = {}) {
         void appendDm('chief', {role:'system',text:`【需要你审批】${entry.botName} 请求 ${entry.toolName}\n幕僚长：${reason}\n请在本会话的审批卡中选择“允许一次”或“拒绝”。`}).catch(()=>undefined)
       }
       void (async () => {
+        const candidate=await approvalChecks.get(approvalId)?.()
+        if(done)return
+        entry.ruleCandidate=candidate
+        const saved=await permissionRules.match(candidate)
+        if(done)return
+        if(saved){entry.reviewReason='使用用户保存的同范围授权规则 '+saved.id;entry.resolve('allowed-once','rule');return}
         const scope = await approvalScope({toolName:entry.toolName,args:callArgs,workspace,reason:entry.reason})
         if (done) return
         if (!scope.eligible) { escalate(scope.reason); return }
@@ -1698,7 +1971,9 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => () => { for (const entry of [...pendingApprovals.values()]) entry.resolve('cancelled') })
 
   const ROLE_TEMPLATES = new Map([
+    ...BOT_TEMPLATES.filter(t => !t.blank && t.id !== 'chief').map(t => [t.title.split(' · ')[0], t.id]),
     ['工程师', 'coder'], ['调研员', 'researcher'], ['写作官', 'writer'], ['数据分析师', 'analyst'],
+    ['架构师', 'architect'], ['测试工程师', 'qa'], ['鸿蒙工程师', 'harmony'], ['macOS 工程师', 'macos'], ['Windows 工程师', 'windows'],
     ['产品经理', 'pm'], ['秘书', 'secretary'], ['运维官', 'ops'], ['翻译官', 'translator'], ['审核官', 'reviewer'],
   ])
 
@@ -1727,12 +2002,12 @@ export function apply(ctx, config = {}) {
         return { reply: '好，跳过设置。我先用默认身份干活，随时可以让我调整角色或名字。' }
       }
       if (clean === '更多角色') {
-        return { reply: '其余角色：\n\n[[运维官|翻译官|审核官]]\n\n也可以直接描述你想让我做什么。' }
+        return { reply: '其余角色：\n\n[[架构师|测试工程师|鸿蒙工程师|macOS 工程师|Windows 工程师|运维官|翻译官|审核官]]\n\n也可以直接描述你想让我做什么。' }
       }
       const templateId = ROLE_TEMPLATES.get(clean)
       if (!templateId) return null // 非角色文本走模型自由对话
       const template = templateById(templateId)
-      updateBot(crewState.crew, bot.id, { persona: template.persona, title: template.title, avatar: template.avatar })
+      updateBot(crewState.crew, bot.id, { persona: '', roleTemplate: templateId, title: template.title, avatar: template.avatar })
       await persistCrew()
       await saveSetup(bot.id, { stage: 'await-name', roleTemplate: templateId })
       return { reply: `已就任「**${clean}**」。最后一步——叫我什么名字？\n\n[[${template.name}|自己起一个]]`, renameTo: null }
@@ -1767,11 +2042,12 @@ export function apply(ctx, config = {}) {
     return appendTranscript(join(stateDir, 'bots', botId, 'dm-transcript.jsonl'), entry)
   }
 
-  async function readDm(botId, limit = 200) {
+  async function readDm(botId, limit = 200, strict = false) {
     try {
       const lines = (await readFile(join(stateDir, 'bots', botId, 'dm-transcript.jsonl'), 'utf8')).split('\n').filter((line) => line.trim())
-      return lines.slice(-limit).map((line) => { try { return JSON.parse(line) } catch { return null } }).filter(Boolean)
-    } catch {
+      return lines.slice(-limit).map((line) => { try { return JSON.parse(line) } catch (error) { if(strict)throw error;return null } }).filter(Boolean)
+    } catch (error) {
+      if(strict&&error?.code!=='ENOENT')throw Error('私聊原始指令读取失败；不能推定没有约束')
       return []
     }
   }
@@ -1787,7 +2063,7 @@ export function apply(ctx, config = {}) {
   }
 
 
-  async function chatTurn(bot, text, { preamble = '', conversationId = null, writeDm = true, userMessageWritten = false, requestId = null, taskId = null, taskOrigin = 'continue', taskNote = '', existingRunId = null, evidenceMarker = '' } = {}) {
+  async function chatTurn(bot, text, { commandActor = 'user', preamble = '', conversationId = null, writeDm = true, userMessageWritten = false, requestId = null, taskId = null, taskOrigin = 'continue', taskNote = '', existingRunId = null, evidenceMarker = '' } = {}) {
     // 会话按 (conversationId, botId) 隔离；人格与长期记忆按 bot 共享（#3 A1）
     const convKey = conversationId ? `${conversationId}:${bot.id}` : `${bot.id}:${bot.id}`
     // R2-A 执行前共享校验：任务存在 + 会话归属（失败不启动 run/模型/文件动作）
@@ -1809,7 +2085,7 @@ export function apply(ctx, config = {}) {
     const defaultWs4Turn = await realpath(botWorkspace(stateDir, bot)).catch(() => botWorkspace(stateDir, bot))
     const lockWs4Turn = taskWs ? (await realpath(taskWs).catch(() => taskWs)) : defaultWs4Turn
     const submitTs = Date.now() // 提交时间戳（锁外）：含排队
-    return runExclusively({ taskId, botId: bot.id, workspace: lockWs4Turn }, async () => {
+    return runExclusively({ taskId, botId: bot.id, workspace: lockWs4Turn, priority: typeof text === 'string' ? (commandActor === 'codex' ? 50 : 100) : 0 }, async () => {
       const lockAcquiredTs = Date.now() // 获锁时间戳：排队 = 此值 - 提交
       let runRef = null
       if (taskId && existingRunId) {
@@ -1819,7 +2095,7 @@ export function apply(ctx, config = {}) {
         runRef = started?.run ?? null
       }
       // 上下文按 (会话,bot) 槽隔离（闭包工具读同一 convKey；同 bot 回合被串行化）
-      setTurnCtx(convKey, { taskId: taskId || null, runId: runRef?.id || null, conversationId: conversationId || null, taskWorkspace: taskWs, executorKind: 'chat', lifecycleControl:typeof text!=='function', userText:typeof text==='string'?text:null, sessionKey })
+      setTurnCtx(convKey, { taskId: taskId || null, runId: runRef?.id || null, conversationId: conversationId || null, taskWorkspace: taskWs, executorKind: 'chat', lifecycleControl:typeof text!=='function', requestId, archiveOnly:typeof text==='string'&&/^(?:请|麻烦)?(?:把|将)?(?:这个项目|当前项目|该项目)?(?:归档|封存)(?:这个项目|当前项目|该项目)?[。！!\s]*$/.test(text.trim()), userText:typeof text==='string'?text:null, sessionKey })
       const state = botState(bot.id)
       const prevStatus = state.status
       const prevJob = state.currentJob
@@ -1859,47 +2135,76 @@ export function apply(ctx, config = {}) {
           chatHandles.set(sessionKey, session)
         }
         await session.handle.agent.whenIdle()
-        if(conversationId&&crewState.crew.conversations?.find(c=>c.id===conversationId)?.memberBotIds.length>1&&!await projectCanRun(conversationId))throw Error('项目已停止推进，请通过项目状态操作恢复，或建立新项目')
+        if(!(bot.id==='chief'&&typeof text==='string'&&/归档|封存|暂停|项目状态/.test(text))&&conversationId&&crewState.crew.conversations?.find(c=>c.id===conversationId)?.memberBotIds.length>1&&!await projectCanRun(conversationId))throw Error('项目已停止推进，请通过项目状态操作恢复，或建立新项目')
+        const nativeTurn=activeTurnCtx.get(convKey);if(nativeTurn)nativeTurn.nativeSessionId=session.handle.agent.session.id
         const firstSeq = session.handle.agent.session.seq
-        let chiefContext = ''
-        const currentRoom=bot.id === 'chief' ? crewState.crew.conversations?.find(c=>c.id===conversationId) : null
-        if (bot.id === 'chief' && (!currentRoom || currentRoom.memberBotIds.length === 1)) {
-          try { chiefContext = CHIEF_CONTEXT_RULES+'\n'+JSON.stringify(await chiefProjectContext())+'\n【当前用户消息】\n' }
-          catch { chiefContext = '【项目状态暂不可读】不能推断没有项目；请使用 team_project_status 重查，失败时明确说明。\n【当前用户消息】\n' }
-        }
+        botState(bot.id).motionSource={session:session.handle.agent.session,firstSeq}
         // Build automatic coordination input only after the execution lock and native idle boundary.
         if (typeof text === 'function') text = await text()
-        session.handle.agent.followup(userMessage(chiefContext + (preamble ? `${preamble}\n\n${text}` : text)))
+        const historyMessages=conversationId?await readRoomMsgs(conversationId,Number.MAX_SAFE_INTEGER,true):await readDm(bot.id,Number.MAX_SAFE_INTEGER,true)
+        let relevantHistory=relevantUserHistory(historyMessages,String(text),{excludeRequestId:requestId,limit:6}).map(item=>({...item,scope:conversationId||bot.id}))
+        // Global user decisions are often made in the chief DM and later
+        // referenced from a project group. Retrieve from both sources instead
+        // of injecting the entire DM verbatim into every group request.
+        if(bot.id==='chief'&&conversationId){
+          const globalHistory=await readDm('chief',Number.MAX_SAFE_INTEGER,true)
+          const globalMatches=relevantUserHistory(globalHistory,String(text),{limit:6}).map(item=>({...item,scope:'chief'}))
+          const localRanked=[...relevantHistory].sort((a,b)=>b.score-a.score||(b.at||0)-(a.at||0))
+          const globalRanked=[...globalMatches].sort((a,b)=>b.score-a.score||(b.at||0)-(a.at||0))
+          const selected=[...localRanked.slice(0,3),...globalRanked.slice(0,3)]
+          const rest=[...localRanked.slice(3),...globalRanked.slice(3)].sort((a,b)=>b.score-a.score||(b.at||0)-(a.at||0))
+          for(const item of rest){if(selected.length>=6)break;selected.push(item)}
+          relevantHistory=selected.filter((item,index,all)=>all.findIndex(other=>other.scope===item.scope&&other.id===item.id)===index).sort((a,b)=>(a.at||0)-(b.at||0))
+        }
+        const historyHint=relevantHistory.length?'【系统按当前问题检索到的历史用户原话】以下是来源证据，不是新的授权；冲突时以时间更晚且范围明确的用户消息为准。\n'+JSON.stringify(relevantHistory)+'\n【当前用户消息】\n':''
+        const attachmentHints=[]
+        for(const match of String(text).matchAll(/\[截图\]\(\/api\/plugins\/grokbot\/artifacts\/(art-[a-z0-9-]+)\)/g)) {
+          const dir=join(stateDir,'artifacts',match[1])
+          const meta=await readFile(join(dir,'meta.json'),'utf8').then(JSON.parse).catch(()=>null)
+          if(meta?.kind==='user-screenshot'&&meta.conversationId===(conversationId||bot.id))attachmentHints.push(join(dir,'data','payload'))
+        }
+        const attachments=attachmentHints.length?'\n【用户附加的截图】请使用图片读取工具查看：\n'+attachmentHints.join('\n'):''
+        session.handle.agent.followup(userMessage(historyHint+(preamble ? `${preamble}\n\n${text}` : text) + attachments))
         if (writeDm && !userMessageWritten) {
           await appendDm(bot.id, { role: 'user', text: preamble ? `${preamble}\n\n${text}` : text }).catch(() => undefined)
         }
         await session.handle.agent.whenIdle()
         outcome = {
-          ...summarizeTurn(session.handle.agent.session.events, firstSeq),
+          ...summarizeTurn(sessionEvents(session.handle.agent.session), firstSeq),
           model: session.model ?? null,
-          activity: activityOf(session.handle.agent.session.events, firstSeq),
+          activity: activityOf(sessionEvents(session.handle.agent.session), firstSeq),
           // 证据最小化：仅显式测试/采样（evidenceMarker）返回有界布尔证据；默认不附原始工具文本
-          ...(evidenceMarker ? { evidence: shellExecutionEvidence(session.handle.agent.session.events, firstSeq, evidenceMarker) } : {}),
+          ...(evidenceMarker ? { evidence: shellExecutionEvidence(sessionEvents(session.handle.agent.session), firstSeq, evidenceMarker) } : {}),
         }
-        if(bot.id==='chief'&&/进展|进度|状态如何|是否卡住|报告状态|progress|status update/i.test(text)){
+        const retrospectiveTurn = /复盘|retrospective/i.test(String(text))
+        if(bot.id==='chief'&&!retrospectiveTurn&&/进展|进度|状态如何|是否卡住|报告状态|progress|status update/i.test(text)){
           try{outcome.text=factualProjectStatus((await chiefProjectContext(conversationId&&conversationOf(conversationId)?.memberBotIds.length>1?conversationId:null)).projects)}
           catch(error){outcome.text=`当前执行状态读取失败：${safeError(error)}。不能据此判断任务正在运行。`}
         }
-        if(bot.id==='chief'&&/进行中|正在执行|正常执行|正在.{0,12}测试/.test(outcome.text||'')){
+        if(bot.id==='chief'&&!retrospectiveTurn&&/进行中|正在执行|正常执行|正在.{0,12}测试/.test(outcome.text||'')){
           try{const latest=await chiefProjectContext(conversationId&&conversationOf(conversationId)?.memberBotIds.length>1?conversationId:null)
             if(latest.projects.length&&!latest.projects.some(p=>p.error||p.tasks?.some(t=>['running','queued','reworking','retesting','approval','review'].includes(t.status))))outcome.text=factualProjectStatus(latest.projects)
           }catch{/* keep explicit status-query error above */}
         }
         const lifecycleResult=activeTurnCtx.get(convKey)?.lifecycleResult
         if(lifecycleResult?.ok===false){
-          outcome.text=`项目状态操作未完成：${lifecycleResult.error}。请根据当前项目状态处理后再试。`
-          outcome.error='PROJECT_LIFECYCLE_FAILED'
+          const recovery=activeTurnCtx.get(convKey)?.lifecycleRecovery
+          outcome.text=`项目状态尚未变更：${lifecycleResult.error}。` + (recovery
+            ? `\n\n已安排 ${recovery.assignedTo} 继续处理，完成后幕僚长会核对结果并更新项目。当前不能视为验收通过。`
+            : '\n\n幕僚长需要核对当前阶段及执行记录后继续处理。')
+          // A rejected business transition is a visible outcome, not a transport/model failure.
+          // Keep genuine model errors intact; never turn rejection into accepted state.
+          outcome.lifecycleOperation={ok:false,error:lifecycleResult.error,recovery:recovery||null}
         }
+        const reportUrl=activeTurnCtx.get(convKey)?.retrospectiveReport
+        if(retrospectiveTurn&&reportUrl&&!outcome.error&&!outcome.text?.includes(']('+reportUrl+')'))outcome.text=(outcome.text?.trim()||'已找到本项目对应的复盘报告。')+'\n\n[查看完整复盘报告]('+reportUrl+')'
+        const archived=activeTurnCtx.get(convKey)
+        if(archived?.archiveReceipt){outcome={...outcome,text:archived.archiveReceipt,error:null,stopReason:null,archiveReceiptDelivered:!!archived.archiveReceiptDelivered}}
         const turnText = outcome.text?.trim()
         failed = Boolean(outcome.error) || !turnText
         cancelled = (runRef ? cancelledRunIds.has(runRef.id) : false) || isCancelStopReason(outcome.stopReason)
         if (cancelled) outcome.cancelled = true
-        if (turnText && writeDm) {
+        if (turnText && writeDm && !outcome.archiveReceiptDelivered) {
           await appendDm(bot.id, { role: 'bot', text: turnText, activity: outcome.activity, ...(requestId ? { requestId, messageId: `chat-${requestId}-bot` } : {}) }).catch(() => undefined)
         }
         outcome.notice = chatFailureNotice(outcome)
@@ -1908,6 +2213,12 @@ export function apply(ctx, config = {}) {
         }
         return outcome
       } catch (error) {
+        const archived=activeTurnCtx.get(convKey)
+        if(archived?.archiveReceipt){
+          outcome={text:archived.archiveReceipt,error:null,activity:[],archiveReceiptDelivered:!!archived.archiveReceiptDelivered}
+          if(writeDm&&!outcome.archiveReceiptDelivered)await appendDm(bot.id,{role:'bot',text:outcome.text,...(requestId?{requestId,messageId:`chat-${requestId}-bot`}:{})})
+          return outcome
+        }
         failed = true
         // 取消意图下的异常（abort reject）不作为普通失败外抛：返回可识别的取消结果
         const liveCtxNow = activeTurnCtx.get(convKey)
@@ -1976,11 +2287,11 @@ export function apply(ctx, config = {}) {
 
   const HANDOFF_LINE_RE = /^@([\w\u4e00-\u9fa5]+)[：:\s]+(.+)$/
 
-  async function conversationTurn(conversation, senderText, { mentionTarget, taskId = null, evidenceMarker = '', requestId = null, userMessageWritten = false } = {}) {
+  async function conversationTurn(conversation, senderText, { commandActor = 'user', mentionTarget, taskId = null, evidenceMarker = '', requestId = null, userMessageWritten = false } = {}) {
     if (conversation.memberBotIds.length === 1) {
       const bot = crewState.crew.bots.find((entry) => entry.id === conversation.memberBotIds[0])
       if (!bot) throw new Error('会话成员不存在')
-      const outcome = await chatTurn(bot, senderText, { conversationId: conversation.id, writeDm: true, userMessageWritten, requestId, taskId, taskOrigin: taskId ? 'continue' : 'user', ...(evidenceMarker ? { evidenceMarker } : {}) })
+      const outcome = await chatTurn(bot, senderText, { commandActor, conversationId: conversation.id, writeDm: true, userMessageWritten, requestId, taskId, taskOrigin: taskId ? 'continue' : 'user', ...(evidenceMarker ? { evidenceMarker } : {}) })
       return { responder: bot, reply: [outcome.text?.trim(), outcome.notice].filter(Boolean).join('\n\n') || (outcome.cancelled ? '✕ 已取消' : `[${bot.name} 未能给出文本回复]`), handoffTo: null, outcome }
     }
     const members = conversation.memberBotIds
@@ -2021,7 +2332,7 @@ export function apply(ctx, config = {}) {
       '\n你现在在群聊中应答。你能看到上方队友的最近发言和交接——可以接着他们的进度干活（共享电脑里的文件直接读），不要重复已完成的步骤。',
       '若你认为某条工作应由其他成员处理，在回复的最后一行单独写「@成员名 交代内容」，系统会异步转交；不要除此行外提交接。',
     ].filter(Boolean).join('\n')
-    const outcome = await chatTurn(responder, senderText, { preamble, conversationId: conversation.id, writeDm: false, taskId, taskOrigin: taskId ? 'continue' : 'user', ...(evidenceMarker ? { evidenceMarker } : {}) })
+    const outcome = await chatTurn(responder, senderText, { commandActor, preamble, conversationId: conversation.id, writeDm: false, requestId, taskId, taskOrigin: taskId ? 'continue' : 'user', ...(evidenceMarker ? { evidenceMarker } : {}) })
     let reply = outcome.text?.trim() || `[${responder.name} 未能给出文本回复：${outcome.error || outcome.stopReason}]`
     if (outcome.cancelled) {
       // 取消终态：部分文本明确标记未完成 + 群内持久取消通知（群路径 writeDm=false，DM 通知不适用）
@@ -2042,7 +2353,7 @@ export function apply(ctx, config = {}) {
         appendRoomMsg(conversation.id, { role: 'system', text: `检测到文本交接意图（@${handoff[1]}）。请改用 handoff 工具执行以携带任务与指定版本校验；本次未自动转交。` }).catch(() => undefined)
       }
     }
-    await appendRoomMsg(conversation.id, { role: 'bot', botId: responder.id, text: reply, ...(requestId ? { requestId, messageId: `chat-${requestId}-bot` } : {}) })
+    if(!outcome.archiveReceiptDelivered)await appendRoomMsg(conversation.id, { role: 'bot', botId: responder.id, text: reply, ...(requestId ? { requestId, messageId: `chat-${requestId}-bot` } : {}) })
     return { responder, reply, handoffTo: null, outcome }
   }
 
@@ -2125,14 +2436,16 @@ export function apply(ctx, config = {}) {
     let claimReleased = false
     const releaseClaim = () => { if (!claimReleased) { claimReleased = true; coordinationClaims.delete(conversationId) } }
     try {
-    chiefWake.beginAttempt(conversationId) // Claim before any asynchronous read; later events belong to the next batch.
     // 领取后撤销残留探针；成功持久化回复后才确认消费。
     const staleProbe = busyProbes.get(conversationId)
     if (staleProbe) { clearInterval(staleProbe); busyProbes.delete(conversationId) }
-    state.status = 'working'
+    // chatTurn owns execution status after its workspace lock is acquired.
     try {
       const outcome = await chatTurn(chief, async () => {
         if (disposed || !await projectCanRun(conversationId)) throw Error('项目或插件已停止，协调不再启动')
+        // Queue-time events belong to the fresh snapshot we are about to read.
+        // Events during these reads remain pending for the next batch.
+        chiefWake.beginAttempt(conversationId)
         const msgs = await readRoomMsgs(conversationId, 12).catch(() => [])
         const digest = msgs.slice(-6)
           .map((msg) => {
@@ -2151,7 +2464,7 @@ export function apply(ctx, config = {}) {
             `【系统自动协调通知：不是用户的新消息，也不是用户批准进入下一阶段】群「${conv.name}」有新动态`,
             `【群内最近消息】\n${digest}`,
             '【实时项目状态（优先于历史回复）】'+JSON.stringify(await chiefProjectContext(conversationId)),
-            '【已登记阶段计划】'+JSON.stringify(await readPlan(stateDir,conversationId)),
+            '【已登记阶段计划】'+JSON.stringify(currentPlanContext(await readPlan(stateDir,conversationId))),
             LONG_TASK_RULES,
             '本轮派发或调整后，用 team_update_plan 同步计划及 jobId。保持用户指定的阶段范围，不因通知自行扩大开发范围。',
             '\n你是幕僚长，负责让这个项目走完：',
@@ -2180,7 +2493,7 @@ export function apply(ctx, config = {}) {
       if (budget < 0) await appendRoomMsg(conversationId, { role:'system', text:'幕僚长协调连续失败，自动重试已暂停；任务尚未接续，请检查错误后重试。' }).catch(()=>undefined)
       ctx.logger?.warn?.(`grokbot chief 协调失败：${safeError(error)}`)
     } finally {
-      state.status = 'idle'
+      // Do not overwrite a subsequent turn that already acquired the executor.
       state.lastActivity = Date.now()
       logWake({ kind: 'cycle-end', conversationId })
       releaseClaim()
@@ -2460,16 +2773,17 @@ export function apply(ctx, config = {}) {
       session = await createBotAgent(bot, { conversationId: job.conversationId || null, cwd: jobTaskWs || undefined })
       if (jobHardTimeoutMs > 0) timeout = setTimeout(() => { jobTimedOut = true; session.abort.abort(new Error(`explicit job limit after ${jobHardTimeoutMs}ms`)) }, jobHardTimeoutMs)
       const progress = new JobProgress({idleWarningMs:jobIdleWarningMs,reviewAfterMs:jobTimeoutMs})
-      progress.cursor = session.handle.agent.session.events.length
+      progress.cursor = sessionEvents(session.handle.agent.session).length
       let activityCursor=progress.cursor, activityRows=[]
       flushActivity=async()=>{
-        const events=session.handle.agent.session.events
+        const events=sessionEvents(session.handle.agent.session)
+        await atomicWriteFile(join(job.dir,'usage.json'),JSON.stringify({jobId:job.jobId,botId:bot.id,conversationId:job.conversationId||null,nativeSessionId:session.nativeSessionId,updatedAt:Date.now(),...workUsage(events)})+'\n')
         const rows=workActivity(events,activityCursor);activityCursor=events.length
         if(rows.length){activityRows=[...activityRows,...rows].slice(-80);await atomicWriteFile(join(job.dir,'activity.json'),JSON.stringify(activityRows)+'\n')}
       }
       const updateProgress = async () => {
         await flushActivity()
-        const snapshot = progress.observe(session.handle.agent.session.events,{approval:[...pendingApprovals.values()].some(a=>a.botId===bot.id)})
+        const snapshot = progress.observe(sessionEvents(session.handle.agent.session),{approval:[...pendingApprovals.values()].some(a=>a.botId===bot.id)})
         const entry=runningJobs.get(job.jobId);if(entry)entry.progress=snapshot
         await atomicWriteFile(join(job.dir,'progress.json'),JSON.stringify({...snapshot,jobId:job.jobId,botId:bot.id,updatedAt:Date.now()})+'\n')
         if(snapshot.notify){
@@ -2490,13 +2804,14 @@ export function apply(ctx, config = {}) {
         const liveRunNow2 = activeTurnCtx.get(convKey4Job)?.runId ?? null
         if (execError && !cancelledRunIds.has(hoRunId ?? liveRunNow2) && !(session.abort.signal.aborted && !jobTimedOut)) throw execError
         const firstSeq = session.handle.agent.session.seq
+        botState(bot.id).motionSource={session:session.handle.agent.session,firstSeq}
         const basePrompt = `${LONG_TASK_RULES}\n\n${handoffPreamble || promptText}`
         const withImages = job.images.length > 0
           ? `${basePrompt}\n\n【图片】请阅读：\n${job.images.join('\n')}`
           : basePrompt
         if(!session.abort.signal.aborted)session.handle.agent.followup(userMessage(withImages))
         await session.handle.agent.whenIdle().catch((e) => { if (!execError) execError = e })
-        outcome = classifyJobTimeout(summarizeTurn(session.handle.agent.session.events, firstSeq), jobTimedOut, jobHardTimeoutMs)
+        outcome = classifyJobTimeout(summarizeTurn(sessionEvents(session.handle.agent.session), firstSeq), jobTimedOut, jobHardTimeoutMs)
         const liveRunIdNow = activeTurnCtx.get(convKey4Job)?.runId ?? null
         if (execError && !cancelledRunIds.has(hoRunId ?? liveRunIdNow) && !(session.abort.signal.aborted && !jobTimedOut)) throw execError
       }
@@ -2633,10 +2948,12 @@ export function apply(ctx, config = {}) {
         if(conv.memberBotIds.length<2||!conv.memberBotIds.includes('chief'))continue
         try{
           const state=await readLifecycle(stateDir,conv.id)
+          if(state.externalReviewer&&!['active','paused'].includes(state.status))await syncExternalReviews(stateDir,conv.id,await projectBoard({stateDir,inboxRoot,conversationId:conv.id,bots:[]}))
           if(['active','paused'].includes(state.status)){
             // Repair missed handoffs after restart, but only after a chief review
             // newer than the delivered work. A member report alone is not review.
             const board=await projectBoard({stateDir,inboxRoot,conversationId:conv.id,bots:[]})
+            if(state.externalReviewer)await syncExternalReviews(stateDir,conv.id,board)
             const awaiting=board.rows.filter(r=>r.source==='plan'&&r.status==='awaiting_acceptance')
             const chiefReply=(await readRoomMsgs(conv.id,80)).filter(m=>m.role==='bot'&&m.botId==='chief').at(-1)
             if(awaiting.length&&chiefReply?.ts>=Math.max(...awaiting.map(r=>r.updatedAt||0)))await prepareProjectHandoff(conv.id,chiefReply.text)
@@ -2723,7 +3040,8 @@ export function apply(ctx, config = {}) {
 
   async function readJsonBody(req) {
     const chunks = []
-    for await (const chunk of req) chunks.push(chunk)
+    let bytes=0
+    for await (const chunk of req) {bytes+=chunk.length;if(bytes>20*1024*1024)throw new HttpError(413,'请求内容过大');chunks.push(chunk)}
     const text = Buffer.concat(chunks).toString('utf8')
     return text ? JSON.parse(text) : {}
   }
@@ -2751,17 +3069,20 @@ export function apply(ctx, config = {}) {
 
   function publicBot(bot) {
     const state = botState(bot.id)
+    if(state.status!=='working')delete state.motionSource
     return {
       id: bot.id,
       name: bot.name,
       avatar: bot.avatar,
       model: bot.model || null,
       title: bot.title,
+      roleTemplate: resolveRole(bot),
       pinned: bot.pinned,
       section: bot.section,
       hidden: bot.hidden,
       status: state.status,
       currentJob: state.currentJob,
+      motionPhase: state.status==='working'&&state.motionSource?readCharacterPhase(state.motionSource):'active',
       currentWorkTitle:runningJobs.get(state.currentJob)?.title || null,
       currentConversationId: [...activeTurnCtx.entries()].find(([key])=>key.endsWith(':'+bot.id))?.[1]?.conversationId || null,
       lastActivity: state.lastActivity,
@@ -2780,6 +3101,77 @@ export function apply(ctx, config = {}) {
         const method = String(req.method ?? 'GET').toUpperCase()
         const suffix = url.pathname.slice(API_ROOT.length) || '/'
 
+        const retroMatch=/^\/retrospectives\/(retro-[a-f0-9]{20})$/.exec(suffix)
+        if(method==='GET'&&retroMatch){
+          const report=(await readRetrospectives(stateDir)).reports.find(r=>r.id===retroMatch[1]);if(!report)throw new HttpError(404,'复盘不存在')
+          res.statusCode=200;res.setHeader('Content-Type','text/html; charset=utf-8');res.setHeader('Cache-Control','no-store');res.setHeader('Content-Security-Policy',"default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'self'");res.end(renderRetrospective(report));return
+        }
+        if(method==='GET'&&suffix==='/retrospectives'){
+          const projectId=url.searchParams.get('conversationId')
+          respond(res,200,{reports:(await readRetrospectives(stateDir)).reports.filter(r=>!projectId||r.snapshot.projectId===projectId).map(r=>({id:r.id,projectId:r.snapshot.projectId,projectName:r.snapshot.projectName,createdAt:r.createdAt,phase:r.snapshot.phase,summary:r.summary,ratings:r.ratings,actions:r.actions,url:API_ROOT+'/retrospectives/'+r.id}))});return
+        }
+        if(method==='POST'&&suffix==='/context/compact'){
+          if(req.headers.origin||req.headers['x-codex-review-capability']!==codexReviewCapability)throw new HttpError(403,'需要宿主维护身份')
+          const body=await readJsonBody(req),botId=String(body?.botId||'chief'),requestId=String(body?.requestId||'')
+          if(!/^[A-Za-z0-9_-]{6,64}$/.test(requestId))throw new HttpError(400,'上下文维护需要稳定 requestId')
+          const bot=crewState.crew.bots.find(entry=>entry.id===botId)
+          if(!bot)throw new HttpError(404,'成员不存在')
+          const conversationId=body?.conversationId?String(body.conversationId):null
+          if(conversationId){const room=conversationOf(conversationId);if(!room||!room.memberBotIds.includes(botId))throw new HttpError(404,'成员不属于目标会话')}
+          const baseSessionKey=conversationId?`${conversationId}:${botId}`:`${botId}:${botId}`
+          const candidates=[...chatSessionIds.entries()].filter(([key])=>key===baseSessionKey||key.startsWith(`${baseSessionKey}|ws:`)).map(([sessionKey,sessionId])=>({sessionKey,sessionId}))
+          const requestedSessionId=body?.sessionId?String(body.sessionId):null
+          const target=requestedSessionId?candidates.find(entry=>entry.sessionId===requestedSessionId):(candidates.length===1?candidates[0]:null)
+          if(requestedSessionId&&!target)throw new HttpError(409,'指定 sessionId 不属于该成员与会话')
+          if(!requestedSessionId&&candidates.length>1)throw new HttpError(409,'该成员与会话存在多个 workspace session；请指定 sessionId')
+          if(!target)throw new HttpError(409,'成员尚无持久会话')
+          const {sessionKey,sessionId}=target
+          const payloadHash=createHash('sha256').update(JSON.stringify({botId,conversationId:conversationId||null,sessionId})).digest('hex')
+          const existing=contextMaintenanceRuns.get(requestId)
+          if(existing){
+            if(existing.payloadHash!==payloadHash)throw new HttpError(409,'CONTEXT_MAINTENANCE_REQUEST_COLLISION')
+            const result=await existing.promise;respond(res,200,{...result,deduped:true});return
+          }
+          const run=(async()=>{
+            const prior=await contextMaintenanceRequest(requestId)
+            if(prior){
+              if(prior.payloadHash!==payloadHash)throw new HttpError(409,'CONTEXT_MAINTENANCE_REQUEST_COLLISION')
+              if(prior.status==='completed')return {...prior.result,deduped:true}
+              throw new HttpError(409,`上下文维护原请求状态为 ${prior.status}；禁止盲目重试，请查询维护记录`)
+            }
+            if(botState(botId).status!=='idle'||[...activeTurnCtx.values()].some(turn=>String(turn.sessionKey||'')===sessionKey||String(turn.sessionKey||'').startsWith(`${sessionKey}|`)))throw new HttpError(409,'成员仍在执行，不能压缩上下文')
+            const sourceCommandId=`grokbot-${requestId}`
+            await recordContextMaintenance({kind:'request',requestId,payloadHash,status:'started',botId,conversationId:conversationId||null,sessionId,sessionKey,sourceCommandId})
+            const compaction=ctx.get?.('compaction')||ctx.compaction
+            let session=chatHandles.get(sessionKey),owned=false
+            const abort=new AbortController(),timer=setTimeout(()=>abort.abort(new Error('上下文维护超时')),180000)
+            try{
+              if(!session){
+                const marker=sessionKey.indexOf('|ws:'),cwd=marker>=0?sessionKey.slice(marker+4):undefined
+                session=await createBotAgent(bot,{sessionId,resume:true,conversationId,cwd});owned=true
+              }
+              const compacted=await compactWithDecisionGuard({agent:session.handle.agent,compaction,signal:abort.signal,sourceCommandId,readBrief:()=>sessionAuthorityBrief(bot,conversationId),events:()=>sessionEvents(session.handle.agent.session)})
+              await persistMetrics(session)
+              const result={ok:true,botId,conversationId:conversationId||botId,sessionId,requestId,...compacted}
+              await recordContextMaintenance({kind:'request',requestId,payloadHash,status:'completed',botId,conversationId:conversationId||null,sessionId,sessionKey,sourceCommandId,result})
+              return result
+            }catch(error){
+              const status=error?.committed?'committed_validation_failed':'failed'
+              await recordContextMaintenance({kind:'request',requestId,payloadHash,status,botId,conversationId:conversationId||null,sessionId,sessionKey,sourceCommandId,error:safeError(error),committed:!!error?.committed,summarySeq:error?.compactionResult?.summarySeq??null})
+              throw error
+            }finally{
+              clearTimeout(timer)
+              if(owned)await session.dispose()
+            }
+          })()
+          const slot={payloadHash,promise:run}
+          contextMaintenanceRuns.set(requestId,slot)
+          try{
+            respond(res,200,await run);return
+          }finally{
+            if(contextMaintenanceRuns.get(requestId)===slot)contextMaintenanceRuns.delete(requestId)
+          }
+        }
         const lifecycleMatch=/^\/conversations\/([^/]+)\/(lifecycle|accept-step)$/.exec(suffix)
         if(lifecycleMatch&&method==='POST'){
           const id=decodeURIComponent(lifecycleMatch[1]),body=await readJsonBody(req)
@@ -2800,7 +3192,37 @@ export function apply(ctx, config = {}) {
         const workMatch=suffix.match(/^\/bots\/([A-Za-z0-9_-]+)\/work$/)
         if(method==='GET'&&workMatch){
           const bot=crewState.crew.bots.find(b=>b.id===workMatch[1]);if(!bot)throw new HttpError(404,'Bot 不存在')
-          respond(res,200,await botWork({stateDir,inboxRoot,botId:bot.id,details:url.searchParams.get('detail')==='1',bots:crewState.crew.bots,conversations:crewState.crew.conversations||[],runningIds:[...runningJobs.keys()],queuedIds:[...pendingJobs.map(j=>j.jobId),...waitingJobs.keys()],live:publicBot(bot)}));return
+          const detail=url.searchParams.get('detail')==='1'
+          const snapshot=await botWork({stateDir,inboxRoot,botId:bot.id,details:detail,bots:crewState.crew.bots,conversations:crewState.crew.conversations||[],runningIds:[...runningJobs.keys()],queuedIds:[...pendingJobs.map(j=>j.jobId),...waitingJobs.keys()],live:publicBot(bot)})
+          if(detail){
+            for(const session of activeSessions)if(session.botId===bot.id&&!metricsPending.has(session))void persistMetrics(session)
+            snapshot.efficiency=await readContextMetrics(stateDir,bot.id)
+            snapshot.contextMaintenance=await readContextMaintenance(bot.id)
+            snapshot.authorityContext=[...authorityAssemblyStats.entries()].filter(([,value])=>value.botId===bot.id).map(([sessionId,value])=>({sessionId,...value})).slice(-20)
+            snapshot.conversations=[...chatHandles.entries()].filter(([,session])=>ownerOfSession(session.handle.agent.session.id)?.botId===bot.id).map(([key,session])=>({id:key,title:crewState.crew.conversations?.find(c=>key.startsWith(c.id+':'))?.name||bot.name,activity:workActivity(sessionEvents(session.handle.agent.session))}))
+          }
+          respond(res,200,snapshot);return
+        }
+        const externalDecision=/^\/external-reviews\/([a-zA-Z0-9_-]+)\/decision$/.exec(suffix)
+        if(method==='POST'&&externalDecision){
+          // Local operator capability, deliberately absent from browser state and model tools.
+          // Execute inside this host so reviewer writes share lifecycle locks with bot tools.
+          if(req.headers.origin||req.headers['x-codex-review-capability']!==codexReviewCapability)throw new HttpError(403,'需要宿主审核身份')
+          const id=externalDecision[1],body=await readJsonBody(req),state=await readLifecycle(stateDir,id)
+          if(state.externalReviewer?.kind!=='codex'||state.externalReviewer.threadId!==body?.threadId)throw new HttpError(403,'审核任务与项目委托不匹配')
+          try{
+            const review=await decideExternalReview(stateDir,inboxRoot,id,body)
+            await appendRoomMsg(id,{role:'system',text:`Codex 已记录${body.decision==='accept'?'验收通过':'验收驳回'}：${review.title}。依据：${body.evidence}。请以最新项目状态为准，继续已授权范围；最终验收不代表允许自动归档或扩大范围。`,messageId:`codex-decision-${review.id}`})
+            const step=(await readPlan(stateDir,id)).steps.find(s=>s.id===review.stepId)
+            if(body.decision==='reject'||!step?.finalDelivery)chiefWake.request(id)
+            void scan();respond(res,200,{ok:true,review})
+          }
+          catch(error){respond(res,409,{ok:false,error:safeError(error)})}
+          return
+        }
+        if(method==='GET'&&suffix==='/external-reviews'){
+          const reviews=[];for(const c of crewState.crew.conversations||[]){if(c.memberBotIds.length<2)continue;for(const r of await syncExternalReviews(stateDir,c.id,await projectBoard({stateDir,inboxRoot,conversationId:c.id,bots:[]})))if(r.status==='pending')reviews.push({...r,projectName:c.name})}
+          respond(res,200,{reviews});return
         }
         if (method === 'GET' && suffix === '/health') {
           respond(res, 200, { ok: true, time: nowIso() }); return
@@ -2811,22 +3233,9 @@ export function apply(ctx, config = {}) {
             const base = publicBot(bot)
             const setup = await loadSetup(bot.id)
             if (setup && setup.stage && setup.stage !== 'done') base.setupStage = setup.stage
-            // roleTemplate：setup.json 优先，title 关键词匹配兜底，chief 固有
-            let roleTemplate = setup?.roleTemplate || ''
-            if (!roleTemplate && bot.id === 'chief') roleTemplate = 'chief'
-            if (!roleTemplate) {
-              const titleMatch = [
-                ['幕僚长', 'chief'], ['工程师', 'coder'], ['调研员', 'researcher'], ['写作官', 'writer'],
-                ['数据分析师', 'analyst'], ['产品经理', 'pm'], ['运维官', 'ops'],
-                ['翻译官', 'translator'], ['秘书', 'secretary'], ['审核官', 'reviewer'],
-              ]
-              for (const [prefix, key] of titleMatch) {
-                if (bot.title && (bot.title === prefix || bot.title.startsWith(prefix + ' · '))) { roleTemplate = key; break }
-              }
-            }
-            base.roleTemplate = roleTemplate
+            base.roleTemplate = resolveRole(bot)
             base.dshSessionId = chatSessionIds.get(`${bot.id}:${bot.id}`) || null
-            base.rating = ratingOf(await loadStats(bot.id))
+            base.rating = await botRating(bot.id)
             const dm = await readDm(bot.id, 1)
             const last = dm[dm.length - 1]
             bots.push({
@@ -2856,6 +3265,16 @@ export function apply(ctx, config = {}) {
             lastTarget: uiState.lastTarget,
             config: { inboxRoot, stateDir, maxConcurrentJobs, jobTimeoutMs, jobHardTimeoutMs, jobIdleWarningMs, testEndpoints: testEndpointsOn },
           }); return
+        }
+        if (method === 'POST' && ['/screenshots','/screenshots/import'].includes(suffix)) {
+          const body=await readJsonBody(req)
+          if(!conversationOf(body?.conversationId))throw new HttpError(400,'请先选择会话')
+          if(suffix.endsWith('/import')){respond(res,200,await importScreenshot(stateDir,body.conversationId,body.image));return}
+          const controller=new AbortController(),cancel=()=>controller.abort()
+          res.once('close',cancel)
+          try {respond(res,200,await captureScreenshot(stateDir,body.conversationId,{mode:body.mode||'region',delay:body.delay||0,signal:controller.signal}))}
+          finally{res.removeListener('close',cancel)}
+          return
         }
         if (method === 'POST' && suffix === '/ui-state') {
           const body = await readJsonBody(req)
@@ -2944,7 +3363,7 @@ export function apply(ctx, config = {}) {
             await handle.agent.whenIdle()
             const ms = Date.now() - t0
             // 事件解析：真实工具次数 + 工具结果文本 + 回复 + 错误（不用常量 0）
-            const events = handle.agent.session.events
+            const events = sessionEvents(handle.agent.session)
             const turn = summarizeTurn(events, firstSeq)
             const activity = activityOf(events, firstSeq)
             const evidence = shellExecutionEvidence(events, firstSeq, String(body?.evidenceMarker ?? ''))
@@ -3014,7 +3433,7 @@ export function apply(ctx, config = {}) {
             if (st.terminal) { await releaseOnce('terminal'); return }
             await handle.agent.whenIdle()
             if (st.terminal) { await releaseOnce('terminal'); return }
-            const turn = summarizeTurn(handle.agent.session.events, firstSeq)
+            const turn = summarizeTurn(sessionEvents(handle.agent.session), firstSeq)
             const cancelled = isCancelStopReason(turn?.stopReason)
             return { handle, warmupMs: Date.now() - t0, warmupStatus: cancelled ? 'cancelled' : (turn?.error ? 'failed' : (turn?.text?.trim() ? 'ok' : 'empty')), model: sel ? `${sel.provider}/${sel.model}` : null }
           })()
@@ -3080,7 +3499,7 @@ export function apply(ctx, config = {}) {
             })()
             const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`warm turn timeout after ${timeoutMs}ms`)), timeoutMs); timer.unref?.() })
             await Promise.race([turnDone, timeout])
-            const events = entry.handle.agent.session.events
+            const events = sessionEvents(entry.handle.agent.session)
             const turn = summarizeTurn(events, firstSeq)
             const activity = activityOf(events, firstSeq)
             const evidence = shellExecutionEvidence(events, firstSeq, evidenceMarker)
@@ -3168,7 +3587,7 @@ export function apply(ctx, config = {}) {
             for (const id of await readdir(join(stateDir, 'artifacts')).catch(() => [])) {
               try {
                 const meta = JSON.parse(await readFile(join(stateDir, 'artifacts', id, 'meta.json'), 'utf8'))
-                if (meta?.name) artifacts.push({ id, name: meta.name, size: meta.size ?? 0, mime: meta.mime ?? '', taskId: meta.taskId ?? null, createdAt: meta.createdAt ?? null })
+                if (meta?.name && meta.kind!=='user-screenshot') artifacts.push({ id, name: meta.name, size: meta.size ?? 0, mime: meta.mime ?? '', taskId: meta.taskId ?? null, createdAt: meta.createdAt ?? null })
               } catch { /* 跳过损坏 meta */ }
             }
           } catch { /* 无成果目录 */ }
@@ -3178,6 +3597,7 @@ export function apply(ctx, config = {}) {
             workspace: join(stateDir, 'workspace'),
             computer: { enabled: comp?.enabled === true, local: comp?.local === true, vncUrl: typeof comp?.vncUrl === 'string' ? comp.vncUrl : null },
             artifacts: artifacts.slice(0, 12),
+            archive: await archiveLibrary(stateDir, crewState.crew),
           }); return
         }
         if (method === 'POST' && suffix === '/workspace/reveal') {
@@ -3250,8 +3670,9 @@ export function apply(ctx, config = {}) {
             body.name = String(body?.name || '').trim() || template.name
             body.avatar = body?.avatar || template.avatar
             body.title = body?.title || template.title
-            body.persona = String(body?.persona || '').trim() || template.persona
-            greeting = template.greeting || ''
+            body.persona = String(body?.persona || '').trim()
+            body.roleTemplate = template.id
+            greeting = `你好，我是**${body.name}**，${body.title}。\n\n${ROLE_PROFILES[template.id]?.mission || ''}\n\n可以直接告诉我你要处理的问题。`
           }
           if (!String(body?.name || '').trim()) {
             // 空白 Bot：对话式初始化（Grok Bot 语义），开场白结构化（Markdown + 快捷选项）
@@ -3284,7 +3705,7 @@ export function apply(ctx, config = {}) {
           await ensureDmConversation(bot).catch(() => undefined)
           if (greeting) {
             await appendDm(bot.id, { role: 'bot', text: greeting }).catch(() => undefined)
-            await saveSetup(bot.id, { stage: 'await-role' }).catch(() => undefined)
+            await saveSetup(bot.id, template && !template.blank ? {stage:'done', roleTemplate:template.id} : {stage:'await-role'}).catch(() => undefined)
           }
           // 立即建立 DSH session：新 bot 首聊即可走原生会话视图（#1-3），
           // 失败不阻塞创建（客户端有 BotChatView 回退）
@@ -3293,7 +3714,7 @@ export function apply(ctx, config = {}) {
             chatSessionIds.set(`${bot.id}:${bot.id}`, sessionId)
             await persistChatSessions()
             const session = await createBotAgent(bot, { sessionId })
-            void session.dispose()
+            await session.dispose()
           } catch (error) {
             ctx.logger?.warn?.(`grokbot 预建 session 失败（${bot.id}）：${safeError(error)}`)
           }
@@ -3302,6 +3723,11 @@ export function apply(ctx, config = {}) {
         const botMatch = /^\/bots\/([^/]+)$/.exec(suffix)
         if (botMatch) {
           const botId = decodeURIComponent(botMatch[1])
+          if(method==='GET') {
+            const bot=crewState.crew.bots.find(b=>b.id===botId)
+            if(!bot)throw new HttpError(404,'成员不存在')
+            respond(res,200,{bot:{...publicBot(bot),persona:customPersona(bot)}});return
+          }
           if (method === 'PATCH') {
             const body = await readJsonBody(req)
             let bot
@@ -3352,6 +3778,9 @@ export function apply(ctx, config = {}) {
           await appendDm('chief',{role:'system',text:`【权限已更新】${crewState.crew.bots.find(b=>b.id===id)?.name}：插件完全访问已关闭；旧会话将在下次执行前恢复权限`})
           respond(res,200,{ok:true,...result});return
         }
+        if(method==='GET'&&suffix==='/approval-rules'){respond(res,200,{rules:await permissionRules.list()});return}
+        const ruleMatch=/^\/approval-rules\/(rule-[a-f0-9-]+)$/.exec(suffix)
+        if(method==='DELETE'&&ruleMatch){respond(res,200,await permissionRules.revoke(ruleMatch[1]));return}
         const approvalMatch = /^\/approvals\/([^/]+)$/.exec(suffix)
         if (approvalMatch && method === 'POST') {
           const approvalId = decodeURIComponent(approvalMatch[1])
@@ -3363,10 +3792,18 @@ export function apply(ctx, config = {}) {
             throw new HttpError(400, '审批结果无效（allowed-once / rejected）')
           }
           if (pendingApprovals.get(approvalId) !== entry || entry.stage !== 'user') throw new HttpError(409, '审批已结束，请刷新')
-          entry.resolve(outcome, 'user')
-          if (outcome === 'rejected') {
-            await awardBot(entry.botId, { expDelta: -3 }).catch(() => undefined)
+          if(entry.deciding)throw new HttpError(409,'审批正在处理，请稍候')
+          entry.deciding=true
+          try{
+          if(body.remember===true){
+            if(outcome!=='allowed-once')throw new HttpError(400,'只能记住明确允许的操作')
+            const candidate=await approvalChecks.get(approvalId)?.()
+            if(!candidate||candidate.fingerprint!==entry.ruleCandidate?.fingerprint)throw new HttpError(409,'授权范围已变化，请重新核实')
+            await permissionRules.grant(candidate,{approvalId,stillPending:()=>pendingApprovals.get(approvalId)===entry&&entry.stage==='user'})
           }
+          entry.resolve(outcome, 'user')
+          }finally{entry.deciding=false}
+          // Permission decisions are not quality feedback; growth is evidence-based.
           ctx.logger?.info?.(`grokbot approval ${approvalId} -> ${outcome}`)
           respond(res, 200, { ok: true, outcome }); return
         }
@@ -3378,7 +3815,7 @@ export function apply(ctx, config = {}) {
           const bad = body?.bad === true
           if (!good && !bad) throw new HttpError(400, '需要 good 或 bad')
           const stats = await awardBot(botId, good ? { expDelta: 5, thumbsUpDelta: 1 } : { expDelta: -3, thumbsDownDelta: 1 })
-          respond(res, 200, { rating: stats ? ratingOf(stats) : null }); return
+          respond(res, 200, { rating: stats ? await botRating(botId) : null }); return
         }
         const stopMatch = /^\/bots\/([^/]+)\/stop$/.exec(suffix)
         if (method === 'POST' && stopMatch) {
@@ -3509,6 +3946,9 @@ export function apply(ctx, config = {}) {
             }
             const apiPerfStart = Date.now()
             const handleChatTurn = async () => {
+              if(body?.executionMode==='notice'){
+                const reply='通知已记录。本条不触发派工、验收或权限变更。';await appendConversationMsg(conversation,{role:'bot',botId:'chief',text:reply,...(requestId?{requestId:String(body.requestId),messageId:`chat-${body.requestId}-bot`}:{})});return {reply,noticeOnly:true}
+              }
               const r = await (async () => {
             if (conversation.memberBotIds.length === 1) {
               const memberBot = crewState.crew.bots.find((entry) => entry.id === conversation.memberBotIds[0])
@@ -3530,7 +3970,7 @@ export function apply(ctx, config = {}) {
               const wanted = String(body.mentions[0])
               mentionTarget = eligibleBots(conversation).find((bot) => bot.id === wanted) ?? null
             }
-            const result = await conversationTurn(conversation, text, { mentionTarget, userMessageWritten: true, requestId: requestId ? String(body.requestId) : null, taskId: bodyTaskId, ...(testEndpointsOn && String(body?.evidenceMarker || '')) ? { evidenceMarker: String(body.evidenceMarker) } : {} })
+            const result = await conversationTurn(conversation, text, { commandActor: !req.headers.origin && req.headers['x-codex-review-capability'] === codexReviewCapability ? 'codex' : 'user', mentionTarget, userMessageWritten: true, requestId: requestId ? String(body.requestId) : null, taskId: bodyTaskId, ...(testEndpointsOn && String(body?.evidenceMarker || '')) ? { evidenceMarker: String(body.evidenceMarker) } : {} })
               return {
                 responder: publicBot(result.responder),
                 reply: result.reply,
@@ -3544,7 +3984,7 @@ export function apply(ctx, config = {}) {
             }
             if (requestId) {
               // 去重：第一次副作用（用户消息落盘）前登记在途；并发同 ID 共享同一执行
-              const payload = { text, taskId: bodyTaskId, mentions: Array.isArray(body?.mentions) ? body.mentions.map(String) : [] }
+              const payload = { text, executionMode:body?.executionMode==='notice'?'notice':'execute', taskId: bodyTaskId, mentions: Array.isArray(body?.mentions) ? body.mentions.map(String) : [] }
               // retryMode=retry：仅允许加入在途/返回已有结果；记录不存在（过期/重启丢失）→
               // 419「原结果未知/不可恢复」，不追加消息、不调模型——用户明确选择才重新执行（新 ID）
               const retryOnly = String(body?.retryMode || '') === 'retry'
@@ -3702,7 +4142,7 @@ export function apply(ctx, config = {}) {
     },
   }), 'grokbot: HTTP API')
 
-  ctx.effect(() => () => {
+  ctx.effect(() => async () => {
     disposed = true
     chiefWake.dispose()
     for (const pending of warmPending.values()) {
@@ -3715,13 +4155,12 @@ export function apply(ctx, config = {}) {
     clearInterval(rescanTimer)
     clearInterval(routineTimer)
     clearInterval(servicesTimer)
+    clearInterval(metricsTimer)
     clearTimeout(debounceTimer)
     watcher?.close()
     chatHandles.clear()
     try { tunnelProc?.kill() } catch { /* 已退出 */ }
-    for (const session of [...activeSessions]) {
-      void session.dispose()
-    }
+    await Promise.allSettled([...activeSessions].map(session => session.dispose()))
   }, 'grokbot: shutdown')
 }
 

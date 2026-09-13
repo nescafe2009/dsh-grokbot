@@ -8,7 +8,7 @@ type Bot = {id:string;name:string;avatar?:string;roleTemplate?:string;model?:Mod
 type Provider = {id:string;name:string;models:{id:string;name:string}[]}
 type Api = (path:string, opts?:RequestInit)=>Promise<any>
 const same = (a?:Model|null,b?:Model|null)=>!!a && !!b && a.provider===b.provider && a.model===b.model
-const chip = {border:'1px solid var(--gk-border, #ddd)',borderRadius:9,padding:'7px 11px',font:'inherit',fontSize:13,cursor:'pointer'}
+const chip = {border:'1px solid var(--gk-border, #ddd)',borderRadius:9,padding:'7px 11px',font:'inherit',fontSize: 14,cursor:'pointer'}
 
 export function ModelLibrary({api,defaultEditor,onDefaultChange}:{api:Api;defaultEditor:ReactNode;onDefaultChange:(value:Model|null)=>void}) {
   const [presets,setPresets]=useState<Preset[]>([]),[bots,setBots]=useState<Bot[]>([]),[providers,setProviders]=useState<Provider[]>([])
@@ -37,20 +37,20 @@ export function ModelLibrary({api,defaultEditor,onDefaultChange}:{api:Api;defaul
       .gkm button{min-height:36px;transition:background .15s,opacity .15s}
       .gkm button:not(:disabled):hover{filter:brightness(.94)}
       .gkm button:disabled{cursor:default;opacity:.5}
-      .gkm h3{font-size:16px;margin:0}
+      .gkm h3{font-size:var(--gk-font-body);margin:0}
       .gkm-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:14px}
-      .gkm-sub{font-size:13px;color:var(--gk-text-2,#666);margin:6px 0 0;line-height:1.5}
-      .gkm-feedback{font-size:12px;min-height:18px;color:var(--gk-text-2,#666);line-height:18px}
+      .gkm-sub{font-size:var(--gk-font-label);color:var(--gk-text-2,#666);margin:6px 0 0;line-height:1.5}
+      .gkm-feedback{font-size:var(--gk-font-meta);min-height:18px;color:var(--gk-text-2,#666);line-height:18px}
       .gkm-error{color:var(--gk-red,#b42318)}
       .gkm .grokbot-form{box-shadow:none;border:0;background:var(--gk-bg-side,#f7f7f7);padding:16px;border-radius:10px}
-      .gkm .grokbot-form label{display:flex;flex-direction:column;align-items:stretch;gap:7px;font-size:12px;min-width:0}
+      .gkm .grokbot-form label{display:flex;flex-direction:column;align-items:stretch;gap:7px;font-size:var(--gk-font-meta);min-width:0}
       .gkm input,.gkm select{width:100%;min-height:38px;box-sizing:border-box}
       .gkm-assignment{display:grid;grid-template-columns:minmax(150px,200px) minmax(0,1fr);gap:16px;align-items:center;padding:12px 0;border-top:1px solid var(--gk-border,#ddd)}
       .gkm-person{display:flex;align-items:center;gap:10px;min-width:0}
-      .gkm-person strong{font-size:14px}
-      .gkm-current{font-size:12px;color:var(--gk-text-2,#666);margin-top:4px;overflow-wrap:anywhere}
+      .gkm-person strong{font-size:var(--gk-font-label)}
+      .gkm-current{font-size:var(--gk-font-meta);color:var(--gk-text-2,#666);margin-top:4px;overflow-wrap:anywhere}
       .gkm-options{display:flex;flex-wrap:wrap;gap:8px}
-      .gkm-selected-label{font-size:12px;margin-left:6px;color:var(--gk-text-2,#666)}
+      .gkm-selected-label{font-size:var(--gk-font-meta);margin-left:6px;color:var(--gk-text-2,#666)}
       @container(max-width:580px){.gkm-assignment{grid-template-columns:1fr;gap:10px}.gkm-head{align-items:flex-start}.gkm-options button{min-height:44px}}
       @media(prefers-reduced-motion:reduce){.gkm button{transition:none}}
     `}</style>
@@ -69,7 +69,7 @@ export function ModelLibrary({api,defaultEditor,onDefaultChange}:{api:Api;defaul
       </div>
       <p className="gkm-sub">模型 ID 可直接输入；服务商连接在 DSH 中配置。修改常用项后，已分配的 Bot 保持原选择。</p></>:null}
       {feedback('library')}
-      {!presets.length?<p style={{fontSize:13,opacity:.65}}>还没有常用模型。添加后，下方会出现对应的快捷按钮。</p>:presets.map((p,i)=><div key={JSON.stringify([p.provider,p.model])} style={{display:'flex',gap:12,alignItems:'center',borderTop:'1px solid var(--gk-border, #ddd)',padding:'12px 0',flexWrap:'wrap'}}><div style={{flex:1,minWidth:150}}><strong>{p.name}</strong><div style={{fontSize:12,opacity:.6,overflowWrap:'anywhere'}}>{p.provider} / {p.model}</div></div><button disabled={busy} style={chip} onClick={()=>{setEditorOpen(true);setEditing(i);setName(p.name);setProvider(p.provider);setModel(p.model)}}>编辑</button><button disabled={busy} style={chip} title="仅移除快捷选项，保留 Bot 当前配置" onClick={()=>void remove(i)}>移除</button></div>)}
+      {!presets.length?<p style={{fontSize: 14,opacity:.65}}>还没有常用模型。添加后，下方会出现对应的快捷按钮。</p>:presets.map((p,i)=><div key={JSON.stringify([p.provider,p.model])} style={{display:'flex',gap:12,alignItems:'center',borderTop:'1px solid var(--gk-border, #ddd)',padding:'12px 0',flexWrap:'wrap'}}><div style={{flex:1,minWidth:150}}><strong>{p.name}</strong><div style={{fontSize: 12,opacity:.6,overflowWrap:'anywhere'}}>{p.provider} / {p.model}</div></div><button disabled={busy} style={chip} onClick={()=>{setEditorOpen(true);setEditing(i);setName(p.name);setProvider(p.provider);setModel(p.model)}}>编辑</button><button disabled={busy} style={chip} title="仅移除快捷选项，保留 Bot 当前配置" onClick={()=>void remove(i)}>移除</button></div>)}
     </section>
     <section aria-label="Bot模型快捷分配" style={{border:'1px solid var(--gk-border, #ddd)',borderRadius:14,padding:20}}>
       <div className="gkm-head"><div><h3>模型分配</h3><p className="gkm-sub">点击即保存，运行中的任务不受影响。</p></div><span className="gkm-selected-label">{bots.filter(b=>!b.model).length} / {bots.length} 位跟随默认</span></div>

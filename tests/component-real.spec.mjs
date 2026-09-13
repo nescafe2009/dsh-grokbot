@@ -117,7 +117,7 @@ test('真实组件 DM→DM：A 发送中切 B → A 迟到不污染 B', async ()
     nativeSetter.call(textarea, '消息到 A')
     textarea.dispatchEvent(new Event('input', { bubbles: true }))
   })
-  const sendBtn = [...c.el.querySelectorAll('button')].find(b => b.textContent?.includes('↑'))
+  const sendBtn = [...c.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息')
   assert.ok(sendBtn, 'send button exists')
 
   // 点击发送 → fetch 挂起（deferred 不 resolve）
@@ -144,7 +144,7 @@ test('真实组件 DM→DM：A 发送中切 B → A 迟到不污染 B', async ()
     s.call(bTextarea, 'B 的消息')
     bTextarea.dispatchEvent(new Event('input', { bubbles: true }))
   })
-  const bSend = [...c.el.querySelectorAll('button')].find(b => b.textContent?.includes('↑'))
+  const bSend = [...c.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息')
   assert.ok(!bSend?.disabled, 'B 的发送按钮未被 A 阻塞')
 
   c.root.unmount()
@@ -164,7 +164,7 @@ test('真实组件 DM→DM：A 发送失败 → B 无错误/重试条', async ()
     s.call(textarea, '失败消息')
     textarea.dispatchEvent(new Event('input', { bubbles: true }))
   })
-  const sendBtn = [...c.el.querySelectorAll('button')].find(b => b.textContent?.includes('↑'))
+  const sendBtn = [...c.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息')
   await act(async () => { sendBtn.click() })
 
   // A 的请求失败
@@ -201,7 +201,7 @@ test('真实组件 DM→DM→DM：切回 A 重试记录保留', async () => {
     s.call(ta, 'A 要重试的消息')
     ta.dispatchEvent(new Event('input', { bubbles: true }))
   })
-  const btn = [...c.el.querySelectorAll('button')].find(b => b.textContent?.includes('↑'))
+  const btn = [...c.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息')
   await act(async () => { btn.click() })
   await act(async () => { rejectFor('/conversations/botA/chat','POST') })
 
@@ -268,7 +268,7 @@ test('真实组件：重试按钮复用原 requestId', async () => {
     s.call(ta, '要重试的消息')
     ta.dispatchEvent(new Event('input', { bubbles: true }))
   })
-  const btn = [...c.el.querySelectorAll('button')].find(b => b.textContent?.includes('↑'))
+  const btn = [...c.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息')
   await act(async () => { btn.click() })
   await act(async () => { rejectFor('/conversations/botA/chat','POST') })
 
@@ -330,7 +330,7 @@ test('真实组件 群→群：A POST 迟到不覆盖群 B', async () => {
     ta.dispatchEvent(new Event('input', { bubbles: true }))
   })
   await act(async () => {
-    [...c.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click()
+    [...c.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息').click()
   })
   // 精确找到 lateA 的 POST
   const idx = deferredQueue.findIndex(d => d.call.url.includes('/lateA/chat') && d.call.method === 'POST')
@@ -362,7 +362,7 @@ test('真实组件 DM：A 发送中 B 也发送 → A 迟到完成 → B 状态�
     Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, 'A msg')
     ta.dispatchEvent(new Event('input', { bubbles: true }))
   })
-  await act(async () => { [...c.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click() })
+  await act(async () => { [...c.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息').click() })
 
   // 切 B → B 也发送
   await rerender(React.createElement(BotChatView, { bot: botB, state: null }), c)
@@ -371,7 +371,7 @@ test('真实组件 DM：A 发送中 B 也发送 → A 迟到完成 → B 状态�
     Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, 'B msg')
     ta.dispatchEvent(new Event('input', { bubbles: true }))
   })
-  const bBtn = [...c.el.querySelectorAll('button')].find(b => b.textContent.includes('↑'))
+  const bBtn = [...c.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息')
   assert.ok(!bBtn.disabled, 'B 可发送（不被 A 阻塞）')
   await act(async () => { bBtn.click() })
 
@@ -412,7 +412,7 @@ test('真实组件 DM：A→B→A 后 A 旧回调不覆盖新一轮', async () =
     Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, '第一轮消息')
     ta.dispatchEvent(new Event('input', { bubbles: true }))
   })
-  await act(async () => { [...c.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click() })
+  await act(async () => { [...c.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息').click() })
   const firstPostIdx = deferredQueue.findIndex(d => d.call.url.includes('/cycleA/chat') && d.call.method === 'POST')
 
   // 切 B 再切回 A
@@ -431,7 +431,7 @@ test('真实组件 DM：A→B→A 后 A 旧回调不覆盖新一轮', async () =
     Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, '第二轮消息')
     ta.dispatchEvent(new Event('input', { bubbles: true }))
   })
-  const btn2 = [...c.el.querySelectorAll('button')].find(b => b.textContent.includes('↑'))
+  const btn2 = [...c.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息')
   assert.ok(!btn2?.disabled, '切回 A 后可发送新消息（旧回调不阻塞）')
 
   c.root.unmount(); c.el.remove(); teardownMockFetch()
@@ -448,7 +448,7 @@ test('Codex: late failure preserves original conversation retry', async () => {
       Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, 'must retain')
       ta.dispatchEvent(new Event('input', { bubbles: true }))
     })
-    await act(async () => [...c.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    await act(async () => [...c.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息').click())
     const post = deferredQueue.find(d => d.call.url.includes('/retryLateA/chat'))
     assert.ok(post, 'retryLateA POST pending')
 
@@ -479,7 +479,7 @@ test('Codex: group A-B-A old POST cannot overwrite new generation', async () => 
   try {
     await render(React.createElement(GroupChatView, { conversation: a, bots }), c)
     await input('first')
-    await act(async () => [...c.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    await act(async () => [...c.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息').click())
     const old = deferredQueue.find(d => d.call.url.includes('/genA/chat'))
     assert.ok(old, 'genA first POST pending')
 
@@ -487,7 +487,7 @@ test('Codex: group A-B-A old POST cannot overwrite new generation', async () => 
     await rerender(React.createElement(GroupChatView, { conversation: makeConv('genB', ['cx','cy']), bots }), c)
     await rerender(React.createElement(GroupChatView, { conversation: a, bots }), c)
     await input('second')
-    await act(async () => [...c.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    await act(async () => [...c.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息').click())
 
     // 旧 POST 返回
     await act(async () => old.resolve({
@@ -508,7 +508,7 @@ test('Codex: older failure cannot overwrite newer retry', async () => {
       Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text)
       ta.dispatchEvent(new Event('input', { bubbles: true }))
     })
-    await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('↑')).click())
+    await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.getAttribute('aria-label') === '发送消息').click())
   }
   try {
     await render(React.createElement(BotChatView, { bot: a, state: null }), c)
@@ -554,7 +554,7 @@ test('旧失败不覆盖新成功后的重试槽', async () => {
       Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text)
       ta.dispatchEvent(new Event('input', { bubbles: true }))
     })
-    await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('↑')).click())
+    await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.getAttribute('aria-label') === '发送消息').click())
   }
   try {
     await render(React.createElement(BotChatView, { bot: a, state: null }), c)
@@ -607,7 +607,7 @@ test('Codex: offscreen newer success blocks older failure (DM)', async () => {
       Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text)
       ta.dispatchEvent(new Event('input', { bubbles: true }))
     })
-    await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('↑')).click())
+    await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.getAttribute('aria-label') === '发送消息').click())
   }
   try {
     await render(React.createElement(BotChatView, { bot: a, state: null }), c)
@@ -641,7 +641,7 @@ test('Codex: offscreen older success must not clear newer failure retry (DM)', a
       Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text)
       ta.dispatchEvent(new Event('input', { bubbles: true }))
     })
-    await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('↑')).click())
+    await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.getAttribute('aria-label') === '发送消息').click())
   }
   try {
     await render(React.createElement(BotChatView, { bot: a, state: null }), c)
@@ -684,13 +684,13 @@ test('Codex: offscreen newer success blocks older failure (group)', async () => 
   }
   try {
     await render(React.createElement(GroupChatView, { conversation: a, bots }), c)
-    await input('OLD'); await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('↑')).click())
+    await input('OLD'); await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.getAttribute('aria-label') === '发送消息').click())
     const old = deferredQueue.find(d => d.call.url.includes('/offgA/chat'))
     assert.ok(old)
 
     await rerender(React.createElement(GroupChatView, { conversation: makeConv('offgB', ['cx', 'cy']), bots }), c)
     await rerender(React.createElement(GroupChatView, { conversation: a, bots }), c)
-    await input('NEW'); await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('↑')).click())
+    await input('NEW'); await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.getAttribute('aria-label') === '发送消息').click())
     const newer = deferredQueue.filter(d => d.call.url.includes('/offgA/chat'))[1]
     assert.ok(newer)
 
@@ -719,12 +719,12 @@ test('Codex: offscreen older success must not clear newer failure retry (group)'
   }
   try {
     await render(React.createElement(GroupChatView, { conversation: a, bots }), c)
-    await input('OLD'); await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('↑')).click())
+    await input('OLD'); await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.getAttribute('aria-label') === '发送消息').click())
     const old = deferredQueue.find(d => d.call.url.includes('/off2gA/chat'))
     assert.ok(old)
     await rerender(React.createElement(GroupChatView, { conversation: makeConv('off2gB', ['cx', 'cy']), bots }), c)
     await rerender(React.createElement(GroupChatView, { conversation: a, bots }), c)
-    await input('NEW'); await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.textContent.includes('↑')).click())
+    await input('NEW'); await act(async () => [...c.el.querySelectorAll('button')].find(b2 => b2.getAttribute('aria-label') === '发送消息').click())
     const newer = deferredQueue.filter(d => d.call.url.includes('/off2gA/chat'))[1]
     assert.ok(newer)
     const newerId = JSON.parse(newer.call.body).requestId
@@ -787,7 +787,7 @@ test('卸载重挂：DM A 草稿+任务引用保留，群视图不继承，重�
     await render(React.createElement(BotChatView, { bot: a, state: null }), c3)
     assert.equal(c3.el.querySelector('textarea').value, 'um-draft-A', '卸载重挂后 DM 草稿保留')
     assert.ok(c3.el.textContent.includes('继续修改：report.html'), '任务引用（附件选择）恢复')
-    await act(async () => [...c3.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    await act(async () => [...c3.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息').click())
     const post = fetchCalls.filter(f => f.url.includes('/umA/chat')).at(-1)
     assert.equal(JSON.parse(post.body).taskId, 'task-um1', '发送携带恢复的任务引用')
     assert.equal(JSON.parse(post.body).text, 'um-draft-A', '发送内容为恢复的草稿')
@@ -826,7 +826,7 @@ test('卸载重挂：群草稿保留，DM 视图不继承', async () => {
     await render(React.createElement(GroupChatView, { conversation: g, bots }), c3)
     assert.equal(c3.el.querySelector('textarea').value, 'um-draft-G', '卸载重挂后群草稿保留')
     // 发送：无任务引用时不携带 taskId（引用归属正确）
-    await act(async () => [...c3.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    await act(async () => [...c3.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息').click())
     const post = fetchCalls.filter(f => f.url.includes('/umG2/chat')).at(-1)
     assert.equal(JSON.parse(post.body).taskId, undefined, '群草稿无任务引用：不携带 taskId')
   } finally {
@@ -851,7 +851,7 @@ test('卸载时挂起：迟到成功不污染重挂视图、不复活 sending、
     const c1 = createContainer(); mounts.push(c1)
     await render(React.createElement(BotChatView, { bot: a, state: null }), c1)
     await typeInto(c1.el, 'pending-msg')
-    await act(async () => [...c1.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    await act(async () => [...c1.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息').click())
     const post = deferredQueue.find(d => d.call.url.includes('/umPendA/chat'))
     assert.ok(post, 'POST 挂起中')
     // 卸载（挂起未决）
@@ -878,7 +878,7 @@ test('卸载时挂起：迟到成功不污染重挂视图、不复活 sending、
     assert.ok(![...c3.el.querySelectorAll('button')].find(b => b.textContent.includes('重试')), '成功已结算：无重试条')
     // sending 未复活：可立即再发（若 sending 卡 true，send 早退不产生 POST）
     await typeInto(c3.el, 'next-msg')
-    await act(async () => [...c3.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    await act(async () => [...c3.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息').click())
     const posts = fetchCalls.filter(f => f.url.includes('/umPendA/chat'))
     assert.equal(posts.length, 2, '恰两次 POST（原始+新发）：卸载/重挂不产生重复 POST')
     const body2 = JSON.parse(posts[1].body)
@@ -906,7 +906,7 @@ test('卸载时挂起：迟到失败后重挂出现重试条，重试复用原 r
     const c1 = createContainer(); mounts.push(c1)
     await render(React.createElement(BotChatView, { bot: a, state: null }), c1)
     await typeInto(c1.el, 'fail-msg')
-    await act(async () => [...c1.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    await act(async () => [...c1.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息').click())
     const post = deferredQueue.find(d => d.call.url.includes('/umPendB/chat'))
     const origId = JSON.parse(post.call.body).requestId
     await act(async () => c1.root.unmount()); c1.el.remove()
@@ -972,7 +972,7 @@ test('Codex: unmounted old history GET cannot replace remounted newer history', 
     const c2 = createContainer(); mounts.push(c2)
     await render(React.createElement(BotChatView, { bot: a, state: null }), c2)
     await typeInto(c2, 'NEW_REQUEST')
-    await act(async () => [...c2.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    await act(async () => [...c2.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息').click())
     await act(async () => resolveFor('/umHistA/chat', 'POST', { reply: 'NEW_CURRENT_RESULT' }))
     await act(async () => resolveFor('/conversations/umHistA', 'GET', { messages: [{ ts: 2, role: 'bot', text: 'NEW_CURRENT_RESULT' }] }))
     assert.ok(c2.el.textContent.includes('NEW_CURRENT_RESULT'), '新历史可见')
@@ -1034,7 +1034,7 @@ test('卸载重挂：群任务引用（带 taskId）恢复，发送携带且不�
     await render(React.createElement(GroupChatView, { conversation: g, bots }), c2)
     assert.equal(c2.el.querySelector('textarea').value, 'group-draft-with-task', '群草稿卸载重挂保留')
     assert.ok(c2.el.textContent.includes('继续修改：group-report.html'), '群任务引用恢复')
-    await act(async () => [...c2.el.querySelectorAll('button')].find(b => b.textContent.includes('↑')).click())
+    await act(async () => [...c2.el.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '发送消息').click())
     const post = fetchCalls.filter(f => f.url.includes('/umG3/chat')).at(-1)
     assert.equal(JSON.parse(post.body).taskId, 'task-g3', '群发送携带恢复的任务引用')
     assert.equal(JSON.parse(post.body).text, 'group-draft-with-task')
@@ -1132,9 +1132,7 @@ test('project board switches groups without stale results, shows numbered tasks 
  assert.match(c.el.textContent,/等待审批 · 已运行 60 分钟/);assert.match(c.el.textContent,/工作检查点（待核实）/);assert.match(c.el.textContent,/剩余：文件传输/)
  assert.equal(c.el.querySelectorAll('.gk-board__tasks>li').length,2)
  assert.deepEqual([...c.el.querySelectorAll('.gk-board__item h3')].map(n=>n.textContent),['1. 架构设计','2. 目录访问'])
- await act(async()=>c.el.querySelector('[aria-label=收起任务列表]').click())
- assert.equal(c.el.querySelector('li'),null)
- await act(async()=>c.el.querySelector('[aria-label=展开任务列表]').click())
+ assert.equal(c.el.querySelector('[aria-label=收起任务列表]'),null,'collapse has one owner: the conversation header')
  assert.equal(c.el.querySelector('svg'),null)
  assert.doesNotMatch(c.el.textContent,/OLD_RUN_HIDDEN/)
  await act(async()=>[...c.el.querySelectorAll('button')].find(b=>b.textContent.startsWith('查看其他执行记录')).click())
@@ -1169,7 +1167,7 @@ test('approval UX decodes nested JSON and only allows once even with stale grant
  assert.equal(c.el.querySelector('.gk-approval__reason').textContent,'保存外网需求')
  assert.equal(c.el.querySelector('.gk-approval__change pre').textContent,'旧内容\n第二行')
  assert.deepEqual(calls,[])
- assert.equal(c.el.querySelector('.gk-approval__scope'),null)
+ assert.match(c.el.querySelector('.gk-approval__scope').textContent,/只允许当前这一项/)
  await act(async()=>c.el.querySelector('button.primary').click())
  assert.deepEqual(calls,['allowed-once'])
  assert.equal(c.el.querySelector('footer'),null)
@@ -1261,14 +1259,14 @@ test('DM pending message survives stale history and remount', async () => {
   await render(React.createElement(BotChatView,{bot,state:null}),c)
   await act(async()=>resolveFor('/conversations/'+bot.id,'GET',{messages:[{ts:1,role:'bot',text:'earlier'}]}))
   await act(async()=>{const t=c.el.querySelector('textarea');Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(t,'keep my message');t.dispatchEvent(new Event('input',{bubbles:true}))})
-  await act(async()=>[...c.el.querySelectorAll('button')].find(b=>b.textContent.includes('↑')).click())
+  await act(async()=>[...c.el.querySelectorAll('button')].find(b=>b.getAttribute('aria-label') === '发送消息').click())
   const requestId=JSON.parse(fetchCalls.find(f=>f.method==='POST'&&f.url.endsWith('/chat')).body).requestId
   assert.ok(c.el.textContent.includes('keep my message'),'visible before executor status arrives')
   await act(async()=>resolveFor('/'+bot.id+'/chat','POST',{reply:'received'}))
   await act(async()=>resolveFor('/conversations/'+bot.id,'GET',{messages:[{ts:1,role:'bot',text:'earlier'}]}))
   assert.ok(c.el.textContent.includes('keep my message'),'stale server snapshot must not erase optimistic user message')
   await act(async()=>{const t=c.el.querySelector('textarea');Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(t,'second message');t.dispatchEvent(new Event('input',{bubbles:true}))})
-  await act(async()=>[...c.el.querySelectorAll('button')].find(b=>b.textContent.includes('↑')).click())
+  await act(async()=>[...c.el.querySelectorAll('button')].find(b=>b.getAttribute('aria-label') === '发送消息').click())
   const secondId=JSON.parse(fetchCalls.filter(f=>f.method==='POST'&&f.url.endsWith('/chat')).at(-1).body).requestId
   await act(async()=>resolveFor('/'+bot.id+'/chat','POST',{reply:'received again'}))
   await act(async()=>resolveFor('/conversations/'+bot.id,'GET',{messages:[{ts:1,role:'bot',text:'earlier'},{ts:2,role:'user',text:'keep my message',requestId},{ts:3,role:'user',text:'second message',requestId:secondId}]}))
@@ -1324,4 +1322,37 @@ test('ordinary Bot re-entry reconciles cached user message with late server repl
   await act(async()=>resolveFor('/conversations/'+a.id,'GET',{messages:[{ts:1,role:'user',text:'私聊问题',requestId:'late-r'},{ts:2,role:'bot',text:'真实迟到回复',requestId:'late-r'}]}))
   assert.match(c.el.textContent,/真实迟到回复/)
  }finally{await act(async()=>c.root.unmount());c.el.remove();teardownMockFetch()}
+})
+
+test('角色状态：审批与失联立即覆盖工作，完成不代表项目验收',async()=>{
+ const {characterActivity}=await import(await import('./ctb-path.mjs').then(m=>m.CTB_DIR+'/test-entry.mjs'))
+ const bot={id:'b',status:'working',motionPhase:'working'},state={approvals:[],queued:[],recentJobs:[]}
+ assert.equal(characterActivity(bot,state).state,'working')
+ assert.equal(characterActivity(bot,{...state,approvals:[{botId:'b',stage:'user'}]}).state,'waiting')
+ assert.equal(characterActivity(bot,{...state,stale:true}).state,'unknown')
+ assert.equal(characterActivity({...bot,status:'idle'},{...state,queued:[{botId:'b'}]}).state,'queued')
+ const completed=characterActivity({...bot,status:'idle'},{...state,recentJobs:[{botId:'b',jobId:'j',status:'replied',endedAt:1000}]},1001)
+ assert.equal(completed.state,'done');assert.equal(completed.label,'本次执行已结束')
+})
+test('角色组件：轮询保留SVG节点，只演新终态；自定义身份可动',async()=>{
+ const {Character}=await import(await import('./ctb-path.mjs').then(m=>m.CTB_DIR+'/test-entry.mjs'))
+ const c=createContainer(),props={seed:'custom-new',name:'新角色',role:'blank',size:52}
+ try{
+ await render(React.createElement(Character,{...props,activity:{state:'active',label:'处理中',eventId:'j'}}),c)
+ const svg=c.el.querySelector('svg')
+ await act(async()=>c.root.render(React.createElement(Character,{...props,activity:{state:'working',label:'执行中',eventId:'j'}})))
+ assert.equal(c.el.querySelector('svg'),svg)
+ await act(async()=>c.root.render(React.createElement(Character,{...props,activity:{state:'done',label:'执行结束',eventId:'j'}})))
+ assert.equal(c.el.querySelector('.gk-character').dataset.event,'true')
+ await act(async()=>c.root.unmount());c.el.remove()
+ const old=createContainer();try{await render(React.createElement(Character,{...props,activity:{state:'done',label:'旧记录',eventId:'j'}}),old);assert.equal(old.el.querySelector('.gk-character').dataset.event,'false')}finally{await act(async()=>old.root.unmount());old.el.remove()}
+ }finally{try{await act(async()=>c.root.unmount())}catch{}c.el.remove()}
+})
+test('审批：只有用户勾选才发送记住授权意图',async()=>{
+ const c=createContainer(),decisions=[]
+ try{await render(React.createElement(ApprovalView,{approval:{id:'r',botId:'b',stage:'user',toolName:'bash',ruleCandidate:{workspace:'/project',mode:'workspace-write',label:'exact'}},onDecision:async(...args)=>decisions.push(args)}),c)
+ const checkbox=c.el.querySelector('input[type=checkbox]');assert.equal(checkbox.checked,false)
+ await act(async()=>checkbox.click());await act(async()=>[...c.el.querySelectorAll('button')].find(b=>b.textContent==='允许并记住').click())
+ assert.deepEqual(decisions,[['allowed-once',true]])
+ }finally{await act(async()=>c.root.unmount());c.el.remove()}
 })

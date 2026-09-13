@@ -26,7 +26,7 @@ export function stepFingerprint(step){return createHash('sha256').update(JSON.st
 export const stepGeneration=(state,id)=>state.stepGenerations?.[id]||0
 export function deliveryFingerprint(state,step){const base=state.deliveryIdentityVersion===2?stepFingerprint({...step,jobIds:[]}):stepFingerprint(step),generation=stepGeneration(state,step.id);return generation?createHash('sha256').update(`${base}:${generation}`).digest('hex'):base}
 export function acceptedStep(state,step,steps=null,seen=new Set()){
- if(!step||step.finalDelivery&&state.reviews?.[step.id]?.actor!=='user'||seen.has(step.id)||state.reviews?.[step.id]?.fingerprint!==deliveryFingerprint(state,step)||state.reworks?.[step.id]&&state.reworks[step.id].phase!=='passed')return false
+ if(!step||step.finalDelivery&&!(['user',...(state.externalReviewer?.kind==='codex'?['codex']:[])].includes(state.reviews?.[step.id]?.actor))||seen.has(step.id)||state.reviews?.[step.id]?.fingerprint!==deliveryFingerprint(state,step)||state.reworks?.[step.id]&&state.reworks[step.id].phase!=='passed')return false
  if(!steps)return true
  const next=new Set(seen);next.add(step.id)
  const dependencies=state.reviews[step.id].dependencyFingerprints
@@ -37,15 +37,16 @@ export async function transitionProject(root,id,{action,expectedRevision,summary
  const s=await readLifecycle(root,id)
  if(expectedRevision!==s.revision)throw Error('项目版本已变化，请重新读取后操作')
  if(typeof summary!=='string'||!summary.trim()||summary.length>12000)throw Error('必须提供项目摘要或操作原因（最多12000字）')
- const targets={pause:'paused',block:'blocked',resume:'active',complete:'completed',cancel:'cancelled',archive:'archived',restore:'paused'}
+ const targets={pause:'paused',block:'blocked',resume:'active',complete:'completed',cancel:'cancelled',archive:'archived',restore:'paused',iterate:'active'}
  const to=targets[action];if(!to)throw Error('未知生命周期操作')
- const allowed={pause:['active','blocked'],block:['active','paused'],resume:['paused','blocked'],complete:['active','paused'],cancel:['active','paused','blocked'],archive:['active','paused','blocked','completed','cancelled'],restore:['archived','completed','cancelled']}
- if(!allowed[action].includes(s.status))throw Error(`不允许 ${s.status} → ${to}`)
+ const allowed={pause:['active','blocked'],block:['active','paused'],resume:['paused','blocked'],complete:['active','paused'],cancel:['active','paused','blocked'],archive:['active','paused','blocked','completed','cancelled'],restore:['archived','completed','cancelled'],iterate:['completed','archived']}
+ if(!allowed[action].includes(s.status))throw Error(action==='iterate'&&s.status==='active'?'当前轮次仍为 active；全部阶段验收后先 complete，再用最新 revision 执行 iterate。不要改写已验收阶段标题或拼接新轮计划。':`不允许 ${s.status} → ${to}`)
  if(action==='block'&&(!blocker?.reason?.trim()||!blocker?.resolution?.trim()||!blocker?.owner?.trim()))throw Error('阻塞必须指定原因、负责人和解除条件')
  const live=await inspect()
- if(['archive','complete','cancel'].includes(action)&&((leases.get(key(root,id))||0)>0||live.running))throw Error('项目仍有执行中操作；请先暂停，等待执行收尾后再操作')
+ if(['archive','complete','cancel','iterate'].includes(action)&&((leases.get(key(root,id))||0)>0||live.running))throw Error('项目仍有执行中操作；请先暂停，等待执行收尾后再操作')
  if(action==='complete'&&(!live.allAccepted||live.queued))throw Error('项目仍有未验收阶段或排队任务，不能完成')
- const next={...s,status:to,epoch:(s.epoch||0)+(['archive','cancel'].includes(action)?1:0),snapshot:action==='archive'?live.snapshot:s.snapshot,revision:s.revision+1,summary:summary.trim(),blocker:action==='block'?blocker:null,updatedAt:Date.now(),previousStatus:s.status,
+ const iteration=action==='iterate'?{iteration:(s.iteration||1)+1,iterations:[...(s.iterations||[]),{number:s.iteration||1,closedAt:Date.now(),status:s.status,summary:s.summary,baseline:live.snapshot}]}:{}
+ const next={...s,...iteration,status:to,epoch:(s.epoch||0)+(['archive','cancel','iterate'].includes(action)?1:0),snapshot:action==='archive'?live.snapshot:s.snapshot,revision:s.revision+1,summary:summary.trim(),blocker:action==='block'?blocker:null,updatedAt:Date.now(),previousStatus:s.status,
  history:[...s.history,{revision:s.revision+1,from:s.status,to,action,actor,at:Date.now(),summary:summary.trim()}]}
  await mkdir(join(root,'project-lifecycle'),{recursive:true});await atomicWriteFile(key(root,id),JSON.stringify(next));return next
 })}
@@ -54,6 +55,7 @@ export async function acceptProjectStep(root,id,{expectedRevision,stepId,evidenc
  if(!['active','paused'].includes(s.status))throw Error('当前项目状态不允许验收')
  if(expectedRevision!==s.revision)throw Error('项目版本已变化，请重新读取')
  if(typeof evidence!=='string'||!evidence.trim()||evidence.length>12000)throw Error('必须提供验收证据说明')
+ if(actor==='codex'&&s.externalReviewer?.kind!=='codex')throw Error('项目没有 Codex 代审授权')
  const {step,ready}=await inspect(stepId)
  if(!step||!ready)throw Error('阶段尚未交付、前置未验收或仍在执行，不能验收')
  if(expectedEpoch!==undefined&&expectedEpoch!==s.epoch)throw Error('审阅请求属于旧项目批次，请重新提交审阅')
@@ -64,7 +66,7 @@ export async function acceptProjectStep(root,id,{expectedRevision,stepId,evidenc
  await mkdir(join(root,'project-lifecycle'),{recursive:true});await atomicWriteFile(key(root,id),JSON.stringify(next));return next
 })}
 
-export function reviewModeOf(state,step){return state.reviewPolicies?.[step.id]?.mode||step.reviewMode||'user'}
+export function reviewModeOf(state,step){const mode=state.reviewPolicies?.[step.id]?.mode||step.reviewMode||'user';return state.externalReviewer?.kind==='codex'&&(step.finalDelivery||mode==='user')?'codex':mode}
 export async function setReviewPolicy(root,id,{expectedRevision,stepId,mode,evidence,userText},inspect){return projectLock(root,id,async()=>{
  const state=await readLifecycle(root,id),steps=await inspect(),step=steps.find(s=>s.id===stepId)
  if(!['active','paused'].includes(state.status)||state.revision!==expectedRevision)throw Error('项目状态或版本已变化')

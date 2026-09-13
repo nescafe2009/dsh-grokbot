@@ -1,18 +1,26 @@
+# DeepSeekBot · v0.6.0
+
+正式里程碑版，也可供同事小范围试用。已验证宿主为 macOS arm64 的 DSH Desktop 0.8.2；安装包不附带模型额度、API key、聊天记录或项目数据。
+
+先阅读 [安装、升级与回退](docs/INSTALL.md) 和 [同事试用手册](docs/USER-GUIDE.md)。技术包名仍为 `dsh-grokbot`，展示名为 DeepSeekBot。
+
 ## 定位
 
-**dsh-grokbot 是一个纯 out-of-tree DSH 插件**：安装即得 Grok Bot 式的常驻团队（多专家/群聊/派发回流/幕僚长协调/任务闭环）。bots 用 DSH 原生工具在**宿主本机**执行（本地调用、无 SSH 绕行；本插件通过 profile patch 启用 web profile 默认禁用的 bash/fs 等执行工具，沙箱与审批沿用 DSH 原生体系。不承诺固定耗时——同任务下插件路径与直连的额外回合/耗时如实计量，见效率验收）。
+**DeepSeekBot（npm 包名 dsh-grokbot）是一个纯 out-of-tree DSH 插件**：安装即得 Grok Bot 式的常驻团队（多专家/群聊/派发回流/幕僚长协调/任务闭环）。bots 用 DSH 原生工具在**宿主本机**执行（本地调用、无 SSH 绕行；本插件通过 profile patch 启用 web profile 默认禁用的 bash/fs 等执行工具，沙箱与审批沿用 DSH 原生体系。不承诺固定耗时——同任务下插件路径与直连的额外回合/耗时如实计量，见效率验收）。
 
 可选配件：配置 computer.json 后获得一台团队共享电脑（Linux VM）——用于无头构建、长时任务、托管可试玩的 HTML（noVNC 观摩）。默认不启用，不影响插件本体。
 
-# dsh-grokbot
+## 项目基础
 
 在 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) 上复刻 Grok Bot 模式的常驻 agent 团队插件。
+
+> 展示名已改为 **DeepSeekBot**；技术标识（npm 包名 `dsh-grokbot`、API 路由、状态目录、localStorage 键、插件注册名等）保持兼容不变。本插件与 DeepSeek 官方无隶属关系，不代表 DeepSeek 官方出品。
 
 **一切皆插件**：本项目是纯树外插件，不修改 DSH 本体，`dsh plugin` 一条命令安装。
 
 ## 它做什么
 
-- **常驻 agent 团队**：在 `crew.json` 里定义若干具名 bot（头像、人格、专属工作区），DSH 启动即常驻
+- **常驻 agent 团队**：在 `crew.json` 里定义若干具名 bot（头像、人格、可配置工作区），DSH 启动即常驻
 - **首页原生存在**：bot 卡片直接出现在 DSH 首页输入区下方，显示实时状态（待命/工作中），点击即聊——不新开窗口
 - **todi-hub 兼容 inbox 协议**：`queue.jsonl` + `<jobId>/job.json` + `reply.md`，与 Grok Bot 的文件驱动方式同构，外部系统（手机、webhook、定时器）投文件即接活
 - **共享本机工作区**：默认使用插件状态目录下的共享 workspace（`<stateDir>/workspace`，个人子目录 `agents/<botId>`），bot 可覆盖为独立工作区；后台任务在按 (会话,bot) 隔离的 DSH 会话中执行
@@ -28,7 +36,7 @@ dsh plugin --profile web add github:nescafe2009/dsh-grokbot
 
 重启 DSH 后，从团队侧栏进入幕僚长、成员私聊或项目群聊。
 
-当前版本：**v0.5.0**。固定版本可从 [GitHub Releases](https://github.com/nescafe2009/dsh-grokbot/releases/tag/v0.5.0) 下载 `dsh-grokbot-0.5.0.tgz`，使用 `dsh plugin --profile web add /路径/dsh-grokbot-0.5.0.tgz` 安装。升级前请备份插件状态目录；升级不删除会话与项目文件。
+当前版本：**v0.6.0**。固定版本可从 [GitHub Releases](https://github.com/nescafe2009/dsh-grokbot/releases/tag/v0.6.0) 下载 `dsh-grokbot-0.6.0.tgz`，使用 `dsh plugin --profile web add /路径/dsh-grokbot-0.6.0.tgz` 安装。升级前请备份插件状态目录；升级不删除会话与项目文件。
 
 ## 配置
 
@@ -118,3 +126,15 @@ MIT
 「团队默认模型」入口提供常用模型库和按成员快捷分配。选择后立即保存，下次对话或任务生效；未单独指定模型的成员跟随团队默认。服务商连接和凭据仍由 DSH 管理。
 
 生命周期与恢复机制详见 [设计说明](docs/LIFECYCLE-RELIABILITY.md)。
+
+## 预置角色
+
+角色库包含架构师、QA、鸿蒙、macOS、Windows 及原有通用专业角色。姓名、职位、专业规范与用户补充职责分别管理；私聊、群聊和派工使用同一份当前身份。现有成员按职位兼容，无需重新创建。可直接让幕僚长调整成员职责。来源、许可、映射与兼容规则见 [角色设计与来源](docs/role-sources.md)。
+
+### 项目复盘与成长
+
+对幕僚长说「复盘这个项目」，即可按实际阶段、交付与验收记录总结经验并评价各角色。改进建议进入后续工作的实践提醒，经过后续项目验证有效才获得成长经验。报告可在 Computer → 复盘档案回看。详见 [复盘机制](docs/retrospective.md)。
+
+## 上下文治理
+
+长会话使用 DSH 原生压缩并在每轮重新装配项目状态、用户指令来源和审核边界。群聊采用有界跨作用域目录与按需历史检索，压缩不删除原始 append-only 会话事件。维护记录、调用 token 与响应时间可在成员工作详情查看。设计与限制见 [上下文管理说明](docs/context-management.md)。

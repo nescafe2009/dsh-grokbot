@@ -1,3 +1,4 @@
+import {currentProjectEvidence} from './project-evidence.mjs'
 import {mkdir} from 'node:fs/promises'
 import {join} from 'node:path'
 import {atomicWriteFile} from './inbox.mjs'
@@ -23,6 +24,7 @@ export function validateDispatch(state,step,steps,jobs,{phase='normal',toBot}){
  if(!step.dependsOn.every(id=>acceptedStep(state,steps.find(s=>s.id===id),steps)))throw Error('前置工作包尚未验收，不能派发下游任务')
  if(step.finalDelivery&&steps.some(s=>s.id!==step.id&&!acceptedStep(state,s,steps)))throw Error('最终质量验收尚有必交付阶段未验收')
  if(acceptedStep(state,step,steps))throw Error('工作包已验收；发现缺陷请先退回返工')
+ if(currentProjectEvidence(state,step,steps,jobs))throw Error('已有成果已登记待审，不应重复派工；有缺陷请退回返工')
  const work=state.reworks?.[step.id],current=currentStepJobs(state,step,jobs)
  if(work){
   if(work.scopeFingerprint&&work.scopeFingerprint!==stepFingerprint({...step,jobIds:[]}))throw Error('阶段范围已变化，请用 action=revise 调整返工方案再派发')
@@ -62,7 +64,7 @@ export async function returnProjectStep(root,id,params,inspect){return projectLo
  if(params.action==='revise'&&!state.reworks?.[step.id])throw Error('尚无返工轮次可以调整')
  if(state.reworks?.[step.id]&&state.reworks[step.id].phase!=='passed'&&params.action!=='revise')throw Error('已有返工轮次；请修复、复测并记录结论，不能重复退回')
  const linked=currentStepJobs(state,step,jobs)
- if(params.action!=='revise'&&!linked.some(j=>['replied','failed','cancelled'].includes(j.record.status)))throw Error('阶段尚未交付或结束，不能退回')
+ if(params.action!=='revise'&&!currentProjectEvidence(state,step,steps,jobs)&&!linked.some(j=>['replied','failed','cancelled'].includes(j.record.status)))throw Error('阶段尚未交付或结束，不能退回')
  return persist(root,id,invalidate(state,steps,step,params))
 })}
 export async function recordRetest(root,id,params,inspect){return projectLock(root,id,async()=>{

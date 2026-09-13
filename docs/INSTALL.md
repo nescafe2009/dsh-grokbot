@@ -1,49 +1,36 @@
-# dsh-grokbot 安装 / 启停 / 卸载（R3）
+# 安装、升级与回退
 
-## 已验证宿主
-
-- DSH Desktop **0.7.2**（macOS arm64）
-- `@deepseek-ai/dsh-base` / `@deepseek-ai/dsh-web-app` **0.1.2-alpha.1**
-- 插件注入面：`agents`（create/resume）、`webServer.register(prefix)`、`agentDefaultModel`、`llm`；客户端经宿主 `ModuleLoader`（CJS 包裹）加载 `lib/client.js`
-
-## 依赖
-
-- **服务端零 npm 运行时依赖**（`lib/index.mjs` 仅用 node: 内建模块）
-- 客户端 `lib/client.js` 的 react/react-dom 由宿主运行时提供（external，不随包分发）
-- 测试环境固定版本（不随包分发）：react 19.2.8 / react-dom 19.2.8 / happy-dom 20.14.0
+适用 DeepSeekBot 0.6.0。本插件不是独立应用；本版验证宿主为 DSH Desktop 0.8.2 / macOS arm64（内置 `dsh-base`、`dsh-web-app` 0.1.2-rc.1）。Windows、Linux和其他宿主版本尚未完成本版实机验收。源码构建需要 Node.js 22+ 和 pnpm；安装预编译包无需构建。
 
 ## 安装
 
-1. 取得 `dsh-grokbot-<version>.tgz`（构建方式见 `tests/package-build/build-tgz.sh`：固定 git SHA 干净导出 + npm pack + 私人内容扫描 + manifest hash）
-2. 在目标 profile（`$DSH_HOME/profiles/<name>`）的 `package.json`：
-   ```json
-   {
-     "dependencies": { "dsh-grokbot": "file:/path/to/dsh-grokbot-<version>.tgz" },
-     "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "dsh-grokbot"] } }
-   }
-   ```
-3. 安装依赖（等价桌面端 `dsh plugin --profile <name> install --no-frozen-lockfile`）；离线场景可直接把 tgz 解包为 `profile/node_modules/dsh-grokbot/`（R3 验收脚本 `tests/package-build/r3-accept.mjs` 即此形态）
-4. 启动宿主（桌面选择该 profile，或 `dsh --profile <name> --no-open --host 127.0.0.1 --port <p>`）
+1. 安装DSH，在宿主配置自己的模型服务和API key，确认普通对话成功。插件不附带额度或凭据。
+2. 从GitHub Release下载 `dsh-grokbot-0.6.0.tgz`、`SHA256SUMS`，放在同一目录。
+3. 在下载目录运行：
 
-## 启停
+```sh
+shasum -a 256 -c SHA256SUMS
+dsh plugin --profile web add ./dsh-grokbot-0.6.0.tgz
+```
 
-- 启动：随宿主 profile 启动自动加载（无需单独进程）
-- 停止：停止宿主即停止（插件无守护进程；SIGTERM 退出干净，R3 验收已验证）
-- 临时停用：从 `dsh.profile.bundles` 移除 `dsh-grokbot` 后重启宿主——数据不删
+若找不到dsh，先配置宿主CLI并运行 `dsh plugin --help`；不要在未知运行时目录执行npm install。使用其他profile时替换web参数。
 
-## 卸载与产物保留
+4. 等在途任务结束后重启DSH，从侧栏或主页进入幕僚长，做一个独立试用目录中的小任务。
 
-- 卸载：移除 profile 依赖与 bundles 条目（`dsh plugin --profile <name> remove dsh-grokbot`）——**不删除任何用户数据**
-- 用户数据/产物目录：**`$DSH_HOME/grokbot/`**（随包 `cordis.patch.yml` 以 `dshHomePath('grokbot')` 配置的默认；可经插件 config `stateDir` 覆盖）。含：
-  - `crew.json`（成员与会话）、`bots/<id>/`（DM 转录、记忆、stats）
-  - `tasks/`（任务与 run 历史）、`artifacts/<id>/`（成果快照 + meta，SHA256 校验）
-  - `rooms/`（群转录）、`inbox/`（派发队列）、`memory/`、`skills/`
-- 卸载后需要彻底清理时手动删除该目录（成果快照在 `artifacts/`，删除前自行备份）
+插件patch启用宿主bash、文件和后台任务工具；权限沿用宿主。不要给试用任务无关目录的访问权限。
 
-## 测试端点
+## 数据、备份与升级
 
-`__probe/echo`、`__probe/count`、`__perf/direct` **默认关闭**（路由不注册，404，不建会话不写计数）。仅显式配置启用：插件 config `testEndpoints: true` 或环境变量 `GROKBOT_TEST_ENDPOINTS=1`；`/state` 的 `config.testEndpoints` 字段可见当前开关态。仍走同一宿主认证与 origin 检查。
+状态目录为当前宿主的 `$DSH_HOME/grokbot`，可由stateDir覆盖，不一定是 `~/.dsh/grokbot`；Desktop和CLI可能使用不同数据根。成员、会话、项目、成果、复盘在状态目录，原生会话另在宿主sessions目录。API key由宿主凭据系统管理。
+
+升级前等任务结束、退出宿主，备份旧插件包、profile配置和数据目录。备份只保存在本机，不发给同事、不附在issue中。安装固定版本tgz后重启，不同时运行两个实例写相同状态。
+
+回退时退出宿主，安装原版本包并恢复配套的升级前状态和profile备份。旧版本读取新状态不保证兼容，因此仅降级包不保证恢复。先保留本地异常现场，勿直接删数据。
+
+## 卸载
+
+运行 `dsh plugin --profile web remove dsh-grokbot` 后重启。卸载插件不等于删除业务数据，不要删除整个DSH根目录。不同宿主命令以其 `dsh plugin --help` 为准。
 
 ## 包完整性
 
-每个 tgz 附 `dist/r3/manifest.json`：git SHA、tgz SHA256、逐文件 SHA256。构建脚本扫描机器特定绝对路径与凭据痕迹，命中即失败。
+Release附tgz、SHA256SUMS、manifest.json和手册。manifest记录源码提交和包内文件哈希。发布包不含个人凭据、聊天记录、node_modules、运行日志或业务项目。

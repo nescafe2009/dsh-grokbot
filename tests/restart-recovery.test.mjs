@@ -18,15 +18,14 @@ const API_ROOT = '/api/plugins/grokbot'
 const HOST_TOKEN = 'rr-harness-token'
 
 // 记录型 mock agent：不真实模型；create/followup/dispose 全计数，事件可被真实 summarizeTurn 解析
-function makeRecordingAgents() {
+function makeRecordingAgents({resumeError=false}={}) {
   const calls = { create: 0, resume: 0, followups: 0, disposes: 0 }
-  const create = async () => {
-    calls.create += 1
+  const handle = (id) => {
     let seq = 0
     const events = []
     return {
       agent: {
-        session: { get seq() { return seq }, events },
+        session: { id, get seq() { return seq }, events },
         whenIdle: async () => {},
         followup() {
           calls.followups += 1
@@ -39,12 +38,20 @@ function makeRecordingAgents() {
       dispose: async () => { calls.disposes += 1 },
     }
   }
-  return { create, resume: create, calls }
+  const create=async options=>{calls.create++;return handle(options.sessionId)}
+  const resume=async options=>{
+    calls.resume++
+    assert.equal(typeof options.resumeSessionId,'string','SDK resume requires resumeSessionId')
+    assert.equal('sessionId' in options,false,'create-only sessionId must not be sent to resume')
+    if(resumeError)throw Error('fixture persistence failed')
+    return handle(options.resumeSessionId)
+  }
+  return { create, resume, calls }
 }
 
-async function startLifecycle(stateDir) {
+async function startLifecycle(stateDir,options={}) {
   const { default: plugin } = await import('../lib/index.mjs')
-  const agents = makeRecordingAgents()
+  const agents = makeRecordingAgents(options)
   const disposers = []
   const handlers = []
   const ctx = {
@@ -217,4 +224,23 @@ test('重启恢复：历史正确恢复、终态不重派不重复交付、在�
     for (const lc of lifecycles.splice(0)) await lc.close().catch(() => undefined)
     await rm(stateDir, { recursive: true, force: true }).catch(() => undefined)
   }
+})
+
+for(const resumeError of [false,true])test(`native session identity after restart (resume failure=${resumeError})`,async()=>{
+ const stateDir=await mkdtemp(join(tmpdir(),'rr-identity-'));const opened=[]
+ try{
+  const A=await startLifecycle(stateDir);opened.push(A)
+  const botId=(await (await A.api('/state')).json()).bots[0].id
+  const chat=host=>host.api(`/conversations/${botId}/chat`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({text:'identity probe',requestId:randomUUID()})})
+  assert.equal((await chat(A)).status,200)
+  const path=join(stateDir,'chat-sessions.json'),before=JSON.parse(await readFile(path,'utf8'))
+  assert.ok(before[`${botId}:${botId}`]);await A.close()
+  const B=await startLifecycle(stateDir,{resumeError});opened.push(B)
+  const response=await chat(B);const body=await response.text()
+  assert.equal(B.agents.calls.resume,1)
+  assert.equal(B.agents.calls.create,0,'resume failure must not create a replacement session')
+  assert.deepEqual(JSON.parse(await readFile(path,'utf8')),before)
+  if(resumeError)assert.match(body,/fixture persistence failed/)
+  else {assert.equal(response.status,200);assert.match(body,/mock reply ok/)}
+ }finally{for(const host of opened)await host.close();await rm(stateDir,{recursive:true,force:true})}
 })
